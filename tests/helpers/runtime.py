@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import io
 import json
+import math
 import os
 import socket
 import subprocess
@@ -1131,6 +1132,81 @@ class OmniRunner:
                 omni_inputs.append(input_dict)
             return omni_inputs
 
+        # GLM-TTS: follows examples/offline_inference/glm_tts/end2end.py pattern.
+        # additional_information uses **scalar** values (not list-wrapped like Qwen3-TTS).
+        is_glm_tts = "GLM-TTS" in self.model_name or "glm_tts" in self.model_name.lower()
+        if is_glm_tts and modalities == ["audio"]:
+            from vllm_omni.model_executor.models.glm_tts.glm_tts import (
+                GLMTTSForConditionalGeneration,
+            )
+            from vllm_omni.model_executor.models.glm_tts.text_frontend import (
+                GLMTTSTextFrontend,
+            )
+
+            tts_kw = mm_processor_kwargs or {}
+            ref_audio_raw = tts_kw.get("ref_audio", None)
+            ref_text = tts_kw.get("ref_text", None)
+
+            # Load tokenizer (cached) for prompt length estimation
+            _cache = self._prompt_len_estimate_cache
+            if self.model_name not in _cache:
+                from transformers import AutoTokenizer
+
+                tok_path: str | Path = Path(self.model_name)
+                sub = tok_path / "vq32k-phoneme-tokenizer"
+                if sub.is_dir():
+                    tok_path = sub
+                _cache[self.model_name] = (
+                    AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True),
+                    GLMTTSTextFrontend(),
+                )
+            tokenizer, text_frontend = _cache[self.model_name]
+
+            # Resolve ref_audio URL → wav tensor for voice clone
+            ref_audio_wav = None
+            ref_audio_sr = None
+            prompt_speech_token_len = 0
+            if ref_audio_raw is not None and ref_text:
+                if isinstance(ref_audio_raw, str):
+                    resp = requests.get(ref_audio_raw, timeout=60)
+                    resp.raise_for_status()
+                    wav_np, sr = sf.read(io.BytesIO(resp.content), dtype="float32")
+                    if wav_np.ndim > 1:
+                        wav_np = wav_np.mean(axis=1)
+                    ref_audio_wav = torch.from_numpy(wav_np)
+                    ref_audio_sr = int(sr)
+                elif isinstance(ref_audio_raw, torch.Tensor):
+                    ref_audio_wav = ref_audio_raw
+                    ref_audio_sr = int(tts_kw.get("ref_audio_sr", 24000))
+
+                if ref_audio_wav is not None:
+                    n_samples = ref_audio_wav.shape[-1]
+                    prompt_speech_token_len = max(1, int(math.ceil((n_samples / (ref_audio_sr or 24000)) * 25.0)))
+
+            omni_inputs: list[TextPrompt] = []
+            for prompt_text in prompts:
+                text_str = str(prompt_text).strip() or " "
+                additional_information: dict[str, Any] = {"text": text_str}
+                if ref_audio_wav is not None and ref_text:
+                    additional_information["ref_audio_wav"] = ref_audio_wav
+                    additional_information["ref_audio_sr"] = ref_audio_sr
+                    additional_information["ref_text"] = ref_text
+
+                plen = GLMTTSForConditionalGeneration.estimate_prompt_len_from_text(
+                    text=text_str,
+                    tokenizer=tokenizer,
+                    text_frontend=text_frontend,
+                    prompt_text=ref_text if ref_audio_wav is not None else None,
+                    prompt_speech_token_len=prompt_speech_token_len,
+                )
+                omni_inputs.append(
+                    {
+                        "prompt_token_ids": [1] * plen,
+                        "additional_information": additional_information,
+                    }
+                )
+            return omni_inputs
+
         def _normalize(mm_input, num_prompts):
             if mm_input is None:
                 return [None] * num_prompts
@@ -1355,7 +1431,10 @@ class OmniRunnerHandler:
         mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                mm_out = stage_out.request_output.outputs[0].multimodal_output
+                # Use the .multimodal_output property which handles both
+                # pipeline outputs (request_output.outputs[0]) and diffusion
+                # outputs (_multimodal_output) transparently.
+                mm_out = stage_out.multimodal_output
                 break
         if mm_out is None:
             result = OmniResponse(success=False, error_message="No audio output from pipeline")
@@ -1368,14 +1447,22 @@ class OmniRunnerHandler:
             assert result.success, result.error_message
             return result
 
-        sr_raw = mm_out.get("sr")
+        # Try "sr", then "audio_sample_rate", fallback 24000 (common TTS default).
+        sr_raw = mm_out.get("sr") or mm_out.get("audio_sample_rate") or 24000
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
         sr = int(sr_val.item() if hasattr(sr_val, "item") else sr_val)
-        wav_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+        if isinstance(audio_data, list):
+            wav_np = torch.cat([torch.as_tensor(a) for a in audio_data], dim=-1).float().cpu().numpy().reshape(-1)
+        elif isinstance(audio_data, torch.Tensor):
+            wav_np = audio_data.float().cpu().numpy().reshape(-1)
+        else:
+            import numpy as np
+
+            wav_np = np.asarray(audio_data, dtype=np.float32).reshape(-1)
         wav_buf = io.BytesIO()
         sf.write(
             wav_buf,
-            wav_tensor.float().cpu().numpy().reshape(-1),
+            wav_np,
             samplerate=sr,
             format="WAV",
             subtype="PCM_16",

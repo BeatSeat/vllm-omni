@@ -65,6 +65,7 @@ _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
+_GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -74,6 +75,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
+    | _GLM_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -233,6 +235,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_tokenizer = None
         self._voxcpm2_tokenizer = None
         self._voxcpm2_split_map: dict[int, list[int]] = {}
+        self._glm_tts_tokenizer = None
+        self._glm_tts_text_frontend = None
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
@@ -324,6 +328,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "voxcpm" if has_vae_stage or model_stage == "vae" else "voxcpm2"
         if model_stage in _MING_TTS_MODEL_STAGES:
             return "ming_flash_omni_tts"
+        if model_stage in _GLM_TTS_MODEL_STAGES:
+            return "glm_tts"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -353,7 +359,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # is no static speaker list to surface here.
             return set()
         try:
-            if self._tts_model_type == "voxcpm":
+            if self._tts_model_type in ("voxcpm", "glm_tts"):
                 return set()
             if self._tts_model_type == "voxtral_tts":
                 config = self.engine_client.model_config.hf_config.audio_config
@@ -855,6 +861,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None  # VoxCPM2 accepts any text input
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
+        if self._tts_model_type == "glm_tts":
+            return self._validate_glm_tts_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -976,6 +984,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
         elif request.ref_text is not None:
             return "'ref_text' requires 'ref_audio' for VoxCPM voice cloning"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
+
+    def _validate_glm_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate GLM-TTS request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        # Voice cloning: ref_audio + ref_text
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+            if not request.ref_text or not request.ref_text.strip():
+                return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1619,6 +1648,132 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "additional_information": additional_information,
         }
 
+    # ---- GLM-TTS helpers ----
+
+    def _get_glm_tts_tokenizer(self):
+        if self._glm_tts_tokenizer is not None:
+            return self._glm_tts_tokenizer
+
+        from transformers import AutoTokenizer
+
+        model_name = self.engine_client.model_config.model
+        model_path = Path(model_name)
+
+        tokenizer_path: str | Path = model_name
+        tokenizer_kwargs: dict[str, Any] = {"trust_remote_code": True}
+        if model_path.exists():
+            candidates = [
+                model_path / "vq32k-phoneme-tokenizer",
+                model_path.parent / "vq32k-phoneme-tokenizer" if model_path.name == "llm" else None,
+            ]
+            for candidate in candidates:
+                if candidate is not None and candidate.is_dir():
+                    tokenizer_path = candidate
+                    break
+        else:
+            tokenizer_kwargs["subfolder"] = "vq32k-phoneme-tokenizer"
+
+        try:
+            self._glm_tts_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_path,
+                **tokenizer_kwargs,
+            )
+        except Exception:
+            tokenizer_kwargs.pop("subfolder", None)
+            self._glm_tts_tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                **tokenizer_kwargs,
+            )
+        return self._glm_tts_tokenizer
+
+    def _estimate_glm_tts_ref_token_len(
+        self,
+        wav_samples: object,
+        sr: int,
+    ) -> int:
+        n_samples = int(np.asarray(wav_samples).shape[-1])
+        if sr <= 0 or n_samples <= 0:
+            return 1
+        hf_config = self.engine_client.model_config.hf_config
+        frame_rate = float(getattr(hf_config, "input_frame_rate", 25.0) or 25.0)
+        return max(1, int(math.ceil((n_samples / sr) * frame_rate)))
+
+    def _estimate_glm_tts_prompt_len(
+        self,
+        *,
+        text: str,
+        ref_text: str | None = None,
+        ref_audio_data: tuple[Any, int] | None = None,
+    ) -> int:
+        from vllm_omni.model_executor.models.glm_tts.glm_tts import (
+            GLMTTSForConditionalGeneration,
+        )
+        from vllm_omni.model_executor.models.glm_tts.text_frontend import (
+            GLMTTSTextFrontend,
+        )
+
+        tokenizer = self._get_glm_tts_tokenizer()
+        if self._glm_tts_text_frontend is None:
+            self._glm_tts_text_frontend = GLMTTSTextFrontend()
+
+        prompt_speech_token_len = 0
+        if ref_audio_data is not None:
+            wav_samples, sr = ref_audio_data
+            prompt_speech_token_len = self._estimate_glm_tts_ref_token_len(
+                wav_samples,
+                int(sr),
+            )
+
+        return GLMTTSForConditionalGeneration.estimate_prompt_len_from_text(
+            text=text,
+            prompt_text=ref_text,
+            prompt_speech_token_len=prompt_speech_token_len,
+            tokenizer=tokenizer,
+            text_frontend=self._glm_tts_text_frontend,
+        )
+
+    async def _build_glm_tts_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build prompt for GLM-TTS.
+
+        Text-only mode:
+            AR preprocess() builds [Text | BOA] from text field.
+
+        Voice clone mode (ref_audio + ref_text):
+            Passes ref_audio_wav + ref_audio_sr + ref_text to AR preprocess(),
+            which extracts prompt_speech_token, prompt_feat, and embedding
+            on the model side (same pattern as Fish Speech).
+
+        AR preprocess() builds [PromptText | Text | BOA | PromptSpeechTokens + ATS].
+        DiT receives prompt_token, prompt_feat, embedding for conditioning.
+        """
+        additional_information: dict[str, Any] = {
+            "text": request.input,
+        }
+        if request.max_new_tokens is not None:
+            additional_information["max_new_tokens"] = request.max_new_tokens
+
+        # Voice cloning: pass raw audio to model-side preprocess (like Fish Speech)
+        ref_audio_data = None
+        if request.ref_audio is not None and request.ref_text:
+            wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+            ref_audio_data = (wav_samples, int(sr))
+            additional_information["ref_audio_wav"] = torch.from_numpy(np.asarray(wav_samples, dtype=np.float32))
+            additional_information["ref_audio_sr"] = int(sr)
+            additional_information["ref_text"] = request.ref_text
+
+        prompt_len = self._estimate_glm_tts_prompt_len(
+            text=request.input,
+            ref_text=request.ref_text if request.ref_text else None,
+            ref_audio_data=ref_audio_data,
+        )
+
+        # GLM-TTS AR preprocess() handles tokenization and prompt construction.
+        # Placeholder values are ignored, but length must match preprocess embeddings.
+        return {
+            "prompt_token_ids": [1] * prompt_len,
+            "additional_information": additional_information,
+        }
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -1676,6 +1831,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["instruct"] = request.instructions
         elif self._tts_model_type == "voxcpm2":
             prompt = await self._build_voxcpm2_prompt(request)
+            tts_params = {}
+        elif self._tts_model_type == "glm_tts":
+            validation_error = self._validate_glm_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+            prompt = await self._build_glm_tts_prompt(request)
             tts_params = {}
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
@@ -1740,6 +1901,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "voxcpm2"
         elif self._tts_model_type == "ming_flash_omni_tts":
             model_type = "ming_flash_omni_tts"
+        elif self._tts_model_type == "glm_tts":
+            model_type = "glm_tts"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -1751,25 +1914,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type,
         )
 
-        # CosyVoice3: set dynamic min/max tokens based on text length.
-        # The official model requires min_token_text_ratio to prevent early
-        # EOS and max_token_text_ratio to cap generation length.
-        if self._tts_model_type == "cosyvoice3" and sampling_params_list:
+        # CosyVoice3 / GLM-TTS: set dynamic min/max tokens based on text length.
+        # The official models use min/max token-to-text ratios to prevent
+        # early EOS and cap generation length.
+        if self._tts_model_type in ("cosyvoice3", "glm_tts") and sampling_params_list:
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
             text_len = len(request.input)  # rough char-level estimate
-            # Use the model's configured ratios (defaults: min=2, max=20)
             hf_cfg = self.model_config.hf_config
             min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
             max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
+            stage_min_tokens = getattr(sampling_params_list[0], "min_tokens", None)
+            stage_max_tokens = getattr(sampling_params_list[0], "max_tokens", None)
+            cap_candidates = [int(cap) for cap in (stage_max_tokens, request.max_new_tokens) if cap is not None]
+            hard_cap = min(cap_candidates) if cap_candidates else None
+
             min_tokens = max(1, int(text_len * min_ratio))
-            max_tokens = min(2048, int(text_len * max_ratio))
+            if stage_min_tokens is not None:
+                min_tokens = max(min_tokens, int(stage_min_tokens))
+            if hard_cap is not None:
+                min_tokens = min(min_tokens, hard_cap)
+
+            max_tokens = max(min_tokens, int(text_len * max_ratio))
+            if hard_cap is not None:
+                max_tokens = min(max_tokens, hard_cap)
             sampling_params_list[0].min_tokens = min_tokens
             sampling_params_list[0].max_tokens = max_tokens
             logger.info(
-                "CosyVoice3 dynamic tokens: text_len=%d, min_tokens=%d, max_tokens=%d",
+                "%s dynamic tokens: text_len=%d, min_ratio=%s, max_ratio=%s, "
+                "stage_min=%s, stage_max=%s, request_max=%s, min_tokens=%d, max_tokens=%d",
+                self._tts_model_type,
                 text_len,
+                min_ratio,
+                max_ratio,
+                stage_min_tokens,
+                stage_max_tokens,
+                request.max_new_tokens,
                 min_tokens,
                 max_tokens,
             )

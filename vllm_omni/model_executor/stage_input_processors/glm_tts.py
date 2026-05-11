@@ -50,9 +50,10 @@ def _copy_voice_clone_payload(
 
 
 def ar_to_dit(
-    source_outputs: list[Any],
-    _prompt: Any = None,
-    _requires_multimodal_data: bool = False,
+    stage_list: list[Any],
+    engine_input_source: list[int],
+    prompt: Any = None,
+    requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[Any]:
     """Non-streaming processor: collect all speech tokens from AR, pass to DiT.
@@ -61,7 +62,10 @@ def ar_to_dit(
     from the AR model's multimodal_output to the DiT stage.
 
     Args:
-        source_outputs: Outputs from the upstream AR stage.
+        stage_list: List of stage clients; indexed by stage_id.
+        engine_input_source: List of upstream stage IDs to pull outputs from.
+        prompt: Original prompt (unused in sync mode).
+        requires_multimodal_data: Whether to propagate mm data (unused).
         streaming_context: Unused for sync mode; kept for interface parity with
             other stage processors.
 
@@ -72,7 +76,14 @@ def ar_to_dit(
 
     del streaming_context
 
-    ar_outputs = source_outputs
+    if not engine_input_source:
+        raise ValueError("engine_input_source cannot be empty")
+    source_stage_id = engine_input_source[0]
+    if source_stage_id >= len(stage_list):
+        raise IndexError(f"Invalid source stage_id: {source_stage_id}")
+    if stage_list[source_stage_id].engine_outputs is None:
+        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
+    ar_outputs = stage_list[source_stage_id].engine_outputs
     dit_inputs: list[OmniTokensPrompt] = []
 
     for output in ar_outputs:

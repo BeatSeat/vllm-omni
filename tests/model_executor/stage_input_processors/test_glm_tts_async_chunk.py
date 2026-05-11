@@ -76,7 +76,11 @@ def test_ar_to_dit_filters_invalid_tokens_and_preserves_conditioning() -> None:
         )
     ]
 
-    outputs = ar_to_dit(source_outputs)
+    # Build mock stage_list matching the standard process_engine_inputs interface
+    stage_client = SimpleNamespace(engine_outputs=source_outputs)
+    stage_list = [stage_client]  # stage_id=0 is the AR stage
+    engine_input_source = [0]
+    outputs = ar_to_dit(stage_list, engine_input_source)
 
     assert len(outputs) == 1
     assert outputs[0]["prompt_token_ids"] == [0, 7, 32767]

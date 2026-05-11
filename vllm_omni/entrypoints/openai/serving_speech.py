@@ -2069,8 +2069,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 max_tokens = min(max_tokens, hard_cap)
             sampling_params_list[0].min_tokens = min_tokens
             sampling_params_list[0].max_tokens = max_tokens
-            if request.seed is not None:
-                sampling_params_list[0].seed = request.seed
+            seed = getattr(request, "seed", None)
+            if seed is not None:
+                sampling_params_list[0].seed = seed
             logger.info(
                 "GLM-TTS dynamic tokens: text_tokens=%d, min_ratio=%s, max_ratio=%s, "
                 "stage_min=%s, stage_max=%s, request_max=%s, min_tokens=%d, max_tokens=%d",

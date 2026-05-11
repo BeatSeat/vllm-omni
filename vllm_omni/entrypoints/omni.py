@@ -4,7 +4,7 @@ import copy
 import time
 import uuid
 from collections.abc import Callable, Generator, Iterable, Sequence
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from tqdm.auto import tqdm
 from vllm.logger import init_logger
@@ -37,6 +37,109 @@ class Omni(OmniBase):
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
+
+    def _is_glm_tts_pipeline(self) -> bool:
+        return any(getattr(meta, "model_stage", None) == "glm_tts" for meta in getattr(self, "_stage_meta_list", []))
+
+    def _extract_glm_tts_prompt_text(self, prompt: object) -> str | None:
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, dict):
+            text = prompt.get("prompt")
+            return text if isinstance(text, str) and text else None
+        return None
+
+    def _get_glm_tts_tokenizer_path(self) -> Any:
+        from vllm_omni.model_executor.models.glm_tts.glm_tts import resolve_glm_tts_tokenizer_path
+
+        stage_vllm_configs = getattr(self.engine, "stage_vllm_configs", None)
+        if stage_vllm_configs:
+            model_config = getattr(stage_vllm_configs[0], "model_config", None)
+            tokenizer = getattr(model_config, "tokenizer", None)
+            if tokenizer:
+                return tokenizer
+        return resolve_glm_tts_tokenizer_path(self.model)
+
+    def _estimate_glm_tts_text_token_len(self, text: str) -> int:
+        from vllm_omni.model_executor.models.glm_tts.glm_tts import (
+            load_glm_tts_tokenizer,
+        )
+        from vllm_omni.model_executor.models.glm_tts.text_frontend import GLMTTSTextFrontend
+
+        frontend = getattr(self, "_glm_tts_text_frontend", None)
+        if frontend is None:
+            frontend = GLMTTSTextFrontend()
+            self._glm_tts_text_frontend = frontend
+
+        normalized = frontend.text_normalize(text) or text
+        tokenizer = getattr(self, "_glm_tts_text_tokenizer", None)
+        if tokenizer is None:
+            tokenizer_path = self._get_glm_tts_tokenizer_path()
+            tokenizer = load_glm_tts_tokenizer(
+                tokenizer_path,
+                model_name_or_path=self.model,
+                trust_remote_code=True,
+            )
+            self._glm_tts_text_tokenizer = tokenizer
+
+        return max(1, len(tokenizer.encode(normalized)))
+
+    def _maybe_apply_glm_tts_dynamic_tokens(
+        self,
+        prompt: OmniPromptType,
+        sampling_params_list: Sequence[OmniSamplingParams],
+    ) -> list[OmniSamplingParams]:
+        if not sampling_params_list or not self._is_glm_tts_pipeline():
+            return list(sampling_params_list)
+
+        text = self._extract_glm_tts_prompt_text(prompt)
+        if not text:
+            return list(sampling_params_list)
+
+        stage0_meta = self.engine.get_stage_metadata(0)
+        hf_overrides = stage0_meta.get("hf_overrides") or {}
+        min_ratio = float(hf_overrides.get("min_token_text_ratio", 2.0))
+        max_ratio = float(hf_overrides.get("max_token_text_ratio", 20.0))
+
+        try:
+            text_token_len = self._estimate_glm_tts_text_token_len(text)
+        except Exception as exc:
+            text_token_len = max(1, len(text))
+            logger.warning(
+                "GLM-TTS offline dynamic token length fell back to target text character count: %s",
+                exc,
+            )
+
+        params_list = copy.deepcopy(list(sampling_params_list))
+        stage0_params = params_list[0]
+        stage_min_tokens = getattr(stage0_params, "min_tokens", None)
+        stage_max_tokens = getattr(stage0_params, "max_tokens", None)
+        hard_cap = int(stage_max_tokens) if stage_max_tokens is not None else None
+
+        min_tokens = max(1, int(text_token_len * min_ratio))
+        if stage_min_tokens is not None:
+            min_tokens = max(min_tokens, int(stage_min_tokens))
+        if hard_cap is not None:
+            min_tokens = min(min_tokens, hard_cap)
+
+        max_tokens = max(min_tokens, int(text_token_len * max_ratio))
+        if hard_cap is not None:
+            max_tokens = min(max_tokens, hard_cap)
+
+        stage0_params.min_tokens = min_tokens
+        stage0_params.max_tokens = max_tokens
+        logger.info(
+            "GLM-TTS offline dynamic tokens: text_tokens=%d, min_ratio=%s, max_ratio=%s, "
+            "stage_min=%s, stage_max=%s, min_tokens=%d, max_tokens=%d",
+            text_token_len,
+            min_ratio,
+            max_ratio,
+            stage_min_tokens,
+            stage_max_tokens,
+            min_tokens,
+            max_tokens,
+        )
+        return params_list
 
     @overload
     def generate(
@@ -138,6 +241,7 @@ class Omni(OmniBase):
                 if pd_pair is not None:
                     p_id = pd_pair[0]
                     req_sp_list[p_id] = self._prepare_prefill_sampling_params(req_id, req_sp_list[p_id])
+                req_sp_list = self._maybe_apply_glm_tts_dynamic_tokens(prompt, req_sp_list)
 
                 self.engine.add_request(
                     request_id=req_id,

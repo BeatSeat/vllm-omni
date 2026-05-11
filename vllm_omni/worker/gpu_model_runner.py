@@ -1140,18 +1140,19 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, req_infos in cached_infos.items():
                     self._update_intermediate_buffer(req_id, req_infos)
 
-    def _maybe_attach_mimo_audio_req_infos(
+    def _maybe_attach_request_mm_features(
         self,
         req_state: CachedRequestState | None,
         req_infos: dict | None,
         req_id: str,
     ) -> dict | None:
-        """Attach MiMoAudio-specific fields into req_infos if applicable.
+        """Attach request mm_features into req_infos when available.
 
-        This helper is intentionally small and self-contained so that it can be
-        unit-tested to prevent regressions when updating MiMoAudio handling.
+        Some talker-style models need access to the original per-request
+        multimodal feature specs during preprocess(), before postprocess() has
+        had a chance to mirror derived fields into ``model_intermediate_buffer``.
         """
-        if req_state is None or self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+        if req_state is None:
             return req_infos
 
         # Always operate on a dict copy to avoid mutating shared instances.
@@ -1159,6 +1160,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         mm_features = getattr(req_state, "mm_features", None)
         if mm_features and (not req_infos.get("mm_features")):
             req_infos["mm_features"] = mm_features
+
+        if self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+            return req_infos
+
         req_infos["req_id"] = req_id
 
         return req_infos
@@ -1295,7 +1300,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # mimo-audio check
                 req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                req_infos = self._maybe_attach_request_mm_features(req_state, req_infos, req_id)
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])

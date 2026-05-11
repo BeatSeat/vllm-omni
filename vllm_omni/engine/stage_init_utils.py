@@ -259,6 +259,10 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    hf_overrides: dict[str, Any] | None = None
+    # Multi-replica: replica_id distinguishes replicas of the same stage.
+    # For single-replica stages this defaults to 0.
+    replica_id: int = 0
 
 
 @dataclass
@@ -336,10 +340,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=None,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
+            hf_overrides=engine_args.get("hf_overrides"),
         )
 
-    model_stage = getattr(engine_args, "model_stage", None)
-    engine_output_type = getattr(engine_args, "engine_output_type", None)
+    model_stage = engine_args.get("model_stage")
+    engine_output_type = engine_args.get("engine_output_type")
     is_comprehension = getattr(stage_config, "is_comprehension", False)
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
 
@@ -357,6 +362,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+        hf_overrides=engine_args.get("hf_overrides"),
     )
 
 

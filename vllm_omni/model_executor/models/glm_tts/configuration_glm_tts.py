@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM-TTS Configuration classes."""
+"""GLM-TTS Configuration."""
 
 from __future__ import annotations
 
@@ -10,20 +10,15 @@ from transformers import PretrainedConfig
 
 
 class GLMTTSConfig(PretrainedConfig):
-    """Configuration for GLM-TTS model.
+    """Llama-based AR model for text-to-speech token generation.
 
-    GLM-TTS uses a Llama-based AR model for text-to-speech token generation.
-
-    Note: Special token IDs should be loaded dynamically from tokenizer in model's
-    __init__ method. Default values here are placeholders that will be overridden.
+    Special token IDs are loaded dynamically from the tokenizer at init time.
     """
 
     model_type: str = "glm_tts"
 
     def __init__(
         self,
-        # Llama backbone configuration
-        # NOTE: vocab_size should come from checkpoint's config.json, not hardcoded
         vocab_size: int = 98304,
         hidden_size: int = 2048,
         intermediate_size: int = 6144,
@@ -34,23 +29,18 @@ class GLMTTSConfig(PretrainedConfig):
         max_position_embeddings: int = 8192,
         rms_norm_eps: float = 1e-5,
         rope_theta: float = 10000.0,
-        # Special token IDs (placeholders - loaded from tokenizer dynamically)
         audio_token_start: int = -1,
         audio_token_end: int = -1,
         boa_token_id: int = -1,
         eoa_token_id: int = -1,
         pad_token_id: int = -1,
         bos_token_id: int = -1,
-        # Speech token configuration
         speech_token_vocab_size: int = 32768,
         speech_token_dim: int = 512,
-        # Speaker embedding
         spk_embed_dim: int = 192,
-        # Flow model configuration (for Stage 1)
         mel_dim: int = 80,
         input_frame_rate: float = 25.0,
         mel_framerate: int = 50,
-        # Generation defaults
         max_token_text_ratio: float = 20.0,
         min_token_text_ratio: float = 2.0,
         sample_method: str = "ras",
@@ -89,8 +79,4 @@ class GLMTTSConfig(PretrainedConfig):
         self.ras_top_k = ras_top_k
         self.ras_win_size = ras_win_size
         self.ras_tau_r = ras_tau_r
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            **kwargs,
-        )
+        super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, **kwargs)

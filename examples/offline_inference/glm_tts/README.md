@@ -12,17 +12,27 @@ python examples/offline_inference/glm_tts/end2end.py \
     --output-dir ./output
 ```
 
+```bash
+# Voice cloning
+python examples/offline_inference/glm_tts/end2end.py \
+    --model /path/to/GLM-TTS \
+    --text "你好，这是语音克隆测试。" \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "这是参考音频的文本内容。" \
+    --output-dir ./output
+```
+
 ## Architecture
 
 GLM-TTS is a two-stage TTS system:
 
 ```
 Text → [Stage 0: AR Model] → Speech Tokens → [Stage 1: DiT + Vocoder] → Audio
-         (Llama-based)          (32k vocab)      (Flow Matching + Vocos2D)  (24kHz WAV)
+         (Llama-based)          (32k vocab)      (Flow Matching + HiFT)  (24kHz WAV)
 ```
 
 - **Stage 0 (AR)**: Llama-based autoregressive model generates speech tokens from text at 25 Hz
-- **Stage 1 (DiT)**: Flow matching transformer converts speech tokens to mel-spectrograms, then Vocos2D vocoder synthesizes 24kHz audio
+- **Stage 1 (DiT)**: Flow matching transformer converts speech tokens to mel-spectrograms, then HiFT vocoder synthesizes 24kHz audio (Vocos2D 32kHz fallback)
 
 ## Model Path
 
@@ -32,11 +42,11 @@ The `--model` path should point to the **repository root** (not `llm/` subdirect
 GLM-TTS/
 ├── llm/                         # AR model weights
 ├── flow/                        # DiT model weights
-├── vocos2d/                     # Vocos2D vocoder (JIT, 32kHz→24kHz)
-├── hift/                        # HiFi-GAN vocoder (fallback)
+├── hift/                        # HiFT vocoder (primary, 24kHz)
+├── vocos2d/                     # Vocos2D vocoder (fallback, JIT, 32kHz→24kHz)
 ├── vq32k-phoneme-tokenizer/     # Tokenizer
-├── ckpt/speech_tokenizer/       # Speech tokenizer (for voice cloning)
-└── frontend/campplus.onnx       # Speaker embedding (for voice cloning)
+├── speech_tokenizer/            # Speech tokenizer (for voice cloning)
+└── frontend/campplus.onnx       # Speaker embedding (for voice cloning, from GitHub repo)
 ```
 
 ## Examples
@@ -52,6 +62,8 @@ GLM-TTS/
 | `--model` | (required) | Path to GLM-TTS model root |
 | `--text` | "你好，这是一个语音合成测试。" | Text to synthesize |
 | `--output-dir` | `./output` | Output directory for WAV files |
+| `--ref-audio` | `None` | Reference WAV path or URL for voice cloning |
+| `--ref-text` | `None` | Transcript of `--ref-audio` |
 | `--deploy-config` | auto-detected | Path to deploy config YAML |
 | `--stage-init-timeout` | 600 | Stage init timeout (seconds) |
 
@@ -63,4 +75,4 @@ Audio files are saved as `output_<request_id>.wav` in the output directory at 24
 
 - First run may take longer due to model loading and JIT compilation
 - Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` (auto-set by scripts)
-- Default sampling: temperature=0.9, top_k=25, repetition_penalty=1.05
+- Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method)

@@ -10,7 +10,7 @@
 
 set -e
 
-MODEL="${1:-/path/to/GLM-TTS}"
+MODEL="${1:-zai-org/GLM-TTS}"
 
 echo "Starting GLM-TTS server with model: $MODEL"
 

@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 echo "Starting GLM-TTS server (port $PORT)..."
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
 vllm-omni serve "$MODEL" \
-    --stage-configs-path "$REPO_ROOT/vllm_omni/model_executor/stage_configs/glm_tts.yaml" \
+    --deploy-config "$REPO_ROOT/vllm_omni/deploy/glm_tts.yaml" \
     --host 0.0.0.0 \
     --port "$PORT" \
     --gpu-memory-utilization 0.9 \

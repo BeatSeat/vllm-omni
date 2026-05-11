@@ -2273,6 +2273,113 @@ class TestCosyVoice3Serving:
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
 
 
+# ---- GLM-TTS Serving Tests ----
+
+
+@pytest.fixture
+def glm_tts_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="zai-org/GLM-TTS",
+        hf_config=SimpleNamespace(min_token_text_ratio=2, max_token_text_ratio=20),
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="glm_tts"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestGLMTTSServing:
+    def test_validate_glm_tts_requires_ref_audio(self, glm_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = glm_tts_server._validate_glm_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+    def test_validate_glm_tts_requires_ref_text(self, glm_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = glm_tts_server._validate_glm_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+    def test_prepare_speech_generation_glm_tts_uses_multimodal_prompt(
+        self,
+        glm_tts_server,
+        mocker: MockerFixture,
+    ):
+        glm_tts_server._resolve_ref_audio = mocker.AsyncMock(
+            return_value=(np.zeros(24000, dtype=np.float32).tolist(), 24000)
+        )
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+        )
+        request_id, generator, tts_params = asyncio.run(glm_tts_server._prepare_speech_generation(request))
+
+        assert request_id.startswith("speech-")
+        assert generator == "generator"
+        assert tts_params == {}
+        call_prompt = glm_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert "prompt_token_ids" not in call_prompt
+        assert "additional_information" not in call_prompt
+        assert call_prompt["prompt"] == "Hello"
+        assert "audio" in call_prompt["multi_modal_data"]
+        assert call_prompt["mm_processor_kwargs"] == {
+            "prompt_text": "Reference text",
+            "sample_rate": 24000,
+        }
+
+    def test_estimate_glm_tts_target_text_len_uses_tokenizer_tokens(
+        self,
+        glm_tts_server,
+        mocker: MockerFixture,
+    ):
+        class FakeTokenizer:
+            def encode(self, text):
+                assert text == "normalized target"
+                return [10, 20, 30]
+
+        mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.glm_tts.resolve_glm_tts_tokenizer_path",
+            return_value="resolved-tokenizer",
+        )
+        load_tokenizer = mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.glm_tts.load_glm_tts_tokenizer",
+            return_value=FakeTokenizer(),
+        )
+        mocker.patch(
+            "vllm_omni.model_executor.models.glm_tts.text_frontend.GLMTTSTextFrontend.text_normalize",
+            return_value="normalized target",
+        )
+
+        text_token_len = glm_tts_server._estimate_glm_tts_target_text_token_len("abcdef")
+
+        assert text_token_len == 3
+        load_tokenizer.assert_called_once()
+
+
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
 

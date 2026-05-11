@@ -167,7 +167,114 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
 
 
-def test_from_cli_args_only_nulls_untyped_override_fields(monkeypatch: pytest.MonkeyPatch):
+def test_omni_applies_glm_tts_dynamic_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    omni = object.__new__(Omni)
+    omni.model = "zai-org/GLM-TTS"
+    omni._stage_meta_list = [SimpleNamespace(model_stage="glm_tts"), SimpleNamespace(model_stage="glm_tts_dit")]
+    omni.engine = SimpleNamespace(
+        get_stage_metadata=lambda stage_id: {
+            "hf_overrides": {
+                "min_token_text_ratio": 2.0,
+                "max_token_text_ratio": 20.0,
+            }
+        }
+    )
+    monkeypatch.setattr(Omni, "_estimate_glm_tts_text_token_len", lambda self, text: 27)
+    params = [SamplingParams(min_tokens=1, max_tokens=2048), SamplingParams(max_tokens=2048)]
+
+    updated = omni._maybe_apply_glm_tts_dynamic_tokens({"prompt": "hello"}, params)
+
+    assert updated is not params
+    assert updated[0].min_tokens == 54
+    assert updated[0].max_tokens == 540
+    assert params[0].min_tokens == 1
+    assert params[0].max_tokens == 2048
+
+
+def test_omni_glm_tts_tokenizer_path_prefers_stage_vllm_config() -> None:
+    omni = object.__new__(Omni)
+    omni.engine = SimpleNamespace(
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(tokenizer="/cache/GLM-TTS/vq32k-phoneme-tokenizer"))
+        ]
+    )
+
+    assert omni._get_glm_tts_tokenizer_path() == "/cache/GLM-TTS/vq32k-phoneme-tokenizer"
+
+
+def test_omni_glm_tts_dynamic_tokens_falls_back_to_char_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    omni = object.__new__(Omni)
+    omni.model = "zai-org/GLM-TTS"
+    omni._stage_meta_list = [SimpleNamespace(model_stage="glm_tts"), SimpleNamespace(model_stage="glm_tts_dit")]
+    omni.engine = SimpleNamespace(
+        get_stage_metadata=lambda stage_id: {
+            "hf_overrides": {
+                "min_token_text_ratio": 2.0,
+                "max_token_text_ratio": 20.0,
+            }
+        }
+    )
+    monkeypatch.setattr(Omni, "_estimate_glm_tts_text_token_len", lambda self, text: (_ for _ in ()).throw(RuntimeError("boom")))
+    params = [SamplingParams(min_tokens=1, max_tokens=2048), SamplingParams(max_tokens=2048)]
+
+    updated = omni._maybe_apply_glm_tts_dynamic_tokens({"prompt": "abcd"}, params)
+
+    assert updated[0].min_tokens == 8
+    assert updated[0].max_tokens == 80
+
+
+def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+    from vllm_omni.entrypoints.omni import Omni
+
+    captured: dict[str, Any] = {}
+
+    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
+        captured.update(kwargs)
+        return FakeAsyncOmniEngine()
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    nullify_stage_engine_defaults(parser)
+    args = parser.parse_args([])
+    args.model = "fake-model"
+
+    Omni(**vars(args))
+
+    assert captured["gpu_memory_utilization"] is None
+    assert captured["hsdp_shard_size"] == -1
+    assert "_cli_explicit_keys" not in captured
+
+
+def test_from_cli_args_warns_and_forwards_without_internal_keys(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+
+    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
+        captured.update(kwargs)
+        return FakeAsyncOmniEngine()
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+
+    args = argparse.Namespace(model="fake-model", gpu_memory_utilization=0.9, _cli_explicit_keys={"model"})
+    with pytest.deprecated_call(match="from_cli_args"):
+        Omni.from_cli_args(args)
+
+    assert captured["gpu_memory_utilization"] == 0.9
+    assert "_cli_explicit_keys" not in captured
+
+
+def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
+    monkeypatch: pytest.MonkeyPatch,
+):
     from vllm_omni.entrypoints.omni import Omni
 
     captured: dict[str, Any] = {}

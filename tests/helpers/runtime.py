@@ -1114,12 +1114,12 @@ class OmniRunner:
             for prompt_text in prompts:
                 text_str = str(prompt_text).strip() or " "
                 additional_information: dict[str, Any] = {
-                    "task_type": [task_type],
                     "text": [text_str],
-                    "language": [language],
-                    "speaker": [speaker],
-                    "max_new_tokens": [max_new_tokens],
                 }
+                additional_information["task_type"] = [task_type]
+                additional_information["language"] = [language]
+                additional_information["speaker"] = [speaker]
+                additional_information["max_new_tokens"] = [max_new_tokens]
                 if ref_audio is not None:
                     additional_information["ref_audio"] = [ref_audio]
                 if ref_text is not None:

@@ -1819,43 +1819,36 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _build_glm_tts_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build prompt for GLM-TTS.
 
-        Text-only mode:
-            AR preprocess() builds [Text | BOA] from text field.
-
-        Voice clone mode (ref_audio + ref_text):
-            Passes ref_audio_wav + ref_audio_sr + ref_text to AR preprocess(),
-            which extracts prompt_speech_token, prompt_feat, and embedding
-            on the model side (same pattern as Fish Speech).
+        Uses the multimodal processor path (same as CosyVoice3):
+        - prompt: synthesis text
+        - multi_modal_data["audio"]: (wav_samples, sr) reference audio
+        - mm_processor_kwargs["prompt_text"]: reference text transcript
 
         AR preprocess() builds [PromptText | Text | BOA | PromptSpeechTokens + ATS].
         DiT receives prompt_token, prompt_feat, embedding for conditioning.
         """
-        additional_information: dict[str, Any] = {
-            "text": request.input,
-        }
-        if request.max_new_tokens is not None:
-            additional_information["max_new_tokens"] = request.max_new_tokens
-
-        # Voice cloning: pass raw audio to model-side preprocess (like Fish Speech)
-        ref_audio_data = None
+        # Voice cloning requires ref_audio + ref_text
         if request.ref_audio is not None and request.ref_text:
             wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
-            ref_audio_data = (wav_samples, int(sr))
-            additional_information["ref_audio_wav"] = torch.from_numpy(np.asarray(wav_samples, dtype=np.float32))
-            additional_information["ref_audio_sr"] = int(sr)
-            additional_information["ref_text"] = request.ref_text
+            audio_data = (np.asarray(wav_samples, dtype=np.float32), int(sr))
 
-        prompt_len = self._estimate_glm_tts_prompt_len(
-            text=request.input,
-            ref_text=request.ref_text if request.ref_text else None,
-            ref_audio_data=ref_audio_data,
-        )
+            return {
+                "prompt": request.input,
+                "multi_modal_data": {
+                    "audio": audio_data,
+                },
+                "mm_processor_kwargs": {
+                    "prompt_text": request.ref_text,
+                },
+            }
 
-        # GLM-TTS AR preprocess() handles tokenization and prompt construction.
-        # Placeholder values are ignored, but length must match preprocess embeddings.
+        # Text-only mode (no voice cloning) — not typical for GLM-TTS
+        # but kept for completeness. Validator requires ref_audio, so
+        # this path should not be reached in normal operation.
         return {
-            "prompt_token_ids": [1] * prompt_len,
-            "additional_information": additional_information,
+            "prompt": request.input,
+            "multi_modal_data": {},
+            "mm_processor_kwargs": {},
         }
 
     # ---- Common speech generation helpers ----

@@ -1,15 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM-TTS pipeline topology (frozen).
-
-Stage 0: glm_tts     — text → speech tokens (LLM autoregressive, Llama backbone).
-Stage 1: glm_tts_dit — speech tokens → audio waveform (DiT flow-matching).
-  * ``sync_process_input_func`` runs when ``deploy.async_chunk=false``:
-    stage 1 builds full-sequence input from complete AR output.
-  * ``async_chunk_process_next_stage_input_func`` runs when
-    ``deploy.async_chunk=true``: stage 0 streams speech token chunks to
-    stage 1 through the shared-memory connector.
-"""
+"""GLM-TTS pipeline: Stage 0 (AR) → Stage 1 (DiT)."""
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -30,11 +21,14 @@ GLM_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            model_subdir="llm",
-            tokenizer_subdir="vq32k-phoneme-tokenizer",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.ar_to_dit_async_chunk"),
             sampling_constraints={
-                # GLM-TTS uses <|user|> (59253) as end-of-audio token.
+                # GLM-TTS uses 👂 (token string "👂", ID 59253) as
+                # end-of-audio marker.  The ID is resolved dynamically by
+                # GLMTTSForConditionalGeneration.__init__ from the tokenizer and
+                # validated at runtime against this hardcoded value.  If the
+                # upstream checkpoint changes the mapping, the model will log a
+                # warning so the constant here can be updated.
                 "stop_token_ids": [59253],
             },
         ),
@@ -46,8 +40,6 @@ GLM_TTS_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="latent",
-            model_subdir="flow",
-            tokenizer_subdir="llm",
             sync_process_input_func=f"{_PROC}.ar_to_dit",
         ),
     ),

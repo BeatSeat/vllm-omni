@@ -3,7 +3,7 @@
 """Vocoder loading and mel-to-audio conversion for GLM-TTS.
 
 Supports:
-  - HiFT (24kHz) from cosyvoice hifigan checkpoint
+  - HiFT (24kHz) — reuses CosyVoice3's vendored HiFTGenerator
   - Vocos2D JIT (32kHz) from TorchScript checkpoint
 
 Extracted from glm_tts_dit_wrapper.py to keep file sizes under 800 lines.
@@ -15,24 +15,70 @@ import os
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
+
+try:
+    from torch.nn.utils.parametrizations import weight_norm
+except ImportError:
+    from torch.nn.utils import weight_norm
 
 logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HiFT vocoder (24kHz)
+# HiFT vocoder (24kHz) — reuses CosyVoice3's vendored HiFTGenerator
 # ---------------------------------------------------------------------------
 
 
+class ConvRNNF0Predictor(nn.Module):
+    """Non-causal F0 predictor for GLM-TTS HiFT vocoder.
+
+    GLM-TTS ships a non-causal HiFT checkpoint whose F0 predictor uses
+    standard ``nn.Conv1d`` layers (kernel_size=3, padding=1).  CosyVoice3's
+    vendored hifigan only includes the *causal* variant
+    (``CausalConvRNNF0Predictor``), so we provide the non-causal version
+    here.  The network structure and state_dict keys are identical to the
+    original ``cosyvoice.hifigan_cosy2.f0_predictor.ConvRNNF0Predictor``.
+    """
+
+    def __init__(
+        self,
+        num_class: int = 1,
+        in_channels: int = 80,
+        cond_channels: int = 512,
+    ):
+        super().__init__()
+        self.num_class = num_class
+        self.condnet = nn.Sequential(
+            weight_norm(nn.Conv1d(in_channels, cond_channels, kernel_size=3, padding=1)),
+            nn.ELU(),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
+            nn.ELU(),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
+            nn.ELU(),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
+            nn.ELU(),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
+            nn.ELU(),
+        )
+        self.classifier = nn.Linear(in_features=cond_channels, out_features=self.num_class)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.condnet(x)
+        x = x.transpose(1, 2)
+        return torch.abs(self.classifier(x).squeeze(-1))
+
+
 class HiFTWrapper:
-    """Thin wrapper around CosyVoice HiFTGenerator."""
+    """Thin wrapper around CosyVoice3's vendored HiFTGenerator."""
 
     def __init__(self, state_dict: dict[str, Any], device: torch.device):
         self.device = device
         self.sample_rate = 24000
-        from cosyvoice.hifigan_cosy2.f0_predictor import ConvRNNF0Predictor
-        from cosyvoice.hifigan_cosy2.generator import HiFTGenerator
+        from vllm_omni.model_executor.models.common.hifigan import (
+            HiFTGenerator,
+        )
 
         f0_predictor = ConvRNNF0Predictor(num_class=1, in_channels=80, cond_channels=512)
         self.model = HiFTGenerator(
@@ -70,7 +116,13 @@ class HiFTWrapper:
 
 def load_hift(ckpt_path: str, device: torch.device) -> HiFTWrapper:
     """Load HiFT vocoder from checkpoint."""
-    state_dict = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
+    if isinstance(state_dict, dict):
+        for key in ("state_dict", "model", "generator"):
+            nested = state_dict.get(key)
+            if isinstance(nested, dict):
+                state_dict = nested
+                break
     return HiFTWrapper(state_dict, device)
 
 
@@ -158,8 +210,9 @@ def mel_to_audio(
     Returns:
         Audio waveform [B, 1, samples].
     """
-    # Transpose to [B, mel_dim, T] for vocoder
-    mel = mel.transpose(1, 2)
+    # Transpose to [B, mel_dim, T] for vocoder.
+    # HiFT / Vocos2D are precision-sensitive; always feed float32.
+    mel = mel.to(torch.float32).transpose(1, 2)
 
     if vocoder is not None:
         if callable(vocoder) and not hasattr(vocoder, "decode"):
@@ -169,9 +222,6 @@ def mel_to_audio(
         if audio.ndim == 2:
             audio = audio.unsqueeze(1)
     else:
-        logger.warning("No vocoder available, returning silence")
-        batch_size = mel.shape[0]
-        n_samples = mel.shape[2] * 256
-        audio = torch.zeros(batch_size, 1, n_samples, device=mel.device)
+        raise RuntimeError("GLM-TTS vocoder is not loaded.")
 
     return audio

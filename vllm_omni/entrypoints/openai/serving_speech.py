@@ -1868,12 +1868,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
         sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
-        # Resolve uploaded voice for non-Qwen3 models.
-        # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
-        if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano", "glm_tts"):
-            err = self._apply_uploaded_speaker(request)
-            if err:
-                raise ValueError(err)
+        # Resolve uploaded voice for models that support it.
+        # Fish/CosyVoice3/Moss resolve uploaded speakers inside their
+        # own validators (_validate_fish_tts_request, etc.).
+        # GLM-TTS requires explicit ref_audio/ref_text in the request.
 
         if self._is_fish_speech:
             validation_error = self._validate_fish_tts_request(request)

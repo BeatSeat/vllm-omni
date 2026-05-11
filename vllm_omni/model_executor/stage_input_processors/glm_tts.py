@@ -6,13 +6,42 @@ Supports both sync (non-streaming) and async_chunk (streaming) modes.
 Adapted for LLM_GENERATION execution type on stage 1 (DiT).
 """
 
-from collections import defaultdict
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.engine.serialization import deserialize_additional_information
+
 logger = init_logger(__name__)
+
+
+def _copy_voice_clone_payload(
+    src: dict[str, Any],
+    dst: dict[str, Any],
+    *,
+    to_cpu: bool = False,
+    skip_existing: bool = False,
+) -> None:
+    if not skip_existing or "prompt_speech_token" not in dst:
+        prompt = src.get("prompt_speech_token")
+        if prompt is None:
+            prompt = src.get("prompt_token")
+        if prompt is not None:
+            if to_cpu:
+                prompt = _to_cpu_tensor(prompt)
+            if prompt is not None:
+                dst["prompt_speech_token"] = prompt
+
+    for key in ("prompt_feat", "embedding"):
+        if skip_existing and key in dst:
+            continue
+        val = src.get(key)
+        if val is not None:
+            if to_cpu:
+                val = _to_cpu_tensor(val)
+            if val is not None:
+                dst[key] = val
 
 
 # ---------------------------------------------------------------------------
@@ -21,10 +50,10 @@ logger = init_logger(__name__)
 
 
 def ar_to_dit(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
 ) -> list[Any]:
     """Non-streaming processor: collect all speech tokens from AR, pass to DiT.
 
@@ -32,18 +61,18 @@ def ar_to_dit(
     from the AR model's multimodal_output to the DiT stage.
 
     Args:
-        stage_list: List of stage outputs.
-        engine_input_source: Source stage indices.
-        prompt: Original prompt (unused, voice clone data comes from AR output).
-        requires_multimodal_data: Whether multimodal data is required.
+        source_outputs: Outputs from the upstream AR stage.
+        streaming_context: Unused for sync mode; kept for interface parity with
+            other stage processors.
 
     Returns:
         List of OmniTokensPrompt for DiT stage.
     """
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    del streaming_context
+
+    ar_outputs = source_outputs
     dit_inputs: list[OmniTokensPrompt] = []
 
     for output in ar_outputs:
@@ -83,10 +112,7 @@ def ar_to_dit(
                 "speech_tokens": [],
                 "error": "No valid speech tokens after filtering -1 markers",
             }
-            for key in ("prompt_token", "prompt_feat", "embedding"):
-                val = mm.get(key)
-                if val is not None:
-                    additional_info[key] = val
+            _copy_voice_clone_payload(mm, additional_info)
             dit_inputs.append(
                 OmniTokensPrompt(
                     prompt_token_ids=[0],
@@ -104,20 +130,22 @@ def ar_to_dit(
                 min_t,
                 max_t,
             )
+            additional_info = {
+                "speech_tokens": [],
+                "error": f"Invalid speech token range: [{min_t}, {max_t}]",
+            }
+            _copy_voice_clone_payload(mm, additional_info)
             dit_inputs.append(
                 OmniTokensPrompt(
                     prompt_token_ids=[0],
                     multi_modal_data=None,
                     mm_processor_kwargs=None,
-                    additional_information={
-                        "speech_tokens": [],
-                        "error": f"Invalid speech token range: [{min_t}, {max_t}]",
-                    },
+                    additional_information=additional_info,
                 )
             )
             continue
 
-        logger.info(
+        logger.debug(
             "ar_to_dit: %d valid speech tokens, range=[%d, %d]",
             len(token_list),
             min_t,
@@ -129,10 +157,7 @@ def ar_to_dit(
             "speech_tokens": token_list,
         }
         # Propagate voice cloning data from AR model's multimodal_output
-        for key in ("prompt_token", "prompt_feat", "embedding"):
-            val = mm.get(key)
-            if val is not None:
-                additional_info[key] = val
+        _copy_voice_clone_payload(mm, additional_info)
 
         # Speech tokens as prompt_token_ids for LLM_GENERATION scheduler
         dit_inputs.append(
@@ -181,18 +206,12 @@ def _to_cpu_tensor(value: Any) -> torch.Tensor | None:
 
 
 def _decode_additional_information(additional_information: Any) -> dict[str, Any]:
-    """Extract dict from additional_information object."""
-    if isinstance(additional_information, dict):
-        return additional_information
-    if additional_information is not None and hasattr(additional_information, "entries"):
-        result: dict[str, Any] = {}
-        for key, entry in additional_information.entries.items():
-            if hasattr(entry, "tensor_data") and entry.tensor_data is not None:
-                result[key] = entry.tensor_data
-            elif hasattr(entry, "list_data") and entry.list_data is not None:
-                result[key] = entry.list_data
-        return result
-    return {}
+    """Decode additional_information to plain tensors/lists.
+
+    Align with CosyVoice3's async-chunk path: tensor payloads must be
+    reconstructed before we try to forward voice-clone conditioning.
+    """
+    return deserialize_additional_information(additional_information)
 
 
 # ---------------------------------------------------------------------------
@@ -225,44 +244,49 @@ def ar_to_dit_async_chunk(
     GLM-TTS produces single-token-per-step (no multi-codebook), so each entry
     in code_prompt_token_ids is a plain int, not a list of codebook values.
     """
-    request_id = request.external_req_id
+    request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
+    if request_id is None:
+        raise ValueError("GLM-TTS async chunk request is missing request id")
     finished = bool(is_finished or request.is_finished())
 
-    # Read connector chunk config
+    # Read connector chunk config (supports progressive list or single int)
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size = int(cfg.get("codec_chunk_frames", 25))
+    chunk_frames_cfg = cfg.get("codec_chunk_frames", 25)
+    if isinstance(chunk_frames_cfg, list):
+        progressive_chunk_sizes = [int(c) for c in chunk_frames_cfg]
+    else:
+        progressive_chunk_sizes = [int(chunk_frames_cfg)]
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    crossfade_sec = float(cfg.get("crossfade_sec", 0.1))
 
-    if chunk_size <= 0 or left_context_size_config < 0:
+    if not progressive_chunk_sizes or any(c <= 0 for c in progressive_chunk_sizes) or left_context_size_config < 0:
         raise ValueError(
-            f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
+            f"Invalid codec chunk config: codec_chunk_frames={chunk_frames_cfg}, "
             f"codec_left_context_frames={left_context_size_config}"
         )
 
     # Initialize per-request state (like CosyVoice3)
-    if not hasattr(transfer_manager, "request_payload"):
-        transfer_manager.request_payload = {}
-
-    request_state = transfer_manager.request_payload.get(request_id)
+    request_payload = getattr(transfer_manager, "request_payload", None)
+    if request_payload is None:
+        request_payload = {}
+        transfer_manager.request_payload = request_payload
+    code_prompt_token_ids = getattr(transfer_manager, "code_prompt_token_ids", None)
+    if code_prompt_token_ids is None:
+        code_prompt_token_ids = {}
+        transfer_manager.code_prompt_token_ids = code_prompt_token_ids
+    code_prompt_token_ids.setdefault(request_id, [])
+    request_state = request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_glm_tts_async_state" not in request_state:
         # Extract voice clone conditioning from request additional_information
         info = _decode_additional_information(getattr(request, "additional_information", None))
         prompt_payload: dict[str, Any] = {}
-        for key in ("prompt_token", "prompt_feat", "embedding"):
-            value = _to_cpu_tensor(info.get(key))
-            if value is not None:
-                prompt_payload[key] = value
+        _copy_voice_clone_payload(info, prompt_payload, to_cpu=True)
 
         # Also try to extract from pooling_output (first call)
         if isinstance(pooling_output, dict):
-            for key in ("prompt_token", "prompt_feat", "embedding"):
-                if key in prompt_payload:
-                    continue
-                value = _to_cpu_tensor(pooling_output.get(key))
-                if value is not None:
-                    prompt_payload[key] = value
+            _copy_voice_clone_payload(pooling_output, prompt_payload, to_cpu=True, skip_existing=True)
 
         request_state = {
             "_glm_tts_async_state": {
@@ -272,26 +296,26 @@ def ar_to_dit_async_chunk(
                 "emitted_token_len": 0,
                 "terminal_sent": False,
                 "prompt_payload": prompt_payload,
+                "chunk_sizes_history": [],
+                "block_pattern": progressive_chunk_sizes,
             }
         }
-        transfer_manager.request_payload[request_id] = request_state
+        request_payload[request_id] = request_state
 
     state = request_state["_glm_tts_async_state"]
     if bool(state.get("terminal_sent", False)):
         return None
 
     # Accumulate new speech token from this step
-    if not hasattr(transfer_manager, "code_prompt_token_ids"):
-        transfer_manager.code_prompt_token_ids = defaultdict(list)
-
+    # code_prompt_token_ids is always available via the mixin property.
     if isinstance(pooling_output, dict):
         token = _extract_last_speech_token(pooling_output)
         if token is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(token)
+            code_prompt_token_ids[request_id].append(token)
     elif not finished:
         return None
 
-    token_frames = transfer_manager.code_prompt_token_ids[request_id]
+    token_frames = code_prompt_token_ids[request_id]
     length = len(token_frames)
 
     if length <= 0:
@@ -316,10 +340,13 @@ def ar_to_dit_async_chunk(
 
     emitted_token_len = int(state.get("emitted_token_len", 0))
 
-    # Check if finished but all tokens already emitted
+    # If AR has finished exactly on a chunk boundary, emit the cumulative
+    # prefix one final time.  The official GLM-TTS streaming path keeps a
+    # lookahead/fade tail from non-final chunks and flushes it only when the
+    # final full-prefix pass is marked finished.
     if finished and length <= emitted_token_len:
         payload = {
-            "codes": {"audio": []},
+            "codes": {"audio": list(token_frames)},
             "meta": {
                 "finished": torch.tensor(True, dtype=torch.bool),
                 "left_context_size": emitted_token_len,
@@ -328,6 +355,9 @@ def ar_to_dit_async_chunk(
             "left_context_size": emitted_token_len,
             "req_id": [request_id],
             "stream_finished": torch.tensor(True, dtype=torch.bool),
+            "chunk_sizes_history": list(state.get("chunk_sizes_history", [])),
+            "block_pattern": list(state.get("block_pattern", progressive_chunk_sizes)),
+            "crossfade_sec": crossfade_sec,
         }
         if not state.get("sent_prompt", False):
             payload.update(state.get("prompt_payload", {}))
@@ -335,22 +365,37 @@ def ar_to_dit_async_chunk(
         state["terminal_sent"] = True
         return payload
 
+    # Progressive chunk size: 25 → 50 → 200 (official GLM-TTS pattern)
+    chunk_count = int(state.get("emitted_chunks", 0))
+    if chunk_count < len(progressive_chunk_sizes):
+        current_chunk_size = progressive_chunk_sizes[chunk_count]
+    else:
+        current_chunk_size = progressive_chunk_sizes[-1]
+
     # Determine chunk boundaries. Official GLM-TTS streams cumulative prefixes
     # (`all_patch_token`) into the flow stage; prefix reuse happens inside DiT.
     available = max(0, length - emitted_token_len)
 
     if not finished:
-        if available < chunk_size:
+        if available < current_chunk_size:
             return None
 
     # Send the cumulative prefix through the current chunk. token_offset marks
     # the already emitted stable prefix and is used only for output cropping.
     if emitted_token_len == 0:
-        end_index = min(length, chunk_size)
+        end_index = min(length, current_chunk_size)
         token_offset = 0
     else:
-        end_index = length if finished else min(length, emitted_token_len + chunk_size)
+        end_index = length if finished else min(length, emitted_token_len + current_chunk_size)
         token_offset = emitted_token_len
+
+    # Track actual chunk token sizes for lookahead/cache slicing.  Keep the
+    # DiT attention block pattern fixed to the configured official pattern
+    # (25 -> 50 -> 200 by default), rather than using a short final chunk.
+    actual_new_tokens = end_index - emitted_token_len
+    chunk_sizes_history: list[int] = list(state.get("chunk_sizes_history", []))
+    chunk_sizes_history.append(actual_new_tokens)
+    block_pattern = list(state.get("block_pattern", progressive_chunk_sizes))
 
     # GLM-TTS: single token per frame, no codebook interleaving
     code_predictor_codes = list(token_frames[:end_index])
@@ -365,6 +410,9 @@ def ar_to_dit_async_chunk(
         "left_context_size": token_offset,
         "req_id": [request_id],
         "stream_finished": torch.tensor(finished, dtype=torch.bool),
+        "chunk_sizes_history": chunk_sizes_history,
+        "block_pattern": block_pattern,
+        "crossfade_sec": crossfade_sec,
     }
 
     # First chunk: attach voice clone conditioning payload
@@ -379,4 +427,6 @@ def ar_to_dit_async_chunk(
         state["terminal_sent"] = True
 
     state["emitted_chunks"] = int(state.get("emitted_chunks", 0)) + 1
+    state["chunk_sizes_history"] = chunk_sizes_history
+
     return payload

@@ -3,7 +3,7 @@
 """GLM-TTS voice cloning frontend: speech tokenizer, speaker embedding, mel features.
 
 Lazy-loads external models (WhisperVQ, CampPlus ONNX) and provides extraction
-methods consumed by GLMTTSForConditionalGeneration.preprocess().
+helpers consumed by the GLM-TTS multimodal processor.
 """
 
 from __future__ import annotations
@@ -32,7 +32,14 @@ def _get_glm_tts_mel_basis(
     f_min: int,
     f_max: int,
 ) -> torch.Tensor:
-    """Compute or retrieve cached GLM-TTS mel filter bank."""
+    """Compute or retrieve cached GLM-TTS mel filter bank.
+
+    Uses torchaudio melscale_fbanks with Slaney parameters (norm="slaney",
+    mel_scale="slaney") to match the official GLM-TTS ``utils/audio.py``
+    librosa.filters.mel output.  The previous HTK / norm=None config
+    produced a numerically different filter bank that shifted the
+    prompt_feat distribution and degraded voice-clone conditioning.
+    """
     cache_key = (sample_rate, n_fft, n_mels, f_min, f_max, str(device))
     mel_basis = _MEL_BASIS_CACHE.get(cache_key)
     if mel_basis is not None:
@@ -47,8 +54,8 @@ def _get_glm_tts_mel_basis(
             f_max=float(f_max),
             n_mels=n_mels,
             sample_rate=sample_rate,
-            norm=None,
-            mel_scale="htk",
+            norm="slaney",
+            mel_scale="slaney",
         )
         .transpose(0, 1)
         .contiguous()
@@ -122,12 +129,21 @@ def load_voice_clone_frontend(
     *,
     speech_tokenizer_cache: tuple | None,
     campplus_cache: object | None,
+    campplus_path: str | None = None,
 ) -> tuple[tuple | None, object | None]:
     """Lazy-load voice cloning frontend models.
 
+    Args:
+        campplus_path: Pre-resolved path to ``campplus.onnx``.  When provided
+            this takes priority over the default ``model_root/frontend/``
+            lookup.  The caller (``GLMTTSForConditionalGeneration``) resolves
+            the path via ``transformers.utils.hub.cached_file`` during
+            ``__init__`` so the file is already downloaded.
+
     Returns:
-        ``(speech_tokenizer, campplus_session)`` — either may be ``None`` if
-        the required files are missing or loading fails.
+        ``(speech_tokenizer, campplus_session)`` — guaranteed non-None
+        on success.  Raises ``RuntimeError`` when a required component
+        cannot be loaded.
     """
     speech_tokenizer = speech_tokenizer_cache
     campplus_session = campplus_cache
@@ -138,45 +154,52 @@ def load_voice_clone_frontend(
             os.path.join(model_root, "ckpt", "speech_tokenizer"),
         )
         speech_tokenizer_path = next((path for path in speech_tokenizer_paths if os.path.isdir(path)), None)
-        if speech_tokenizer_path is not None:
-            try:
-                from safetensors.torch import load_file
-                from transformers import AutoFeatureExtractor
+        if speech_tokenizer_path is None:
+            raise RuntimeError(
+                f"GLM-TTS speech tokenizer directory not found at {speech_tokenizer_paths[0]} "
+                f"or {speech_tokenizer_paths[1]}.  Voice cloning requires the WhisperVQ "
+                f"speech tokenizer from the model snapshot."
+            )
+        try:
+            from safetensors.torch import load_file
+            from transformers import AutoFeatureExtractor, WhisperConfig
 
-                from vllm_omni.model_executor.models.glm_tts.whisper_models.configuration_whisper import (
-                    WhisperVQConfig,
-                )
-                from vllm_omni.model_executor.models.glm_tts.whisper_models.modeling_whisper import (
-                    WhisperVQEncoder,
-                )
+            from vllm_omni.model_executor.models.common.whisper_vq import (
+                WhisperVQEncoder,
+            )
 
-                _config = WhisperVQConfig.from_pretrained(speech_tokenizer_path)
-                _config.quantize_encoder_only = True
-                _model = WhisperVQEncoder(_config)
-                _state_dict = load_file(os.path.join(speech_tokenizer_path, "model.safetensors"))
-                _cleaned = {}
-                _prefix = "model.encoder."
-                for k, v in _state_dict.items():
-                    _cleaned[k[len(_prefix) :] if k.startswith(_prefix) else k] = v
-                _model.load_state_dict(_cleaned, strict=False)
-                _model = _model.to(model_device).eval()
-
-                _feature_extractor = AutoFeatureExtractor.from_pretrained(speech_tokenizer_path)
-                speech_tokenizer = (_model, _feature_extractor)
-                logger.info("Loaded GLM-TTS WhisperVQEncoder from %s", speech_tokenizer_path)
-            except Exception:
-                logger.warning("Failed to load speech tokenizer", exc_info=True)
+            _config = WhisperConfig.from_pretrained(speech_tokenizer_path)
+            _config.quantize_encoder_only = True
+            _model = WhisperVQEncoder(_config)
+            _sd = load_file(os.path.join(speech_tokenizer_path, "model.safetensors"))
+            _prefix, _cleaned = "model.encoder.", {}
+            for k, v in _sd.items():
+                _cleaned[k[len(_prefix) :] if k.startswith(_prefix) else k] = v
+            _model.load_state_dict(_cleaned, strict=False)
+            _model = _model.to(model_device).eval()
+            _fe = AutoFeatureExtractor.from_pretrained(speech_tokenizer_path)
+            speech_tokenizer = (_model, _fe)
+            logger.info("Loaded GLM-TTS speech tokenizer from %s", speech_tokenizer_path)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load GLM-TTS speech tokenizer from {speech_tokenizer_path}") from exc
 
     if campplus_session is None:
-        campplus_path = os.path.join(model_root, "frontend", "campplus.onnx")
-        if os.path.isfile(campplus_path):
-            try:
-                import onnxruntime
+        cp = campplus_path or os.path.join(model_root, "frontend", "campplus.onnx")
+        if not os.path.isfile(cp):
+            raise RuntimeError(
+                f"GLM-TTS campplus.onnx not found at {cp}.  "
+                f"Voice cloning requires the CampPlus speaker embedding model."
+            )
+        try:
+            import onnxruntime
 
-                campplus_session = onnxruntime.InferenceSession(campplus_path, providers=["CPUExecutionProvider"])
-                logger.info("Loaded campplus ONNX from %s", campplus_path)
-            except Exception as e:
-                logger.warning("Failed to load campplus ONNX: %s", e)
+            cuda_avail = "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+            cuda_ok = model_device.type == "cuda" and cuda_avail
+            providers = (["CUDAExecutionProvider"] if cuda_ok else []) + ["CPUExecutionProvider"]
+            campplus_session = onnxruntime.InferenceSession(cp, providers=providers)
+            logger.info("Loaded GLM-TTS campplus ONNX from %s", cp)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load GLM-TTS campplus ONNX from {cp}") from exc
 
     return speech_tokenizer, campplus_session
 
@@ -185,11 +208,8 @@ def extract_prompt_speech_token(
     ref_audio_wav: torch.Tensor,
     ref_audio_sr: int,
     speech_tokenizer: tuple,
-) -> list[int] | None:
+) -> list[int]:
     """Extract prompt speech tokens from reference audio using WhisperVQ."""
-    if speech_tokenizer is None:
-        logger.warning("Speech tokenizer not available, cannot extract prompt_speech_token")
-        return None
 
     model, feature_extractor = speech_tokenizer
     device = model.device
@@ -234,11 +254,8 @@ def extract_spk_embedding(
     ref_audio_wav: torch.Tensor,
     ref_audio_sr: int,
     campplus_session: object,
-) -> list[float] | None:
+) -> list[float]:
     """Extract speaker embedding from reference audio using CampPlus ONNX."""
-    if campplus_session is None:
-        logger.warning("campplus ONNX not available, cannot extract speaker embedding")
-        return None
 
     import torchaudio.compliance.kaldi as kaldi
 

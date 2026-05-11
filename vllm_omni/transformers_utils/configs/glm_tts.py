@@ -11,7 +11,9 @@ to handle the special token IDs and flow model parameters.
 
 from transformers import AutoConfig
 
-from vllm_omni.model_executor.models.glm_tts.configuration_glm_tts import GLMTTSConfig
+from vllm_omni.model_executor.models.glm_tts.configuration_glm_tts import (
+    GLMTTSConfig,
+)
 
 AutoConfig.register("glm_tts", GLMTTSConfig)
 

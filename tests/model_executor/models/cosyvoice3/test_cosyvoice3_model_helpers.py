@@ -403,6 +403,8 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     class _DummyInputBatch:
         def __init__(self):
             self.sampling_metadata = metadata
+            self.req_ids = ["rid-1"]
+            self.req_output_token_ids = [[1, 2, 3]]
             self.updated = False
 
         def update_async_output_token_ids(self):

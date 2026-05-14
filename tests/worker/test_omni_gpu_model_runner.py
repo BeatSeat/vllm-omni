@@ -38,6 +38,25 @@ class MiMoAudioForConditionalGeneration(torch.nn.Module):
     # No real forward needed for these tests.
 
 
+class GLMTTSForConditionalGeneration(torch.nn.Module):
+    """Dummy model whose class name must exactly match the production check."""
+
+    def __init__(self):
+        super().__init__()
+
+
+class WrappedGLMTTSModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = GLMTTSForConditionalGeneration()
+
+
+class DeepWrappedGLMTTSModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.module = WrappedGLMTTSModel()
+
+
 class DummyTalkerMTP(torch.nn.Module):
     """A fake talker_mtp module for deterministic CPU testing."""
 
@@ -345,6 +364,98 @@ def test_maybe_attach_mimo_audio_req_infos_enriches_dict():
     assert enriched["mm_features"] == req_state.mm_features
     # req_id should always be attached
     assert enriched["req_id"] == req_id
+
+
+def test_maybe_attach_mimo_audio_req_infos_handles_wrapped_glm_tts():
+    runner = _make_runner_for_mimo()
+    runner.model = WrappedGLMTTSModel()
+    req_id = "r_mimo"
+    req_state = runner.requests[req_id]
+
+    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, {}, req_id)
+
+    assert enriched["mm_features"] == req_state.mm_features
+    assert enriched["req_id"] == req_id
+
+
+def test_maybe_attach_mimo_audio_req_infos_handles_deep_wrapped_glm_tts():
+    runner = _make_runner_for_mimo()
+    runner.model = DeepWrappedGLMTTSModel()
+    req_id = "r_mimo"
+    req_state = runner.requests[req_id]
+
+    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(runner, req_state, {}, req_id)
+
+    assert enriched["mm_features"] == req_state.mm_features
+    assert enriched["req_id"] == req_id
+
+
+def test_scheduled_mm_features_by_req_id_is_model_gated():
+    runner = _make_runner_for_mimo()
+    runner.model = DeepWrappedGLMTTSModel()
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="r1", mm_features=["from_scheduler"]),
+            SimpleNamespace(req_id="r2", mm_features=None),
+        ]
+    )
+
+    features = OmniGPUModelRunner._scheduled_mm_features_by_req_id(runner, scheduler_output)
+
+    assert features == {"r1": ["from_scheduler"]}
+
+    runner.model = torch.nn.Linear(1, 1)
+    assert OmniGPUModelRunner._scheduled_mm_features_by_req_id(runner, scheduler_output) == {}
+
+
+def test_scheduled_mm_features_by_req_id_accepts_hf_architecture_gate():
+    runner = _make_runner_for_mimo()
+    runner.model = torch.nn.Linear(1, 1)
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(architectures=["GLMTTSForConditionalGeneration"]))
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="r1", mm_features=["from_scheduler"]),
+        ]
+    )
+
+    features = OmniGPUModelRunner._scheduled_mm_features_by_req_id(runner, scheduler_output)
+
+    assert features == {"r1": ["from_scheduler"]}
+
+
+def test_maybe_attach_mimo_audio_req_infos_uses_scheduled_fallback():
+    runner = _make_runner_for_mimo()
+    runner.model = WrappedGLMTTSModel()
+    req_id = "r_mimo"
+    req_state = runner.requests[req_id]
+    req_state.mm_features = None
+
+    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(
+        runner,
+        req_state,
+        {},
+        req_id,
+        scheduled_mm_features=["from_scheduler"],
+    )
+
+    assert enriched["mm_features"] == ["from_scheduler"]
+    assert enriched["req_id"] == req_id
+
+
+def test_maybe_attach_mimo_audio_req_infos_uses_scheduled_fallback_without_req_state():
+    runner = _make_runner_for_mimo()
+    runner.model = WrappedGLMTTSModel()
+
+    enriched = OmniGPUModelRunner._maybe_attach_mimo_audio_req_infos(
+        runner,
+        None,
+        {},
+        "r_mimo",
+        scheduled_mm_features=["from_scheduler"],
+    )
+
+    assert enriched["mm_features"] == ["from_scheduler"]
+    assert enriched["req_id"] == "r_mimo"
 
 
 def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():

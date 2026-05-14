@@ -42,6 +42,8 @@ recipes/
   on `4x H100/H800 80GB`
 - [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md):
   online serving recipe for multimodal chat (`4x H100 80GB`) and standalone TTS (`1x H100 80GB`)
+- [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md): online serving
+  recipe for Chinese/English zero-shot voice-cloned TTS on `1x A40 48GB`
 - [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md): text-to-image serving
   online serving recipe for ERNIE-Image 8B on `1x RTX 4090 24GB` or `2x RTX 4090 24GB`
 - [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md): online serving recipe for TTS on `1x A800 80GB`

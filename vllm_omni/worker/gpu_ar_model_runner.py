@@ -48,6 +48,19 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 logger = init_logger(__name__)
 
 
+class _ModelSamplerMetadataProxy:
+    """Attach Omni request-local runtime info while preserving vLLM metadata."""
+
+    __slots__ = ("_base", "model_intermediate_buffer")
+
+    def __init__(self, base: Any, model_intermediate_buffer: list[dict[str, Any]]) -> None:
+        self._base = base
+        self.model_intermediate_buffer = model_intermediate_buffer
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
 class ExecuteModelState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: torch.Tensor | None
@@ -139,9 +152,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _sampling_metadata_for_model_sampler(self, sampling_metadata):
         output_token_ids = self._build_model_sampler_output_token_ids()
-        if output_token_ids == sampling_metadata.output_token_ids:
-            return sampling_metadata
-        return replace(sampling_metadata, output_token_ids=output_token_ids)
+        metadata = sampling_metadata
+        if output_token_ids != sampling_metadata.output_token_ids:
+            metadata = replace(sampling_metadata, output_token_ids=output_token_ids)
+        if getattr(self.model, "requires_model_sampler_runtime_info", False):
+            runtime_info = [self.model_intermediate_buffer.get(req_id, {}) for req_id in self.input_batch.req_ids]
+            metadata = _ModelSamplerMetadataProxy(metadata, runtime_info)
+        return metadata
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -672,7 +689,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
                 # this internally, but prefer_model_sampler bypasses it.
-                if hasattr(self.sampler, "logit_bias_state"):
+                if not getattr(self.model, "preserve_official_ar_logits", False) and hasattr(
+                    self.sampler, "logit_bias_state"
+                ):
                     self.sampler.logit_bias_state.apply_logit_bias(
                         logits,
                         self.input_batch.expanded_idx_mapping,

@@ -1152,23 +1152,66 @@ class OmniGPUModelRunner(GPUModelRunner):
                 for req_id, req_infos in cached_infos.items():
                     self._update_intermediate_buffer(req_id, req_infos)
 
+    # Models that need per-request mm_features attached to req_infos.
+    _MODELS_NEEDING_MM_FEATURES = {
+        "MiMoAudioForConditionalGeneration",
+        "GLMTTSForConditionalGeneration",
+    }
+
+    def _model_needs_mm_features_in_req_infos(self) -> bool:
+        models = [self.model]
+        seen_ids = set()
+        model_names: set[str] = set()
+        while models:
+            model = models.pop()
+            if model is None or id(model) in seen_ids:
+                continue
+            seen_ids.add(id(model))
+            model_names.add(model.__class__.__name__)
+            for attr in ("model", "module", "_orig_mod"):
+                inner_model = getattr(model, attr, None)
+                if inner_model is not None:
+                    models.append(inner_model)
+        for config in (getattr(self, "model_config", None), getattr(self.vllm_config, "model_config", None)):
+            hf_config = getattr(config, "hf_config", None)
+            architectures = getattr(hf_config, "architectures", None)
+            if architectures:
+                model_names.update(str(arch) for arch in architectures)
+        return bool(model_names & self._MODELS_NEEDING_MM_FEATURES)
+
+    def _scheduled_mm_features_by_req_id(self, scheduler_output: "SchedulerOutput") -> dict[str, object]:
+        if not self._model_needs_mm_features_in_req_infos():
+            return {}
+
+        scheduled_mm_features: dict[str, object] = {}
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()):
+            req_id = getattr(new_req, "req_id", None) or getattr(new_req, "request_id", None)
+            mm_features = getattr(new_req, "mm_features", None)
+            if req_id is not None and mm_features:
+                scheduled_mm_features[req_id] = mm_features
+        return scheduled_mm_features
+
     def _maybe_attach_mimo_audio_req_infos(
         self,
         req_state: CachedRequestState | None,
         req_infos: dict | None,
         req_id: str,
+        scheduled_mm_features: object | None = None,
     ) -> dict | None:
         """Attach MiMoAudio-specific fields into req_infos if applicable.
 
         This helper is intentionally small and self-contained so that it can be
         unit-tested to prevent regressions when updating MiMoAudio handling.
         """
-        if req_state is None or self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+        if not self._model_needs_mm_features_in_req_infos():
+            return req_infos
+        if req_state is None and not scheduled_mm_features:
             return req_infos
 
         # Always operate on a dict copy to avoid mutating shared instances.
         req_infos = dict(req_infos) if isinstance(req_infos, dict) else {}
-        mm_features = getattr(req_state, "mm_features", None)
+        mm_features = getattr(req_state, "mm_features", None) if req_state is not None else None
+        mm_features = mm_features or scheduled_mm_features
         if mm_features and (not req_infos.get("mm_features")):
             req_infos["mm_features"] = mm_features
         req_infos["req_id"] = req_id
@@ -1304,12 +1347,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+            scheduled_mm_features = self._scheduled_mm_features_by_req_id(scheduler_output)
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
                 # mimo-audio check
                 req_state = self.requests.get(req_id)
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                req_infos = self._maybe_attach_mimo_audio_req_infos(
+                    req_state,
+                    req_infos,
+                    req_id,
+                    scheduled_mm_features.get(req_id),
+                )
 
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 sched_tokens = int(num_scheduled_tokens_np[req_index])

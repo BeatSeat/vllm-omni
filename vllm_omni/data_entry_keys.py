@@ -62,6 +62,10 @@ class OmniPayloadMeta(TypedDict, total=False):
     stream_finished: torch.Tensor
     req_id: list[str]
     left_context_size: int
+    token_offset: int
+    chunk_sizes_history: list[int]
+    block_pattern: list[int]
+    crossfade_sec: float
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
@@ -145,6 +149,10 @@ class MetaStruct(_StructBase):
     stream_finished: torch.Tensor | None = None
     req_id: list[str] | None = None
     left_context_size: int | None = None
+    token_offset: int | None = None
+    chunk_sizes_history: list[int] | None = None
+    block_pattern: list[int] | None = None
+    crossfade_sec: float | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None

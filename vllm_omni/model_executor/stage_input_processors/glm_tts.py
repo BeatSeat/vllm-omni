@@ -78,7 +78,10 @@ def ar_to_dit(
     """Non-streaming: collect speech tokens from AR, pass to DiT.
 
     Propagates voice cloning data (prompt_token, prompt_feat, embedding)
-    from the AR model's multimodal_output to the DiT stage.
+    from the AR model's multimodal_output to the DiT stage using the same
+    nested ``embed`` dict format as the async_chunk path.  This ensures
+    ``nested_get(info, "embed", ...)`` in the DiT wrapper reads all three
+    fields without relying on backward-compat flat-key fallbacks.
     """
     from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -101,7 +104,18 @@ def ar_to_dit(
             logger.warning("No valid speech tokens for request %s", output.request_id)
 
         additional_info: dict[str, Any] = {"speech_tokens": token_list}
-        _copy_voice_clone_payload(mm, additional_info)
+        # Build nested embed dict (unified with async_chunk path).
+        # _build_voice_clone_embed_struct reads prompt_speech_token/prompt_feat/
+        # embedding from *mm* and returns an EmbeddingsStruct; we convert to a
+        # plain dict so flatten_payload/unflatten_payload round-trips correctly
+        # (key "embed" is in _NESTED_KEYS).
+        embed = _build_voice_clone_embed_struct(mm)
+        if embed is not None:
+            additional_info["embed"] = {
+                "speech_token": embed.speech_token,
+                "speech_feat": embed.speech_feat,
+                "embedding": embed.embedding,
+            }
 
         dit_inputs.append(
             OmniTokensPrompt(

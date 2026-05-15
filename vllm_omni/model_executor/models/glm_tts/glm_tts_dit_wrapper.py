@@ -412,6 +412,8 @@ class GLMTTSDiTForGeneration(nn.Module):
             if prompt_feat is None and info:
                 prompt_feat = as_tensor(info.get("prompt_feat"))  # backward compat
             embedding = as_tensor(nested_get(info, "embed", "embedding")) if info else None
+            if embedding is None and info:
+                embedding = as_tensor(info.get("embedding"))  # backward compat
 
             speech_tokens_raw = info.get("speech_tokens") if info else None
             has_meta = isinstance(info.get("meta"), dict) if info else False

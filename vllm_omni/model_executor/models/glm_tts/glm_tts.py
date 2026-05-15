@@ -541,8 +541,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
     supports_multimodal = True
     requires_raw_input_tokens = True
     prefer_model_sampler = True
-    preserve_official_ar_logits = True
-    requires_model_sampler_runtime_info = True
     _sampling_eps = 1e-5
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -771,13 +769,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         return provided_text_len if provided_text_len is not None and provided_text_len > 0 else None
 
-    def _compute_generation_bounds(self, text_token_len: int) -> tuple[int, int]:
-        min_ratio = float(getattr(self.config, "min_token_text_ratio", 2.0))
-        max_ratio = float(getattr(self.config, "max_token_text_ratio", 20.0))
-        min_tokens = max(1, int(text_token_len * min_ratio))
-        max_tokens = max(min_tokens, int(text_token_len * max_ratio))
-        return min_tokens, max_tokens
-
     def _recover_prefill_conditioning_from_mm_features(self, info_dict: Mapping[str, Any]) -> dict[str, Any]:
         """Recover request-local conditioning fields before the first postprocess().
 
@@ -941,55 +932,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         return logits
 
-    def _apply_glm_tts_sampling_guard(
-        self,
-        row_logits: torch.Tensor,
-        decoded_tokens: Sequence[int],
-        *,
-        per_request_bounds: tuple[int, int] | None = None,
-    ) -> tuple[torch.Tensor, int, bool, bool]:
-        """Apply GLM-TTS EOA bounds using generated audio-token count.
-
-        vLLM's generic min_tokens guard is position based, while GLM-TTS
-        prompts include reference text and reference speech tokens before AR
-        generation starts.  The official loop counts only sampled audio tokens,
-        so keep that model-local guard for the custom RAS sampler.
-        """
-        guarded = row_logits.clone()
-        audio_len = sum(1 for token in decoded_tokens if self._ats <= int(token) <= self._ate)
-        min_tokens, max_tokens = per_request_bounds or (0, 0)
-        eoa_masked = min_tokens > 0 and audio_len < min_tokens
-        if eoa_masked:
-            guarded[self._eoa] = float("-inf")
-        eoa_forced = max_tokens > 0 and audio_len >= max_tokens
-        if eoa_forced:
-            guarded[:] = float("-inf")
-            guarded[self._eoa] = 0.0
-        return guarded, audio_len, eoa_masked, eoa_forced
-
-    @staticmethod
-    def _sampling_bounds_from_info(info: Any) -> tuple[int, int] | None:
-        if not isinstance(info, Mapping):
-            return None
-        bounds = info.get("glm_tts_audio_token_bounds")
-        if bounds is None:
-            return None
-        if isinstance(bounds, torch.Tensor):
-            values = bounds.reshape(-1).to(torch.long).cpu().tolist()
-        elif isinstance(bounds, list | tuple):
-            values = list(bounds)
-        else:
-            return None
-        if len(values) < 2:
-            return None
-        return int(values[0]), int(values[1])
-
-    def _lookup_sampling_bounds(self, sampling_metadata: Any, req_idx: int) -> tuple[int, int] | None:
-        runtime_info = getattr(sampling_metadata, "model_intermediate_buffer", None)
-        if isinstance(runtime_info, list) and req_idx < len(runtime_info):
-            return self._sampling_bounds_from_info(runtime_info[req_idx])
-        return None
-
     def sample(
         self,
         logits: torch.Tensor,
@@ -997,18 +939,29 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
     ) -> Any:
         """Custom sampler: RAS (repetition-aware sampling) per CosyVoice3 pattern.
 
-        GLM-TTS keeps an additional EOA guard because its prompt contains
-        reference speech tokens before generation starts. The guard counts
-        sampled audio tokens, matching the official inference loop.
+        Min/max EOA enforcement is delegated to vLLM's standard
+        ``logit_bias_state`` via ``SamplingParams.min_tokens`` /
+        ``max_tokens`` set by the serving endpoint and ``stop_token_ids``
+        from the pipeline config.  This sampler only handles RAS and an
+        allowed-token mask restricting output to ``[ATS..ATE] ∪ {EOA}``.
         """
         if logits is None or logits.numel() == 0:
             return None
         if self.model_stage != "glm_tts":
             return None
 
-        # Mirror official GLM-TTS. The official loop samples from the raw AR
-        # logits with RAS and only applies the local EOA min/max guard.
         logits = logits.to(torch.float32)
+
+        # Restrict sampling to valid audio tokens and EOA.  vLLM's
+        # logit_bias_state handles min_tokens (mask EOA early) and the
+        # engine enforces max_tokens, but without this mask the model
+        # could emit non-audio tokens that waste decode budget.
+        allowed_mask = getattr(self, "_ar_allowed_mask", None)
+        if allowed_mask is None or allowed_mask.device != logits.device or allowed_mask.shape[0] != logits.shape[-1]:
+            allowed_mask = torch.full((logits.shape[-1],), float("-inf"), device=logits.device)
+            allowed_mask[self._ats : self._ate + 1] = 0.0
+            allowed_mask[self._eoa] = 0.0
+            self._ar_allowed_mask = allowed_mask
 
         ws = getattr(self, "_ras_win_size", 10)
         tr = getattr(self, "_ras_tau_r", 0.1)
@@ -1017,14 +970,9 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         sampled_ids: list[int] = []
         for req_idx in range(int(logits.shape[0])):
-            row_logits = logits[req_idx]
+            row_logits = logits[req_idx] + allowed_mask
             decoded_tokens = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
-            )
-            row_logits, _, _, _ = self._apply_glm_tts_sampling_guard(
-                row_logits,
-                decoded_tokens,
-                per_request_bounds=self._lookup_sampling_bounds(sampling_metadata, req_idx),
             )
             temperature = float(req_float(sampling_metadata.temperature, req_idx, 1.0))
             if temperature < self._sampling_eps:
@@ -1172,17 +1120,10 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             # text_token_len was already resolved during the initial prefill.
             if not one_token_prefill_tail:
                 text_token_len = self._resolve_prefill_target_text_len(span_len, info_dict, recovered_conditioning)
-                if text_token_len is None:
-                    raise RuntimeError(
-                        "GLM-TTS target text token length is missing before AR prefill. "
-                        "Cannot apply the official min/max EOA guard safely."
+                if text_token_len is not None:
+                    info_update["glm_tts_text_token_len"] = torch.tensor(
+                        [text_token_len], device=device, dtype=torch.long
                     )
-                info_update["glm_tts_audio_token_bounds"] = torch.tensor(
-                    self._compute_generation_bounds(text_token_len),
-                    device=device,
-                    dtype=torch.long,
-                )
-                info_update["glm_tts_text_token_len"] = torch.tensor([text_token_len], device=device, dtype=torch.long)
                 prompt_text_len = info_dict.get("glm_tts_prompt_text_token_len")
                 if prompt_text_len is None:
                     prompt_text_len = recovered_conditioning.get("glm_tts_prompt_text_token_len")

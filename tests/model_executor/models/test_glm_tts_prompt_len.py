@@ -320,45 +320,6 @@ def test_glm_tts_preprocess_initializes_generation_bounds_before_sampling() -> N
     )
 
     assert info["glm_tts_text_token_len"][0].item() == 27
-    assert info["glm_tts_audio_token_bounds"].tolist() == [54, 540]
-
-
-def test_glm_tts_sampling_guard_masks_eoa_before_min_len() -> None:
-    model = object.__new__(GLMTTSForConditionalGeneration)
-    model._ats = 1000
-    model._ate = 2000
-    model._eoa = 2
-
-    row_logits = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    guarded, audio_len, eoa_masked, eoa_forced = model._apply_glm_tts_sampling_guard(
-        row_logits,
-        decoded_tokens=[],
-        per_request_bounds=(5, 20),
-    )
-
-    assert guarded[0].item() == 1.0
-    assert guarded[1].item() == 2.0
-    assert torch.isneginf(guarded[2])
-    assert guarded[3].item() == 4.0
-    assert eoa_masked is True
-    assert eoa_forced is False
-    assert audio_len == 0
-
-
-def test_glm_tts_bounds_lookup_reads_batch_order_runtime_info() -> None:
-    model = object.__new__(GLMTTSForConditionalGeneration)
-    sampling_metadata = SimpleNamespace(
-        model_intermediate_buffer=[
-            {"glm_tts_audio_token_bounds": torch.tensor([5, 20])},
-            {"glm_tts_audio_token_bounds": [7, 30]},
-            {},
-        ],
-    )
-
-    assert model._lookup_sampling_bounds(sampling_metadata, 0) == (5, 20)
-    assert model._lookup_sampling_bounds(sampling_metadata, 1) == (7, 30)
-    assert model._lookup_sampling_bounds(sampling_metadata, 2) is None
-    assert model._lookup_sampling_bounds(sampling_metadata, 3) is None
 
 
 def test_glm_tts_preprocess_recovers_prefill_lengths_from_mm_features(
@@ -392,7 +353,6 @@ def test_glm_tts_preprocess_recovers_prefill_lengths_from_mm_features(
     assert info["glm_tts_mm_prefill_done"] is True
     assert info["glm_tts_text_token_len"][0].item() == 11
     assert info["prompt_speech_token_len"][0].item() == 17
-    assert info["glm_tts_audio_token_bounds"].tolist() == [22, 220]
 
 
 def test_glm_tts_make_omni_output_emits_prompt_speech_len_once() -> None:

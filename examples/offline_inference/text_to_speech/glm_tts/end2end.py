@@ -7,8 +7,17 @@ GLM-TTS is a two-stage TTS system:
   - Stage 1 (DiT): Flow matching model converts speech tokens to audio
 
 Usage:
+    # Sync two-stage (default)
     python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
         --model /path/to/GLM-TTS \
+        --text "你好，这是一个语音合成测试。" \
+        --ref-audio /path/to/reference.wav \
+        --ref-text "参考音频的转录文本。" \
+        --output-dir ./output
+
+    # Async chunk mode (streaming DiT)
+    python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
+        --model /path/to/GLM-TTS --async-chunk \
         --text "你好，这是一个语音合成测试。" \
         --ref-audio /path/to/reference.wav \
         --ref-text "参考音频的转录文本。" \
@@ -19,12 +28,14 @@ import base64
 import io
 import logging
 import os
+import tempfile
 import time
 from typing import Any
 from urllib.request import urlopen
 
 import soundfile as sf
 import torch
+import yaml
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -92,10 +103,32 @@ def _audio_to_tensor(mm: dict) -> tuple[torch.Tensor | None, int]:
     ), sr
 
 
+def _modify_deploy_config(base_path: str, async_chunk: bool) -> str:
+    """Build deploy config with explicit sync/async mode and eager execution.
+
+    Mirrors the logic in ``tests/e2e/offline_inference/test_glm_tts.py``
+    (``_get_deploy_config``) so that example runs match CI behavior.
+    """
+    with open(base_path) as f:
+        cfg = yaml.safe_load(f)
+    cfg["async_chunk"] = async_chunk
+    for stage in cfg.get("stages", []):
+        stage["enforce_eager"] = True
+        if stage.get("stage_id") == 0:
+            stage["async_scheduling"] = bool(async_chunk)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False, prefix="glm_tts_"
+    )
+    yaml.dump(cfg, tmp)
+    tmp.close()
+    return tmp.name
+
+
 def main(args):
     """Run offline GLM-TTS inference."""
     os.makedirs(args.output_dir, exist_ok=True)
-    deploy_config_path = args.deploy_config or DEFAULT_DEPLOY_CONFIG
+    base_deploy_config = args.deploy_config or DEFAULT_DEPLOY_CONFIG
+    deploy_config_path = _modify_deploy_config(base_deploy_config, args.async_chunk)
 
     ref_audio_wav, ref_audio_sr = _load_ref_audio(args.ref_audio)
     if not args.ref_text:
@@ -166,6 +199,12 @@ def parse_args():
     parser.add_argument("--ref-audio", type=str, required=True, help="Reference WAV path/URL")
     parser.add_argument("--ref-text", type=str, required=True, help="Transcript of ref audio")
     parser.add_argument("--deploy-config", type=str, default=None)
+    parser.add_argument(
+        "--async-chunk",
+        action="store_true",
+        default=False,
+        help="Enable async_chunk mode (streaming DiT). Default: sync two-stage.",
+    )
     parser.add_argument("--log-stats", action="store_true")
     parser.add_argument("--stage-init-timeout", type=int, default=600)
     return parser.parse_args()

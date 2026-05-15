@@ -6,8 +6,13 @@ GLM-TTS is a two-stage TTS system (AR + DiT) that generates audio from text
 conditioned on reference speech. Each request requires ref_audio + ref_text.
 
 Usage:
-    # Voice cloning
-    python openai_speech_client.py --text "你好" --ref-audio file:///path/to/ref.wav --ref-text "参考文本"
+    # Voice cloning (sync, non-streaming — server with --no-async-chunk)
+    python openai_speech_client.py --text "你好" --ref-audio file:///path/to/ref.wav \
+        --ref-text "参考文本"
+
+    # Voice cloning (streaming — server with default async_chunk)
+    python openai_speech_client.py --text "你好" --ref-audio file:///path/to/ref.wav \
+        --ref-text "参考文本" --stream
 
     # Specify output format
     python openai_speech_client.py --text "你好" --ref-audio file:///path/to/ref.wav \
@@ -31,6 +36,7 @@ def run_tts_generation(args) -> None:
         "model": args.model,
         "input": args.text,
         "response_format": args.response_format,
+        "stream": args.stream,
     }
 
     # Add optional parameters
@@ -47,6 +53,7 @@ def run_tts_generation(args) -> None:
 
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
+    print(f"Stream: {args.stream}")
     if args.ref_audio:
         print(f"Voice cloning: ref_audio={args.ref_audio}, ref_text={args.ref_text}")
     print("Generating audio...")
@@ -58,28 +65,56 @@ def run_tts_generation(args) -> None:
         "Authorization": f"Bearer {args.api_key}",
     }
 
-    with httpx.Client(timeout=300.0) as client:
-        response = client.post(api_url, json=payload, headers=headers)
-
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}")
-        print(response.text)
-        return
-
-    # Check for JSON error response
-    try:
-        text = response.content.decode("utf-8")
-        if text.startswith('{"error"'):
-            print(f"Error: {text}")
-            return
-    except UnicodeDecodeError:
-        pass  # Binary audio data, not an error
-
-    # Save audio response
     output_path = args.output or f"tts_output.{args.response_format}"
-    with open(output_path, "wb") as f:
-        f.write(response.content)
-    print(f"Audio saved to: {output_path}")
+
+    if args.stream:
+        # Streaming mode: collect audio chunks as they arrive
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream("POST", api_url, json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    resp.read()
+                    print(f"Error: {resp.status_code}")
+                    print(resp.text)
+                    return
+                chunks = []
+                for chunk in resp.iter_bytes():
+                    chunks.append(chunk)
+        audio_data = b"".join(chunks)
+
+        # Check for JSON error response
+        try:
+            text = audio_data.decode("utf-8")
+            if text.startswith('{"error"'):
+                print(f"Error: {text}")
+                return
+        except UnicodeDecodeError:
+            pass  # Binary audio data, not an error
+
+        with open(output_path, "wb") as f:
+            f.write(audio_data)
+        print(f"Audio saved to: {output_path} ({len(chunks)} chunks, {len(audio_data)} bytes)")
+    else:
+        # Non-streaming mode: single response
+        with httpx.Client(timeout=300.0) as client:
+            response = client.post(api_url, json=payload, headers=headers)
+
+        if response.status_code != 200:
+            print(f"Error: {response.status_code}")
+            print(response.text)
+            return
+
+        # Check for JSON error response
+        try:
+            text = response.content.decode("utf-8")
+            if text.startswith('{"error"'):
+                print(f"Error: {text}")
+                return
+        except UnicodeDecodeError:
+            pass  # Binary audio data, not an error
+
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        print(f"Audio saved to: {output_path} ({len(response.content)} bytes)")
 
 
 def parse_args():
@@ -139,6 +174,14 @@ def parse_args():
         type=str,
         default=None,
         help="Output audio file path (default: tts_output.<format>)",
+    )
+
+    # Streaming mode
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        default=False,
+        help="Use streaming response (for async_chunk server mode)",
     )
 
     # Voice cloning parameters

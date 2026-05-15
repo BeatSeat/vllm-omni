@@ -51,13 +51,14 @@ def _progressive_transfer_manager() -> SimpleNamespace:
     return SimpleNamespace(connector=connector)
 
 
-def _source_output(mm: dict) -> SimpleNamespace:
+def _source_output(mm: dict, request_id: str = "req-0") -> SimpleNamespace:
     return SimpleNamespace(
+        request_id=request_id,
         outputs=[
             SimpleNamespace(
                 multimodal_output=mm,
             )
-        ]
+        ],
     )
 
 
@@ -88,9 +89,18 @@ def test_ar_to_dit_filters_invalid_tokens_and_preserves_conditioning() -> None:
     assert outputs[0]["prompt_token_ids"] == [0, 7, 32767]
     additional_info = outputs[0]["additional_information"]
     assert additional_info["speech_tokens"] == [0, 7, 32767]
-    assert additional_info["prompt_speech_token"] is prompt_token
-    assert additional_info["prompt_feat"] is prompt_feat
-    assert additional_info["embedding"] is embedding
+    # Voice clone data stored in nested embed dict (matches async_chunk path)
+    embed = additional_info["embed"]
+    assert embed["speech_token"] is prompt_token
+    assert embed["speech_feat"] is prompt_feat
+    assert embed["embedding"] is embedding
+    # Meta dict enables block-causal attention in DiT wrapper
+    meta = additional_info["meta"]
+    assert meta["req_id"] == ["req-0"]
+    assert meta["token_offset"] == 0
+    assert meta["stream_finished"] is True
+    assert meta["block_pattern"] == [3]  # len([0, 7, 32767])
+    assert meta["chunk_sizes_history"] == [3]
 
 
 def test_dit_explicit_empty_speech_tokens_override_scheduler_placeholder() -> None:

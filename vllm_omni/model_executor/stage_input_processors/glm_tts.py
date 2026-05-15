@@ -104,6 +104,7 @@ def ar_to_dit(
             logger.warning("No valid speech tokens for request %s", output.request_id)
 
         additional_info: dict[str, Any] = {"speech_tokens": token_list}
+
         # Build nested embed dict (unified with async_chunk path).
         # _build_voice_clone_embed_struct reads prompt_speech_token/prompt_feat/
         # embedding from *mm* and returns an EmbeddingsStruct; we convert to a
@@ -116,6 +117,19 @@ def ar_to_dit(
                 "speech_feat": embed.speech_feat,
                 "embedding": embed.embedding,
             }
+
+        # Populate meta dict so DiT wrapper uses block-causal attention.
+        # Without meta, forward() sets uses_streaming=False → bidirectional
+        # attention → garbage audio. The full token sequence is treated as
+        # a single "chunk" with stream_finished=True.
+        n_tokens = len(token_list) if token_list else 1
+        additional_info["meta"] = {
+            "req_id": [output.request_id],
+            "token_offset": 0,
+            "stream_finished": True,
+            "chunk_sizes_history": [n_tokens],
+            "block_pattern": [n_tokens],
+        }
 
         dit_inputs.append(
             OmniTokensPrompt(

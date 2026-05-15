@@ -541,6 +541,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
     supports_multimodal = True
     requires_raw_input_tokens = True
     prefer_model_sampler = True
+    preserve_official_ar_logits = True
     _sampling_eps = 1e-5
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={

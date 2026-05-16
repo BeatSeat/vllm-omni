@@ -254,7 +254,7 @@ def extract_spk_embedding(
     ref_audio_wav: torch.Tensor,
     ref_audio_sr: int,
     campplus_session: object,
-) -> list[float]:
+) -> list[float] | None:
     """Extract speaker embedding from reference audio using CampPlus ONNX."""
 
     import torchaudio.compliance.kaldi as kaldi

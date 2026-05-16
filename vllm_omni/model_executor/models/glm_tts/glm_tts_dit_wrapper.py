@@ -341,7 +341,7 @@ class GLMTTSDiTForGeneration(nn.Module):
             return dtype
         if isinstance(dtype, str):
             _aliases = {"bf16": "bfloat16", "fp16": "float16", "half": "float16", "fp32": "float32"}
-            return getattr(torch, _aliases.get(dtype, dtype), None)
+            return getattr(torch, _aliases.get(dtype.lower(), dtype.lower()), None)
         return None
 
     def _ensure_vocoder_loaded(self) -> None:

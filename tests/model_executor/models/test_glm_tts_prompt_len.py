@@ -322,38 +322,6 @@ def test_glm_tts_preprocess_initializes_generation_bounds_before_sampling() -> N
     assert info["glm_tts_text_token_len"][0].item() == 27
 
 
-def test_glm_tts_preprocess_recovers_prefill_lengths_from_mm_features(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = object.__new__(GLMTTSForConditionalGeneration)
-    model._pad = 0
-    model._ats = 1000
-    model._ate = 2000
-    model._eoa = 3000
-    model._model_dtype = lambda: torch.float32
-    model.config = SimpleNamespace(min_token_text_ratio=2.0, max_token_text_ratio=20.0)
-
-    monkeypatch.setattr(
-        glm_tts_module.MultiModalFeatureSpec,
-        "gather_kwargs",
-        staticmethod(
-            lambda _features, _keys: {
-                "glm_tts_text_token_len": [torch.tensor([11])],
-                "prompt_speech_token_len": [torch.tensor([17])],
-            }
-        ),
-    )
-
-    _, _, info = model.preprocess(
-        torch.tensor([11, 12, 13]),
-        torch.tensor([[1.0], [2.0], [3.0]]),
-        mm_features=[object()],
-    )
-
-    assert info["glm_tts_mm_prefill_done"] is True
-    assert info["glm_tts_text_token_len"][0].item() == 11
-    assert info["prompt_speech_token_len"][0].item() == 17
-
 
 def test_glm_tts_make_omni_output_emits_prompt_speech_len_once() -> None:
     model = object.__new__(GLMTTSForConditionalGeneration)

@@ -322,7 +322,6 @@ def test_glm_tts_preprocess_initializes_generation_bounds_before_sampling() -> N
     assert info["glm_tts_text_token_len"][0].item() == 27
 
 
-
 def test_glm_tts_make_omni_output_emits_prompt_speech_len_once() -> None:
     model = object.__new__(GLMTTSForConditionalGeneration)
 

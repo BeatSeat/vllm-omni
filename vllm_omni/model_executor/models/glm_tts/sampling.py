@@ -13,15 +13,7 @@ import torch
 
 __all__ = [
     "req_float",
-    "req_scalar",
 ]
-
-
-def req_scalar(param: torch.Tensor | None, req_idx: int, default: int) -> int:
-    if param is None or param.numel() == 0:
-        return default
-    index = min(req_idx, int(param.numel()) - 1)
-    return int(param.reshape(-1)[index].item())
 
 
 def req_float(param: torch.Tensor | None, req_idx: int, default: float) -> float:

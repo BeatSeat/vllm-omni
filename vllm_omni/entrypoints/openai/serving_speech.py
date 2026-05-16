@@ -2079,9 +2079,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         text_len = self._estimate_glm_tts_text_token_len(text)
         prompt_text_len = (
-            self._estimate_glm_tts_text_token_len(prompt_text, add_trailing_space=True)
-            if prompt_text
-            else 0
+            self._estimate_glm_tts_text_token_len(prompt_text, add_trailing_space=True) if prompt_text else 0
         )
         return {
             "glm_tts_text_token_len": [text_len],

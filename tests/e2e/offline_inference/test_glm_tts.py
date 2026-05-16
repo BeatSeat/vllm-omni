@@ -98,7 +98,7 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
     Uses the official jiayan_zh.wav reference audio from the upstream
     GLM-TTS repository (real human speech matching REF_TEXT).
     """
-    synth_text = "我捡到一只超可爱的流浪猫。我给这只小猫取了一个名字，叫丁满。"
+    synth_text = "今天天气真不错，适合出去散散步。"
     prompt_audio = _load_ref_audio()
     from tests.helpers.runtime import OmniRunner
 

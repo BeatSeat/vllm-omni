@@ -89,7 +89,7 @@ def test_voice_clone_zh_sync(omni_server, openai_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
-        "input": "我捡到一只超可爱的流浪猫。我给这只小猫取了一个名字，叫丁满。",
+        "input": "今天天气真不错，适合出去散散步。",
         "stream": False,
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,
@@ -112,7 +112,7 @@ def test_voice_clone_zh_async_chunk(omni_server, openai_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
-        "input": "我捡到一只超可爱的流浪猫。我给这只小猫取了一个名字，叫丁满。",
+        "input": "今天天气真不错，适合出去散散步。",
         "stream": True,
         "response_format": "wav",
         "ref_audio": REF_AUDIO_URL,

@@ -54,7 +54,6 @@ stages:
       detokenize: false
     hf_overrides:
       sample_method: ras
-      sampling_top_k: 25
       ras_top_p: 0.8
       ras_top_k: 25
       ras_win_size: 10

@@ -33,6 +33,7 @@ import time
 from typing import Any
 from urllib.request import urlopen
 
+import numpy as np
 import soundfile as sf
 import torch
 import yaml
@@ -75,33 +76,26 @@ def _load_ref_audio(ref_audio: str) -> tuple[torch.Tensor, int]:
     return torch.from_numpy(wav_np), int(sr)
 
 
-def _audio_to_tensor(mm: dict) -> tuple[torch.Tensor | None, int]:
-    """Extract and concatenate audio from multimodal output."""
-    audio_data = mm.get("audio")
-    if audio_data is None:
-        return None, SAMPLE_RATE
-    sr_raw = mm.get("sr", SAMPLE_RATE)
-    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-    sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-    if isinstance(audio_data, list):
-        if not audio_data:
-            return torch.zeros(0, dtype=torch.float32), sr
-        if hasattr(audio_data[0], "cpu"):
-            return torch.cat(audio_data, dim=-1).float().cpu(), sr
-        import numpy as np
+def _concat_audio(audio_val: Any) -> np.ndarray:
+    """Concatenate audio tensors from multimodal output."""
+    if isinstance(audio_val, list):
+        tensors = [torch.as_tensor(t).float().reshape(-1) for t in audio_val if t is not None]
+        if not tensors:
+            return np.zeros((0,), dtype=np.float32)
+        return torch.cat(tensors, dim=-1).cpu().numpy().astype(np.float32, copy=False)
+    if isinstance(audio_val, torch.Tensor):
+        return audio_val.float().cpu().numpy().reshape(-1)
+    return np.asarray(audio_val, dtype=np.float32).reshape(-1)
 
-        return torch.as_tensor(
-            np.concatenate([np.asarray(a).flatten() for a in audio_data]),
-            dtype=torch.float32,
-        ), sr
-    if hasattr(audio_data, "cpu"):
-        return audio_data.float().cpu().flatten(), sr
-    import numpy as np
 
-    return torch.as_tensor(
-        np.asarray(audio_data).flatten(),
-        dtype=torch.float32,
-    ), sr
+def _extract_sample_rate(audio_mm: dict) -> int:
+    """Extract sample rate from multimodal output dict."""
+    sr_raw = audio_mm.get("sr", SAMPLE_RATE)
+    if isinstance(sr_raw, list):
+        sr_raw = sr_raw[-1] if sr_raw else SAMPLE_RATE
+    if hasattr(sr_raw, "item"):
+        return int(sr_raw.item())
+    return int(sr_raw)
 
 
 def _modify_deploy_config(base_path: str, async_chunk: bool) -> str:
@@ -140,10 +134,7 @@ def main(args):
                 "audio": (ref_audio_wav.float().cpu().numpy(), ref_audio_sr),
             },
             "modalities": ["audio"],
-            "mm_processor_kwargs": {
-                "prompt_text": args.ref_text,
-                "sample_rate": ref_audio_sr,
-            },
+            "mm_processor_kwargs": {"prompt_text": args.ref_text},
             "additional_information": build_glm_tts_prefill_metadata(
                 args.model,
                 args.text,
@@ -160,39 +151,20 @@ def main(args):
     )
 
     t_start = time.perf_counter()
-    audio_chunks: dict[str, list[torch.Tensor]] = {}
-    sample_rates: dict[str, int] = {}
-    prev_count: dict[str, int] = {}
+    outputs = omni.generate(inputs)
+    elapsed = (time.perf_counter() - t_start) * 1000
 
-    for stage_out in omni.generate(inputs):
-        if stage_out.error:
-            logger.warning("request=%s error=%s", stage_out.request_id, stage_out.error)
-        mm = stage_out.multimodal_output
-        if not mm or "audio" not in mm:
-            continue
-        # Deduplicate cumulative audio chunks
-        audio_val = mm.get("audio")
-        if isinstance(audio_val, list):
-            pc = prev_count.get(stage_out.request_id, 0)
-            new_audio = audio_val[pc:]
-            prev_count[stage_out.request_id] = len(audio_val)
-            if not new_audio:
-                continue
-            mm = {**mm, "audio": new_audio}
-        audio, sr = _audio_to_tensor(mm)
-        if audio is None or audio.numel() == 0:
-            continue
-        audio_chunks.setdefault(stage_out.request_id, []).append(audio)
-        sample_rates[stage_out.request_id] = sr
+    assert outputs, "No outputs returned"
+    audio_mm = outputs[0].multimodal_output
+    assert "audio" in audio_mm, "No audio output found"
 
-    for req_id, chunks in audio_chunks.items():
-        full_audio = torch.cat(chunks, dim=-1).float().cpu().numpy().flatten()
-        sr = sample_rates[req_id]
-        out_path = os.path.join(args.output_dir, f"output_{req_id}.wav")
-        sf.write(out_path, full_audio, samplerate=sr, format="WAV")
-        logger.info("Saved %s (%.2fs @ %dHz)", out_path, len(full_audio) / sr, sr)
+    audio = _concat_audio(audio_mm["audio"])
+    sr = _extract_sample_rate(audio_mm)
+    out_path = os.path.join(args.output_dir, "output.wav")
+    sf.write(out_path, audio, samplerate=sr, format="WAV")
 
-    logger.info("Total inference: %.1f ms", (time.perf_counter() - t_start) * 1000)
+    logger.info("Saved %s (%.2fs @ %dHz)", out_path, len(audio) / sr, sr)
+    logger.info("Total inference: %.1f ms", elapsed)
 
 
 def parse_args():

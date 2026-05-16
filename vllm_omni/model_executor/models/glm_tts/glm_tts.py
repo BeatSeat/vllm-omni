@@ -9,7 +9,6 @@ Analogous to Fish Speech Slow AR and Qwen3-TTS Talker models.
 from __future__ import annotations
 
 import os
-import threading
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -268,8 +267,7 @@ def build_glm_tts_prefill_metadata(
     """Build request-local GLM-TTS length metadata for AR prefill.
 
     These scalars are mirrored into ``additional_information`` so the model
-    preprocess hook can initialize request state without peeking into
-    runner-level ``mm_features``.
+    preprocess hook can initialize request state from the metadata alone.
     """
     if tokenizer_path is None:
         tokenizer_path = resolve_glm_tts_tokenizer_path(model_name_or_path)
@@ -729,9 +727,8 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-        self.gpu_resident_buffer_keys: set[str] = {"last_hidden"}
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("last_hidden", "last")}
 
-        self._text_frontend: GLMTTSTextFrontend | None = None
         self.model = LlamaModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         # LM head for speech token prediction
@@ -766,9 +763,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         self._ras_tau_r = float(getattr(config, "ras_tau_r", 0.1))
         self._ras_top_p = float(getattr(config, "ras_top_p", 0.8))
         self._ras_top_k = int(getattr(config, "ras_top_k", 25))
-
-        # Thread safety for lazy text frontend loading
-        self._text_frontend_lock = threading.Lock()
 
     def _model_dtype(self) -> torch.dtype:
         """Return the active parameter dtype for locally-created embeddings."""
@@ -819,13 +813,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             return inferred_text_len
 
         return provided_text_len if provided_text_len is not None and provided_text_len > 0 else None
-
-    def _get_text_frontend(self) -> GLMTTSTextFrontend:
-        if self._text_frontend is None:
-            with self._text_frontend_lock:
-                if self._text_frontend is None:
-                    self._text_frontend = GLMTTSTextFrontend()
-        return self._text_frontend
 
     def embed_input_ids(
         self,
@@ -1190,7 +1177,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         if hidden_states.numel() == 0:
             return {}
         last = hidden_states[-1, :].detach()
-        update: dict[str, Any] = {"last_hidden": last}
+        update: dict[str, Any] = {"last_hidden": {"last": last}}
 
         multimodal_outputs = kwargs.get("multimodal_outputs")
         if isinstance(multimodal_outputs, dict):

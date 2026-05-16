@@ -51,7 +51,6 @@ class GLMTTSConfig(PretrainedConfig):
         max_token_text_ratio: float = 20.0,
         min_token_text_ratio: float = 2.0,
         sample_method: str = "ras",
-        sampling_top_k: int = 25,
         ras_top_p: float = 0.8,
         ras_top_k: int = 25,
         ras_win_size: int = 10,
@@ -81,7 +80,6 @@ class GLMTTSConfig(PretrainedConfig):
         self.max_token_text_ratio = max_token_text_ratio
         self.min_token_text_ratio = min_token_text_ratio
         self.sample_method = sample_method
-        self.sampling_top_k = sampling_top_k
         self.ras_top_p = ras_top_p
         self.ras_top_k = ras_top_k
         self.ras_win_size = ras_win_size

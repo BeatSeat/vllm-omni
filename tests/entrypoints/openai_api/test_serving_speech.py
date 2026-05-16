@@ -2411,7 +2411,7 @@ class TestGLMTTSServing:
             return_value="normalized target",
         )
 
-        text_token_len = glm_tts_server._estimate_glm_tts_target_text_token_len("abcdef")
+        text_token_len = glm_tts_server._estimate_glm_tts_text_token_len("abcdef")
 
         assert text_token_len == 3
         load_tokenizer.assert_called_once()

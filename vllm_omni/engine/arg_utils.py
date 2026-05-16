@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "GLMTTSForConditionalGeneration": "glm_tts",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
     "VoxCPMForConditionalGeneration": "voxcpm",
@@ -28,6 +29,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "GLMTTSForConditionalGeneration": "vq32k-phoneme-tokenizer",
 }
 
 
@@ -40,6 +42,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
@@ -57,6 +60,7 @@ def _register_omni_hf_configs() -> None:
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
+        ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),

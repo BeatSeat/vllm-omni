@@ -28,62 +28,63 @@ DEFAULT_API_KEY = "EMPTY"
 
 def run_tts_generation(args) -> None:
     """Run TTS generation via OpenAI-compatible /v1/audio/speech API."""
-
-    # Build request payload
-    payload = {
-        "model": args.model,
-        "input": args.text,
-        "response_format": args.response_format,
-        "stream": bool(args.stream),
-    }
-
-    # Add optional parameters
-    if args.max_new_tokens:
-        payload["max_new_tokens"] = args.max_new_tokens
-
-    # Voice cloning parameters
-    if args.ref_audio:
-        payload["ref_audio"] = args.ref_audio
-    if args.ref_text:
-        payload["ref_text"] = args.ref_text
     if not args.ref_audio or not args.ref_text:
         raise ValueError("GLM-TTS requires --ref-audio and --ref-text for voice cloning.")
 
+    payload = {
+        "model": args.model,
+        "voice": "default",
+        "input": args.text,
+        "response_format": args.response_format,
+        "stream": bool(args.stream),
+        "ref_audio": args.ref_audio,
+        "ref_text": args.ref_text,
+    }
+    if args.max_new_tokens:
+        payload["max_new_tokens"] = args.max_new_tokens
+
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
-    if args.ref_audio:
-        print(f"Voice cloning: ref_audio={args.ref_audio}, ref_text={args.ref_text}")
+    print(f"Voice cloning: ref_audio={args.ref_audio}, ref_text={args.ref_text}")
+    print(f"Stream: {args.stream}")
     print("Generating audio...")
 
-    # Make the API call
     api_url = f"{args.api_base}/v1/audio/speech"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {args.api_key}",
     }
 
-    with httpx.Client(timeout=300.0) as client:
-        response = client.post(api_url, json=payload, headers=headers)
-
-    if response.status_code != 200:
-        print(f"Error: {response.status_code}")
-        print(response.text)
-        return
-
-    # Check for JSON error response
-    try:
-        text = response.content.decode("utf-8")
-        if text.startswith('{"error"'):
-            print(f"Error: {text}")
+    if args.stream:
+        output_path = args.output or "tts_output.pcm"
+        with httpx.Client(timeout=300.0) as client, open(output_path, "wb") as f:
+            with client.stream("POST", api_url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    print(f"Error: {response.status_code}")
+                    response.read()
+                    print(response.text)
+                    return
+                for chunk in response.iter_bytes():
+                    f.write(chunk)
+        print(f"Streaming audio saved to: {output_path}")
+    else:
+        with httpx.Client(timeout=300.0) as client:
+            response = client.post(api_url, json=payload, headers=headers)
+        if response.status_code != 200:
+            print(f"Error: {response.status_code}")
+            print(response.text)
             return
-    except UnicodeDecodeError:
-        pass  # Binary audio data, not an error
-
-    # Save audio response
-    output_path = args.output or f"tts_output.{args.response_format}"
-    with open(output_path, "wb") as f:
-        f.write(response.content)
-    print(f"Audio saved to: {output_path}")
+        try:
+            text = response.content.decode("utf-8")
+            if text.startswith('{"error"'):
+                print(f"Error: {text}")
+                return
+        except UnicodeDecodeError:
+            pass
+        output_path = args.output or f"tts_output.{args.response_format}"
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+        print(f"Audio saved to: {output_path}")
 
 
 def parse_args():

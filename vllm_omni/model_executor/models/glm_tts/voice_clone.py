@@ -208,7 +208,7 @@ def extract_prompt_speech_token(
     ref_audio_wav: torch.Tensor,
     ref_audio_sr: int,
     speech_tokenizer: tuple,
-) -> list[int]:
+) -> list[int] | None:
     """Extract prompt speech tokens from reference audio using WhisperVQ."""
 
     model, feature_extractor = speech_tokenizer

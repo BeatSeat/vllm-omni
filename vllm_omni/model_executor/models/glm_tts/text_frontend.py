@@ -230,20 +230,29 @@ class GLMTTSTextFrontend:
             else None
         )
         self.en_tn_model = EnNormalizer() if EnNormalizer is not None else None
+        self._custom_replacements = self._load_custom_replacements()
+
+    @staticmethod
+    def _load_custom_replacements() -> list[tuple[str, str]]:
+        custom_replace_path = os.path.join(os.path.dirname(__file__), "configs", "custom_replace.jsonl")
+        if not os.path.exists(custom_replace_path):
+            return []
+        replacements: list[tuple[str, str]] = []
+        with open(custom_replace_path, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                replacements.append((item["origin"], item["new"]))
+        return replacements
 
     def pre_replace(self, sentence: str) -> str:
         sentence = tn_scientific_notation(sentence)
         sentence = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "减", sentence)
         sentence = sentence.replace("-", "")
         sentence = re.sub(r"咯([" + re.escape(PUNCTUATION_CHARS) + r"])", r"喽\1", sentence)
-        custom_replace_path = os.path.join(os.path.dirname(__file__), "configs", "custom_replace.jsonl")
-        if os.path.exists(custom_replace_path):
-            with open(custom_replace_path, encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    item = json.loads(line)
-                    sentence = sentence.replace(item["origin"], item["new"])
+        for origin, new in self._custom_replacements:
+            sentence = sentence.replace(origin, new)
         return sentence
 
     def post_replace(self, sentence: str) -> str:

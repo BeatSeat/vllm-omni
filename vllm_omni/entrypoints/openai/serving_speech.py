@@ -2012,7 +2012,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 },
                 "mm_processor_kwargs": {
                     "prompt_text": request.ref_text,
-                    "sample_rate": int(sr),
                 },
                 "additional_information": self._build_glm_tts_prefill_metadata(
                     request.input,
@@ -2020,15 +2019,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 ),
             }
 
-        # Text-only mode (no voice cloning) — not typical for GLM-TTS
-        # but kept for completeness. Validator requires ref_audio, so
-        # this path should not be reached in normal operation.
-        return {
-            "prompt": request.input,
-            "multi_modal_data": {},
-            "mm_processor_kwargs": {},
-            "additional_information": self._build_glm_tts_prefill_metadata(request.input, None),
-        }
+        raise ValueError("GLM-TTS requires ref_audio and ref_text for voice cloning.")
 
     def _glm_tts_text_tokenizer_and_frontend(self):
         from vllm_omni.model_executor.models.glm_tts.glm_tts import (
@@ -2037,7 +2028,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         from vllm_omni.model_executor.models.glm_tts.text_frontend import GLMTTSTextFrontend
 
-        cached = getattr(self, "_glm_tts_text_tokenizer", None)
+        cached = self._glm_tts_text_tokenizer
         if cached is None:
             model_name_or_path = self.engine_client.model_config.model
             tokenizer_path = getattr(self.engine_client.model_config, "tokenizer", None)
@@ -2050,7 +2041,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
             self._glm_tts_text_tokenizer = cached
 
-        frontend = getattr(self, "_glm_tts_text_frontend", None)
+        frontend = self._glm_tts_text_frontend
         if frontend is None:
             frontend = GLMTTSTextFrontend()
             self._glm_tts_text_frontend = frontend
@@ -2065,10 +2056,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if add_trailing_space and normalized:
             normalized = f"{normalized} "
         return max(1, len(cached.encode(normalized)))
-
-    def _estimate_glm_tts_target_text_token_len(self, text: str) -> int:
-        """Estimate GLM-TTS AR target text length with the model tokenizer."""
-        return self._estimate_glm_tts_text_token_len(text)
 
     def _build_glm_tts_prefill_metadata(self, text: str, prompt_text: str | None) -> dict[str, Any]:
         """Mirror GLM-TTS processor length metadata into additional_information.
@@ -2324,7 +2311,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            text_token_len = self._estimate_glm_tts_target_text_token_len(request.input)
+            text_token_len = self._estimate_glm_tts_text_token_len(request.input)
             hf_cfg = self.model_config.hf_config
             min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
             max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)

@@ -51,9 +51,6 @@ from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_samp
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
 
-from .sampling import (
-    req_float,
-)
 from .text_frontend import GLMTTSTextFrontend
 from .voice_clone import (
     extract_prompt_feat,
@@ -69,9 +66,11 @@ _GLM_TTS_TOKENIZER_SUBDIR = "vq32k-phoneme-tokenizer"
 _GLM_TTS_MAX_PROMPT_SPEECH_TOKENS = 1024
 
 
-def is_glm_tts_model_name(model_name: Any) -> bool:
-    s = str(model_name).lower()
-    return "glm-tts" in s or "glm_tts" in s
+def _req_float(param: torch.Tensor | None, req_idx: int, default: float) -> float:
+    if param is None or param.numel() == 0:
+        return default
+    index = min(req_idx, int(param.numel()) - 1)
+    return float(param.reshape(-1)[index].item())
 
 
 def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
@@ -83,7 +82,8 @@ def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
         ]:
             if os.path.isdir(candidate):
                 return candidate
-    if is_glm_tts_model_name(model_name_or_path):
+    name_lower = str(model_name_or_path).lower()
+    if "glm-tts" in name_lower or "glm_tts" in name_lower:
         try:
             from huggingface_hub import snapshot_download
 
@@ -437,7 +437,6 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
             return BatchFeature(
                 {
                     "input_ids": input_ids,
-                    "input_len": torch.tensor([int(input_ids.shape[1])], dtype=torch.long),
                     "prompt_speech_token": torch.zeros((1, dummy_audio_len), dtype=torch.long),
                     "prompt_speech_token_len": [torch.tensor([dummy_audio_len], dtype=torch.long)],
                     "glm_tts_prompt_text_token_len": [torch.tensor([0], dtype=torch.long)],
@@ -486,7 +485,6 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
         return BatchFeature(
             {
                 "input_ids": input_ids,
-                "input_len": torch.tensor([int(input_ids.shape[1])], dtype=torch.long),
                 "prompt_speech_token": prompt_speech_token_tensor,
                 "prompt_speech_token_len": [torch.tensor([len(prompt_speech_token)], dtype=torch.long)],
                 "glm_tts_prompt_text_token_len": [torch.tensor([int(prompt_text_ids.shape[1])], dtype=torch.long)],
@@ -666,9 +664,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         # (_TOKENIZER_SUBFOLDER_MAP).  Fall back to vq32k-phoneme-tokenizer/
         # under model_dir.
         tokenizer_path = getattr(vllm_config.model_config, "tokenizer", None)
-        if tokenizer_path and os.path.isdir(tokenizer_path):
-            pass
-        else:
+        if not (tokenizer_path and os.path.isdir(tokenizer_path)):
             tokenizer_path = os.path.join(self.model_dir, _GLM_TTS_TOKENIZER_SUBDIR)
             if not os.path.exists(tokenizer_path):
                 tokenizer_path = self.model_dir
@@ -700,8 +696,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         # stripped under python -O).
         if self._ate - self._ats != 32767:
             raise ValueError(f"Audio token range should be 32768, got {self._ate - self._ats + 1}")
-        if self._ats >= self._ate:
-            raise ValueError(f"ATS={self._ats} should be < ATE={self._ate}")
         if self._boa >= self._ats:
             raise ValueError(f"BOA={self._boa} should be < ATS={self._ats} (BOA is text token)")
 
@@ -974,10 +968,10 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             allowed_mask[self._eoa] = 0.0
             self._ar_allowed_mask = allowed_mask
 
-        ws = getattr(self, "_ras_win_size", 10)
-        tr = getattr(self, "_ras_tau_r", 0.1)
-        top_p = getattr(self, "_ras_top_p", 0.8)
-        top_k = getattr(self, "_ras_top_k", 25)
+        ws = self._ras_win_size
+        tr = self._ras_tau_r
+        top_p = self._ras_top_p
+        top_k = self._ras_top_k
 
         sampled_ids: list[int] = []
         for req_idx in range(int(logits.shape[0])):
@@ -985,7 +979,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             decoded_tokens = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
-            temperature = float(req_float(sampling_metadata.temperature, req_idx, 1.0))
+            temperature = float(_req_float(sampling_metadata.temperature, req_idx, 1.0))
             if temperature < self._sampling_eps:
                 sampled_ids.append(int(torch.argmax(row_logits).item()))
                 continue
@@ -1161,8 +1155,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         sampled_token = int(input_ids[0].item())
         if self._ats <= sampled_token <= self._ate:
             speech_token = sampled_token - self._ats
-            if not (0 <= speech_token <= 32767):
-                raise ValueError(f"speech_token={speech_token} out of range [0, 32767]")
         else:
             # EOA or other non-audio token → mark as invalid (-1)
             speech_token = -1

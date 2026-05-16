@@ -771,17 +771,6 @@ class GLMTTSDiTForGeneration(nn.Module):
             rs.fade_tail = next_tail
         return emit
 
-    def cleanup_request(self, req_id: str) -> None:
-        """Remove all streaming state for a request.
-
-        Called when a request finishes normally or is aborted/dropped
-        (e.g. client disconnect).  Without this, per-request diffusion
-        caches and audio tails leak indefinitely.
-        """
-        with self._stream_cache_lock:
-            self._stream_state_by_req.pop(req_id, None)
-            self._stream_last_seen.pop(req_id, None)
-
     # Maximum number of forward calls before a cache entry is considered stale.
     _STALE_THRESHOLD = 64
 

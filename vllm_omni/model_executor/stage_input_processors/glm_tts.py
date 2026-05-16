@@ -181,15 +181,6 @@ def _to_cpu_tensor(value: Any) -> torch.Tensor | None:
     return None
 
 
-def _decode_additional_information(additional_information: Any) -> dict[str, Any]:
-    """Decode additional_information to plain tensors/lists.
-
-    Align with CosyVoice3's async-chunk path: tensor payloads must be
-    reconstructed before we try to forward voice-clone conditioning.
-    """
-    return deserialize_additional_information(additional_information)
-
-
 # ---------------------------------------------------------------------------
 # Async streaming processor: emit speech token chunks as AR produces them
 # ---------------------------------------------------------------------------
@@ -257,7 +248,7 @@ def ar_to_dit_async_chunk(
     request_state = request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_glm_tts_async_state" not in request_state:
         # Extract voice clone conditioning from request additional_information
-        info = _decode_additional_information(getattr(request, "additional_information", None))
+        info = deserialize_additional_information(getattr(request, "additional_information", None))
         prompt_payload: dict[str, Any] = {}
         _copy_voice_clone_payload(info, prompt_payload, to_cpu=True)
 

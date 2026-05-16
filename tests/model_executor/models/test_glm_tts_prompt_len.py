@@ -79,7 +79,6 @@ def test_glm_tts_call_hf_processor_builds_prompt_text_text_boa(
     )
 
     assert out["input_ids"].tolist() == [[11, 12, 21, 22, 23, 99]]
-    assert out["input_len"].item() == 6
     assert out["prompt_speech_token"].tolist() == [[7, 8, 9, 10]]
     assert out["prompt_speech_token_len"][0].item() == 4
     assert out["glm_tts_text_token_len"][0].item() == 3
@@ -152,7 +151,6 @@ def test_glm_tts_text_only_processor_skips_voice_clone(monkeypatch: pytest.Monke
     out = processor._call_hf_processor(prompt="target text", mm_data={}, mm_kwargs={}, tok_kwargs={})
 
     assert out["input_ids"].tolist() == [[11, 12, 13, 99]]
-    assert out["input_len"].item() == 4
     assert out["prompt_speech_token"].shape == (1, 1024)
     assert out["prompt_speech_token_len"][0].item() == 1024
     assert out["glm_tts_prompt_text_token_len"][0].item() == 0

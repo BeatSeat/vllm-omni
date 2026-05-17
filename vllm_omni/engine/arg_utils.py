@@ -40,7 +40,9 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration

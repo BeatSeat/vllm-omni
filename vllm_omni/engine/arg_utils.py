@@ -37,8 +37,6 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
-        from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
-        from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )

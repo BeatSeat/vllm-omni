@@ -2013,7 +2013,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "mm_processor_kwargs": {
                     "prompt_text": request.ref_text,
                 },
-                "additional_information": self._build_glm_tts_prefill_metadata(
+                "model_intermediate_buffer": self._build_glm_tts_prefill_metadata(
                     request.input,
                     request.ref_text,
                 ),
@@ -2058,7 +2058,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return max(1, len(cached.encode(normalized)))
 
     def _build_glm_tts_prefill_metadata(self, text: str, prompt_text: str | None) -> dict[str, Any]:
-        """Mirror GLM-TTS processor length metadata into additional_information.
+        """Build GLM-TTS processor length metadata for model_intermediate_buffer.
 
         The model preprocess hook runs before postprocess can mirror MM kwargs
         into model_intermediate_buffer, so these scalar fields must originate

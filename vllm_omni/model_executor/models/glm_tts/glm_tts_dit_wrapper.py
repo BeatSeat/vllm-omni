@@ -870,33 +870,48 @@ class GLMTTSDiTForGeneration(nn.Module):
             dt = t_span[step + 1] - t_current
 
             use_causal = block_pattern is not None
-            dphi_dt = self.dit(
-                middle_point=x.to(mel_cond.dtype),
-                condition=condition_dit,
-                text=speech_tokens,
-                time_step=t_current.unsqueeze(0),
-                padding_mask=padding_mask,
-                spkr_emb=spkr_embedding_dit if spkr_embedding_dit is not None and self.spkr_emb_adaln else None,
-                is_causal=use_causal,
-                block_pattern=block_pattern,
-                text_lens=text_lens,
-            ).to(torch.float32)
+            x_dit = x.to(mel_cond.dtype)
 
             if self.inference_cfg_rate > 0:
-                text_uncond = torch.zeros_like(speech_tokens) if self.speech_token_cfg else speech_tokens
-                spkr_uncond = torch.zeros_like(spkr_embedding_dit) if spkr_embedding_dit is not None else None
-                cfg_dphi_dt = self.dit(
-                    middle_point=x.to(mel_cond.dtype),
-                    condition=torch.zeros_like(condition_dit),
-                    text=text_uncond,
+                # Batch conditional + unconditional into a single forward
+                middle_b = x_dit.expand(2, -1, -1)
+                condition_b = torch.cat([condition_dit, torch.zeros_like(condition_dit)], dim=0)
+                if self.speech_token_cfg:
+                    text_b = torch.cat([speech_tokens, torch.zeros_like(speech_tokens)], dim=0)
+                else:
+                    text_b = speech_tokens.expand(2, -1)
+                time_b = t_current.unsqueeze(0).expand(2)
+                padding_b = padding_mask.expand(2, -1)
+                if spkr_embedding_dit is not None and self.spkr_emb_adaln:
+                    spkr_b = torch.cat([spkr_embedding_dit, torch.zeros_like(spkr_embedding_dit)], dim=0)
+                else:
+                    spkr_b = None
+                text_lens_b = text_lens.expand(2) if text_lens is not None else None
+                pred_b = self.dit(
+                    middle_point=middle_b,
+                    condition=condition_b,
+                    text=text_b,
+                    time_step=time_b,
+                    padding_mask=padding_b,
+                    spkr_emb=spkr_b,
+                    is_causal=use_causal,
+                    block_pattern=block_pattern,
+                    text_lens=text_lens_b,
+                ).to(torch.float32)
+                dphi_dt, cfg_dphi_dt = pred_b.chunk(2, dim=0)
+                dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+            else:
+                dphi_dt = self.dit(
+                    middle_point=x_dit,
+                    condition=condition_dit,
+                    text=speech_tokens,
                     time_step=t_current.unsqueeze(0),
                     padding_mask=padding_mask,
-                    spkr_emb=spkr_uncond if self.spkr_emb_adaln else None,
+                    spkr_emb=spkr_embedding_dit if spkr_embedding_dit is not None and self.spkr_emb_adaln else None,
                     is_causal=use_causal,
                     block_pattern=block_pattern,
                     text_lens=text_lens,
                 ).to(torch.float32)
-                dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
 
             x = x + dt * dphi_dt
 
@@ -1161,28 +1176,41 @@ class CUDAGraphGLMTTSDiTWrapper:
             self.static_step_cache[size][step].copy_(x)
             t_current = t_span[step]
             dt = t_span[step + 1] - t_current
-            dphi_dt = self.dit(
-                middle_point=x,
-                condition=condition,
-                text=text,
-                text_lens=text_lens,
-                time_step=t_current.unsqueeze(0),
-                padding_mask=padding_mask,
-                spkr_emb=spkr_emb,
-            )
             if self.inference_cfg_rate > 0:
-                text_uncond = torch.zeros_like(text) if self.speech_token_cfg else text
-                spkr_uncond = torch.zeros_like(spkr_emb) if spkr_emb is not None else None
-                cfg_dphi_dt = self.dit(
+                middle_b = x.expand(2, -1, -1)
+                condition_b = torch.cat([condition, torch.zeros_like(condition)], dim=0)
+                if self.speech_token_cfg:
+                    text_b = torch.cat([text, torch.zeros_like(text)], dim=0)
+                else:
+                    text_b = text.expand(2, -1)
+                time_b = t_current.unsqueeze(0).expand(2)
+                padding_b = padding_mask.expand(2, -1)
+                text_lens_b = text_lens.expand(2)
+                if spkr_emb is not None:
+                    spkr_b = torch.cat([spkr_emb, torch.zeros_like(spkr_emb)], dim=0)
+                else:
+                    spkr_b = None
+                pred_b = self.dit(
+                    middle_point=middle_b,
+                    condition=condition_b,
+                    text=text_b,
+                    text_lens=text_lens_b,
+                    time_step=time_b,
+                    padding_mask=padding_b,
+                    spkr_emb=spkr_b,
+                )
+                dphi_dt, cfg_dphi_dt = pred_b.chunk(2, dim=0)
+                dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+            else:
+                dphi_dt = self.dit(
                     middle_point=x,
-                    condition=torch.zeros_like(condition),
-                    text=text_uncond,
+                    condition=condition,
+                    text=text,
                     text_lens=text_lens,
                     time_step=t_current.unsqueeze(0),
                     padding_mask=padding_mask,
-                    spkr_emb=spkr_uncond if self.spkr_emb_adaln else None,
+                    spkr_emb=spkr_emb,
                 )
-                dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
             x = x + dt * dphi_dt
         self.static_output[size].copy_(x)
         return self.static_output[size]

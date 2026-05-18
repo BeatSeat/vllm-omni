@@ -386,9 +386,7 @@ class GLMTTSDiTForGeneration(nn.Module):
         # was never sent).  Entries not seen for 64 forward calls are dropped.
         self._evict_stale_stream_caches()
 
-        runtime_info = kwargs.get("model_intermediate_buffer")
-        if runtime_info is None:
-            runtime_info = kwargs.get("runtime_additional_information", [])
+        runtime_info = kwargs.get("model_intermediate_buffer") or []
 
         seq_token_counts = kwargs.get("seq_token_counts")
         flat_ids = input_ids.reshape(-1).to(dtype=torch.long)

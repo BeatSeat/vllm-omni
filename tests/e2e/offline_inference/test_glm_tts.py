@@ -114,10 +114,11 @@ def test_offline_voice_clone_zh(async_chunk: bool) -> None:
                     "multi_modal_data": {"audio": prompt_audio},
                     "modalities": ["audio"],
                     "mm_processor_kwargs": {"prompt_text": REF_TEXT},
-                    "additional_information": build_glm_tts_prefill_metadata(
+                    "model_intermediate_buffer": build_glm_tts_prefill_metadata(
                         MODEL,
                         synth_text,
                         REF_TEXT,
+                        trust_remote_code=True,
                     ),
                 }
             ],

@@ -1043,9 +1043,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             return model_outputs
 
         hidden = model_outputs
-        info_dicts = kwargs.get("model_intermediate_buffer")
-        if info_dicts is None:
-            info_dicts = kwargs.get("runtime_additional_information") or []
+        info_dicts = kwargs.get("model_intermediate_buffer") or []
         if isinstance(info_dicts, dict):
             info_dicts = [info_dicts]
 

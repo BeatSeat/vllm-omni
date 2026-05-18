@@ -63,6 +63,7 @@ _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
+_FUNCINEFORGE_TTS_MODEL_STAGES = {"funcineforge_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
@@ -74,6 +75,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _QWEN3_TTS_MODEL_STAGES
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
+    | _FUNCINEFORGE_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _COVO_AUDIO_MODEL_STAGES
     | _VOXCPM_TTS_MODEL_STAGES
@@ -81,7 +83,14 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
 )
-_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
+_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
+    "fish_tts",
+    "qwen3_tts",
+    "voxtral_tts",
+    "cosyvoice3",
+    "voxcpm2",
+    "funcineforge",
+}
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -334,6 +343,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
             in _COSYVOICE3_TTS_MODEL_STAGES
         )
+
+        self._is_funcineforge = (
+            self._tts_stage is not None
+            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
+            in _FUNCINEFORGE_TTS_MODEL_STAGES
+        )
+
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
 
@@ -491,6 +507,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "fish_tts"
         if model_stage in _COSYVOICE3_TTS_MODEL_STAGES:
             return "cosyvoice3"
+        if model_stage in _FUNCINEFORGE_TTS_MODEL_STAGES:
+            return "funcineforge"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
         if model_stage in _COVO_AUDIO_MODEL_STAGES:
@@ -1136,6 +1154,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_fish_tts_request(request)
         if self._tts_model_type == "cosyvoice3":
             return self._validate_cosyvoice3_request(request)
+        if self._tts_model_type == "funcineforge":
+            return self._validate_funcineforge_request(request)
         if self._tts_model_type == "voxcpm":
             return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
@@ -1469,6 +1489,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if not request.ref_text or not request.ref_text.strip():
             return "CosyVoice3 requires 'ref_text' (transcript of the reference audio)"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
+
+    def _validate_funcineforge_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate FunCineForge request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        # FunCineForge requires reference audio for voice cloning
+        if request.ref_audio is None:
+            return "FunCineForge requires 'ref_audio' (reference audio for voice cloning)"
+
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+
+        if not request.ref_text or not request.ref_text.strip():
+            return "FunCineForge requires 'ref_text' (transcript of the reference audio)"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -2001,6 +2045,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prompt["additional_information"] = additional_information
         return prompt
 
+    async def _build_funcineforge_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build prompt for FunCineForge.
+
+        FunCineForge uses multimodal input with reference audio for voice cloning,
+        similar to CosyVoice3.  Face embeddings can be provided via the
+        ``face_embedding`` field in ``mm_processor_kwargs``; if absent the
+        model falls back to zero face embeddings.
+        """
+        wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
+        audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
+
+        mm_kwargs: dict[str, Any] = {
+            "prompt_text": request.ref_text,
+            "sample_rate": sr,
+        }
+
+        return {
+            "prompt": request.input,
+            "multi_modal_data": {
+                "audio": audio_data,
+            },
+            "mm_processor_kwargs": mm_kwargs,
+        }
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -2112,6 +2183,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+            elif self._tts_model_type == "funcineforge":
+                prompt = await self._build_funcineforge_prompt(request)
+                tts_params = {}
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2178,8 +2252,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
 
         # CosyVoice3: set dynamic min/max tokens based on text length.
-        # The official model requires min_token_text_ratio to prevent early
-        # EOS and max_token_text_ratio to cap generation length.
         if self._tts_model_type == "cosyvoice3" and sampling_params_list:
             sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
 

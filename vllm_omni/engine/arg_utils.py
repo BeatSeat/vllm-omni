@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "FunCineForgeModel": "funcineforge",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
     "VoxCPMForConditionalGeneration": "voxcpm",
@@ -28,6 +29,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "FunCineForgeModel": "Qwen2-0.5B-CosyVoice-BlankEN",
 }
 
 
@@ -35,6 +37,7 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -52,6 +55,7 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
+        ("funcineforge", FunCineForgeConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

@@ -65,8 +65,16 @@ def nucleus_sample_one(
         # Fallback: always keep at least the top token
         mask[0] = True
 
-    kept_probs = sorted_prob[mask]
+    kept_probs = torch.nan_to_num(sorted_prob[mask], nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
     kept_indices = sorted_idx[mask]
+    # ``torch.multinomial`` accepts unnormalized weights, but not an all-zero
+    # vector.  Handle the extreme underflow case on-device by forcing the top
+    # retained token to be selectable without adding another CPU sync.
+    kept_probs[0] = torch.where(
+        kept_probs.sum() > 0,
+        kept_probs[0],
+        torch.ones_like(kept_probs[0]),
+    )
 
     sample_pos = multinomial_sample(kept_probs, generator=generator)
     return int(kept_indices[int(sample_pos.item())].item())

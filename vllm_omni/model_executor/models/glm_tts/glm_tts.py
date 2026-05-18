@@ -743,6 +743,11 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # GLM-TTS async chunk transfer consumes speech_tokens plus voice-clone
+        # conditioning only. Avoid copying per-token hidden states to CPU for
+        # the downstream pooler payload; postprocess still receives GPU hidden
+        # states to maintain last_hidden for AR decode.
+        self.pooler_output_needs_hidden = False
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("last_hidden", "last")}
 
         self.model = LlamaModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
@@ -984,6 +989,37 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             self._ar_allowed_mask = allowed_mask
         return logits + allowed_mask
 
+    def _select_allowed_audio_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Return compact logits for [audio tokens] plus EOA.
+
+        The RAS path samples only from GLM-TTS audio tokens and EOA.  Keeping a
+        compact view avoids top-k/logsumexp over the full LLM vocabulary on
+        every AR step; this is equivalent to sampling after ``_apply_allowed_mask``.
+        """
+        audio_logits = logits[:, self._ats : self._ate + 1]
+        if self._ats <= self._eoa <= self._ate:
+            return audio_logits
+        return torch.cat((audio_logits, logits[:, self._eoa : self._eoa + 1]), dim=-1)
+
+    def _allowed_local_to_token_id(self, local_id: int) -> int:
+        audio_vocab = self._ate - self._ats + 1
+        return self._ats + local_id if local_id < audio_vocab else self._eoa
+
+    def _recent_allowed_local_ids(self, decoded_tokens: Sequence[int], win_size: int) -> list[int]:
+        if win_size <= 0 or not decoded_tokens:
+            return []
+        audio_vocab = self._ate - self._ats + 1
+        recent: list[int] = []
+        for token in decoded_tokens[-win_size:]:
+            token_id = int(token)
+            if self._ats <= token_id <= self._ate:
+                recent.append(token_id - self._ats)
+            elif token_id == self._eoa:
+                recent.append(audio_vocab)
+            else:
+                recent.append(-1)
+        return recent
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -1006,51 +1042,51 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             sampler = Sampler()
             self._ar_sampler = sampler
 
-        logits = self._apply_allowed_mask(logits)
-
         if not self._glm_tts_ras_enabled(sampling_metadata):
+            logits = self._apply_allowed_mask(logits)
             return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         logits = logits.to(torch.float32)
         sampling_for_processors = replace(sampling_metadata, no_penalties=True)
         logits = sampler.apply_logits_processors(logits, sampling_for_processors, predict_bonus_token=False)
+        allowed_logits = self._select_allowed_audio_logits(logits)
 
         default_top_p = self._ras_top_p
         default_top_k = self._ras_top_k
         ws = self._ras_win_size
         tr = self._ras_tau_r
 
-        num_reqs = int(logits.shape[0])
+        num_reqs = int(allowed_logits.shape[0])
         temperatures = _tensor_param_values(sampling_metadata.temperature, num_reqs, 1.0)
         top_ps = _tensor_param_values(sampling_metadata.top_p, num_reqs, default_top_p)
         top_ks = _tensor_param_values(sampling_metadata.top_k, num_reqs, default_top_k)
 
         sampled_ids: list[int] = []
         for req_idx in range(num_reqs):
-            row_logits = logits[req_idx]
+            row_logits = allowed_logits[req_idx]
             temperature = temperatures[req_idx]
             if temperature < self._sampling_eps:
-                sampled_ids.append(int(torch.argmax(row_logits).item()))
+                local_id = int(torch.argmax(row_logits).item())
+                sampled_ids.append(self._allowed_local_to_token_id(local_id))
                 continue
 
             top_p = top_ps[req_idx]
             top_k = int(top_ks[req_idx])
             generator = sampling_metadata.generators.get(req_idx)
-            weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
+            weighted_scores = row_logits / max(temperature, self._sampling_eps)
             decoded_tokens = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
-            sampled_ids.append(
-                _ras_sample_one(
-                    weighted_scores,
-                    decoded_tokens,
-                    top_p=top_p,
-                    top_k=top_k,
-                    win_size=ws,
-                    tau_r=tr,
-                    generator=generator,
-                )
+            local_id = _ras_sample_one(
+                weighted_scores,
+                self._recent_allowed_local_ids(decoded_tokens, ws),
+                top_p=top_p,
+                top_k=top_k,
+                win_size=ws,
+                tau_r=tr,
+                generator=generator,
             )
+            sampled_ids.append(self._allowed_local_to_token_id(local_id))
 
         sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
@@ -1153,7 +1189,9 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             )
 
         mm_prefill_done = bool(info_dict.get("glm_tts_mm_prefill_done"))
-        sampled_token = int(input_ids[0].item()) if span_len == 1 else None
+        sampled_token: int | None = None
+        if input_embeds is not None and span_len == 1:
+            sampled_token = int(input_ids[0].item())
         one_token_prefill_tail = (
             input_embeds is not None
             and span_len == 1
@@ -1204,7 +1242,8 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         # Convert sampled token to speech token (relative to ATS)
         # -1 = invalid/EOA, valid range = [0, ATE-ATS]
-        sampled_token = int(input_ids[0].item())
+        if sampled_token is None:
+            sampled_token = int(input_ids[0].item())
         if self._ats <= sampled_token <= self._ate:
             speech_token = sampled_token - self._ats
         else:

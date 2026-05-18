@@ -42,5 +42,9 @@ models:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
     endpoint: /v1/audio/speech
+    trust_remote_code: true
+    # GLM-TTS stores its ChatGLM4 tokenizer in a subdirectory.
+    # bench_tts.py resolves it via snapshot_download at runtime.
+    tokenizer_subfolder: vq32k-phoneme-tokenizer
     task_extra_body:
       voice_clone: {}

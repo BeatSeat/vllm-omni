@@ -2311,7 +2311,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            text_token_len = self._estimate_glm_tts_text_token_len(request.input)
+            glm_metadata = prompt.get("model_intermediate_buffer") if isinstance(prompt, dict) else None
+            text_len_value = None
+            if isinstance(glm_metadata, dict):
+                text_len_value = glm_metadata.get("glm_tts_text_token_len")
+                if isinstance(text_len_value, list) and text_len_value:
+                    text_len_value = text_len_value[0]
+            text_token_len = int(text_len_value) if text_len_value is not None else self._estimate_glm_tts_text_token_len(request.input)
             hf_cfg = self.model_config.hf_config
             min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
             max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)

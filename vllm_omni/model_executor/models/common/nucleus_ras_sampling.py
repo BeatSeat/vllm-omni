@@ -34,13 +34,22 @@ def nucleus_sample_one(
 
     Vectorized via ``torch.cumsum`` — no Python loop over the vocabulary.
     """
-    probs = weighted_scores.softmax(dim=0)
-    sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
-
-    # Apply top-k truncation
-    if top_k > 0:
-        sorted_prob = sorted_prob[: int(top_k)]
-        sorted_idx = sorted_idx[: int(top_k)]
+    # Apply top-k before sort.  GLM-TTS and CosyVoice3 usually run with
+    # top_k=25, so sorting the whole audio vocabulary on every AR step is
+    # avoidable work in the hottest path.  Keep probabilities normalized over
+    # the full vocabulary so the top-p cumulative mass matches the old path.
+    if top_k > 0 and int(top_k) < int(weighted_scores.numel()):
+        top_scores, sorted_idx = torch.topk(
+            weighted_scores,
+            k=int(top_k),
+            dim=0,
+            largest=True,
+            sorted=True,
+        )
+        sorted_prob = (top_scores - torch.logsumexp(weighted_scores, dim=0)).exp()
+    else:
+        probs = weighted_scores.softmax(dim=0)
+        sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
 
     # Apply top-p (nucleus) filtering: keep the smallest prefix whose
     # cumulative probability exceeds top_p, always including the first token.
@@ -92,12 +101,8 @@ def ras_sample_one(
         generator=generator,
     )
     if win_size > 0 and decoded_tokens:
-        recent = torch.as_tensor(
-            list(decoded_tokens[-win_size:]),
-            device=weighted_scores.device,
-            dtype=torch.long,
-        )
-        rep_num = int((recent == top_id).sum().item())
+        recent = decoded_tokens[-win_size:]
+        rep_num = sum(1 for token in recent if int(token) == top_id)
         if rep_num >= win_size * tau_r:
             top_id = _random_sample_one()
     return top_id

@@ -77,7 +77,28 @@ def _req_float(param: torch.Tensor | None, req_idx: int, default: float) -> floa
     return float(param.reshape(-1)[index].item())
 
 
+def _tensor_param_values(
+    param: torch.Tensor | None,
+    count: int,
+    default: float,
+) -> list[float]:
+    if param is None or param.numel() == 0:
+        return [default] * count
+    values = param.reshape(-1).detach().cpu().tolist()
+    if not values:
+        return [default] * count
+    if len(values) < count:
+        values.extend([values[-1]] * (count - len(values)))
+    return [float(value) for value in values[:count]]
+
+
 def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
+    """Resolve local vq32k-phoneme-tokenizer directory.
+
+    Only checks local filesystem paths.  Remote (Hub) tokenizer
+    downloading is handled by ``arg_utils._TOKENIZER_SUBFOLDER_MAP``
+    during engine init — no need to duplicate ``snapshot_download`` here.
+    """
     model_path = os.fspath(model_name_or_path)
     if os.path.exists(model_path):
         for candidate in [
@@ -86,20 +107,6 @@ def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
         ]:
             if os.path.isdir(candidate):
                 return candidate
-    name_lower = str(model_name_or_path).lower()
-    if "glm-tts" in name_lower or "glm_tts" in name_lower:
-        try:
-            from huggingface_hub import snapshot_download
-
-            snapshot_dir = snapshot_download(
-                model_path,
-                allow_patterns=f"{_GLM_TTS_TOKENIZER_SUBDIR}/*",
-            )
-            tokenizer_dir = os.path.join(snapshot_dir, _GLM_TTS_TOKENIZER_SUBDIR)
-            if os.path.isdir(tokenizer_dir):
-                return tokenizer_dir
-        except Exception as exc:
-            logger.debug("Failed to resolve GLM-TTS tokenizer subdir from Hub: %s", exc)
     return model_name_or_path
 
 
@@ -174,6 +181,9 @@ def _decode_glm_tts_audio_data(value: Any) -> tuple[torch.Tensor | None, int | N
     return None, None
 
 
+_glm_tts_tokenizer_cache: dict[str, Any] = {}
+
+
 def load_glm_tts_tokenizer(
     tokenizer_path: Any,
     *,
@@ -181,28 +191,26 @@ def load_glm_tts_tokenizer(
     trust_remote_code: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """Load GLM-TTS phoneme tokenizer (local path → subfolder → snapshot)."""
-    common = {**kwargs, "trust_remote_code": trust_remote_code}
-    attempts: list[tuple[Any, dict[str, Any]]] = [
-        (tokenizer_path, {"use_fast": False}),
-        (tokenizer_path, {}),
-    ]
-    if model_name_or_path is not None:
-        attempts += [
-            (model_name_or_path, {"subfolder": _GLM_TTS_TOKENIZER_SUBDIR, "use_fast": False}),
-            (model_name_or_path, {"subfolder": _GLM_TTS_TOKENIZER_SUBDIR}),
-        ]
+    """Load GLM-TTS phoneme tokenizer (ChatGLM4Tokenizer, slow-only).
 
-    last_exc: Exception | None = None
-    for path, extra in attempts:
-        try:
-            return AutoTokenizer.from_pretrained(path, **common, **extra)
-        except Exception as exc:
-            last_exc = exc
+    Results are cached by resolved *tokenizer_path* so repeated calls
+    (e.g. from ``build_glm_tts_prefill_metadata``) reuse the same instance.
+    """
+    cache_key = str(tokenizer_path)
+    cached = _glm_tts_tokenizer_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
-    if last_exc is not None:
-        raise last_exc
-    raise ValueError("Failed to load GLM-TTS tokenizer.")
+    # ChatGLM4Tokenizer is SentencePiece-backed with no fast (Rust) impl.
+    # Always load as slow tokenizer — no fallback loop needed.
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        use_fast=False,
+        trust_remote_code=trust_remote_code,
+        **kwargs,
+    )
+    _glm_tts_tokenizer_cache[cache_key] = tokenizer
+    return tokenizer
 
 
 def get_glm_tts_special_token_ids(tokenizer: Any) -> dict[str, int]:
@@ -260,6 +268,16 @@ def _normalize_glm_tts_processor_text(
     return normalized
 
 
+_glm_tts_text_frontend: GLMTTSTextFrontend | None = None
+
+
+def _get_text_frontend() -> GLMTTSTextFrontend:
+    global _glm_tts_text_frontend
+    if _glm_tts_text_frontend is None:
+        _glm_tts_text_frontend = GLMTTSTextFrontend()
+    return _glm_tts_text_frontend
+
+
 def build_glm_tts_prefill_metadata(
     model_name_or_path: Any,
     text: str,
@@ -280,7 +298,7 @@ def build_glm_tts_prefill_metadata(
         model_name_or_path=model_name_or_path,
         trust_remote_code=trust_remote_code,
     )
-    frontend = GLMTTSTextFrontend()
+    frontend = _get_text_frontend()
     text_len = max(1, len(tokenizer.encode(_normalize_glm_tts_processor_text(frontend, text))))
     prompt_text_len = 0
     if prompt_text:
@@ -1002,16 +1020,21 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         ws = self._ras_win_size
         tr = self._ras_tau_r
 
+        num_reqs = int(logits.shape[0])
+        temperatures = _tensor_param_values(sampling_metadata.temperature, num_reqs, 1.0)
+        top_ps = _tensor_param_values(sampling_metadata.top_p, num_reqs, default_top_p)
+        top_ks = _tensor_param_values(sampling_metadata.top_k, num_reqs, default_top_k)
+
         sampled_ids: list[int] = []
-        for req_idx in range(int(logits.shape[0])):
+        for req_idx in range(num_reqs):
             row_logits = logits[req_idx]
-            temperature = float(_req_float(sampling_metadata.temperature, req_idx, 1.0))
+            temperature = temperatures[req_idx]
             if temperature < self._sampling_eps:
                 sampled_ids.append(int(torch.argmax(row_logits).item()))
                 continue
 
-            top_p = float(_req_float(sampling_metadata.top_p, req_idx, default_top_p))
-            top_k = int(_req_float(sampling_metadata.top_k, req_idx, default_top_k))
+            top_p = top_ps[req_idx]
+            top_k = int(top_ks[req_idx])
             generator = sampling_metadata.generators.get(req_idx)
             weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
             decoded_tokens = (

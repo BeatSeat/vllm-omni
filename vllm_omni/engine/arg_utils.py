@@ -298,7 +298,10 @@ class OmniEngineArgs(EngineArgs):
                         break
             elif not os.path.isdir(model_path):
                 subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch)
-                if subfolder:
+                # Only download tokenizer subfolder for the stage that owns it
+                # (stage 0).  Non-AR stages (e.g. DiT) don't use the text
+                # tokenizer and would waste time on a redundant download.
+                if subfolder and self.stage_id == 0:
                     # Download just the tokenizer files from the subfolder
                     try:
                         from huggingface_hub import snapshot_download

@@ -37,3 +37,10 @@ models:
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_clone: {}
+
+  zai-org/GLM-TTS:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}

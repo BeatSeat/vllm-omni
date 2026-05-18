@@ -1057,9 +1057,23 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         tr = self._ras_tau_r
 
         num_reqs = int(allowed_logits.shape[0])
-        temperatures = _tensor_param_values(sampling_metadata.temperature, num_reqs, 1.0)
-        top_ps = _tensor_param_values(sampling_metadata.top_p, num_reqs, default_top_p)
-        top_ks = _tensor_param_values(sampling_metadata.top_k, num_reqs, default_top_k)
+        t_data = sampling_metadata.temperature
+        tp_data = sampling_metadata.top_p
+        tk_data = sampling_metadata.top_k
+        cache_key = (
+            t_data.data_ptr() if t_data is not None else 0,
+            tp_data.data_ptr() if tp_data is not None else 0,
+            tk_data.data_ptr() if tk_data is not None else 0,
+            num_reqs,
+        )
+        _sp_cache = getattr(self, "_sampling_param_cache", None)
+        if _sp_cache is not None and _sp_cache[0] == cache_key:
+            temperatures, top_ps, top_ks = _sp_cache[1]
+        else:
+            temperatures = _tensor_param_values(t_data, num_reqs, 1.0)
+            top_ps = _tensor_param_values(tp_data, num_reqs, default_top_p)
+            top_ks = _tensor_param_values(tk_data, num_reqs, default_top_k)
+            self._sampling_param_cache = (cache_key, (temperatures, top_ps, top_ks))
 
         sampled_ids: list[int] = []
         for req_idx in range(num_reqs):

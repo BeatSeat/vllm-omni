@@ -77,7 +77,7 @@ def nucleus_sample_one(
     )
 
     sample_pos = multinomial_sample(kept_probs, generator=generator)
-    return int(kept_indices[int(sample_pos.item())].item())
+    return int(kept_indices[sample_pos].item())
 
 
 def ras_sample_one(

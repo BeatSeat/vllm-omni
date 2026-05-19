@@ -360,6 +360,3 @@ def ar_to_dit_async_chunk(
         state["emitted_token_len"] = max(emitted_token_len, end_index)
 
     return _make_payload(list(token_frames[:end_index]), tok_offset=token_offset, is_terminal=finished)
-
-
-ar_to_dit_async_chunk.inline_save_async = True  # type: ignore[attr-defined]

@@ -749,10 +749,6 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.has_preprocess = True
         self.has_postprocess = True
         # GLM-TTS async chunk transfer consumes speech_tokens plus voice-clone
-        # conditioning only. Avoid copying per-token hidden states to CPU for
-        # the downstream pooler payload; postprocess still receives GPU hidden
-        # states to maintain last_hidden for AR decode.
-        self.pooler_output_needs_hidden = False
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("last_hidden", "last")}
 
         self.model = LlamaModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))

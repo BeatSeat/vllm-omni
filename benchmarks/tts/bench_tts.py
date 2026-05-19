@@ -66,28 +66,6 @@ def load_model_configs(path: Path) -> dict[str, Any]:
     return data.get("models", {})
 
 
-def _resolve_tokenizer_subfolder(model: str, subfolder: str) -> str | None:
-    """Resolve a tokenizer stored in a HF repo subfolder to a local cache path.
-
-    Uses snapshot_download to ensure the subfolder is cached locally, then
-    returns the absolute path so ``vllm bench serve`` can load it via
-    ``--tokenizer``.
-    """
-    try:
-        from huggingface_hub import snapshot_download
-
-        local_dir = snapshot_download(
-            model,
-            allow_patterns=[f"{subfolder}/**"],
-        )
-        resolved = Path(local_dir) / subfolder
-        if resolved.is_dir():
-            return str(resolved)
-    except Exception as exc:
-        print(f"[bench_tts] WARNING: cannot resolve tokenizer subfolder '{subfolder}' for {model}: {exc}")
-    return None
-
-
 def build_bench_args(
     *,
     host: str,
@@ -142,19 +120,6 @@ def build_bench_args(
         "--percentile-metrics",
         "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
     ]
-
-    # Models with non-root tokenizer paths (e.g. GLM-TTS stores its tokenizer
-    # in vq32k-phoneme-tokenizer/ subfolder) need explicit --tokenizer so the
-    # benchmark client can load it.
-    tokenizer_cfg = model_cfg.get("tokenizer")
-    if not tokenizer_cfg:
-        subfolder = model_cfg.get("tokenizer_subfolder")
-        if subfolder:
-            tokenizer_cfg = _resolve_tokenizer_subfolder(model, subfolder)
-    if tokenizer_cfg:
-        cmd += ["--tokenizer", tokenizer_cfg]
-    if model_cfg.get("trust_remote_code", False):
-        cmd.append("--trust-remote-code")
 
     if resolved_dataset_path:
         cmd += ["--dataset-path", resolved_dataset_path]

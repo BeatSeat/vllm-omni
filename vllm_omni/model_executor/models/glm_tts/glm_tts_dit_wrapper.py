@@ -269,6 +269,9 @@ class GLMTTSDiTForGeneration(nn.Module):
         self.sample_rate = self.hf_flow_config.get("sample_rate", _GLM_TTS_RUNTIME_FLOW_DEFAULTS["sample_rate"])
 
         self.n_timesteps = self.hf_flow_config.get("n_timesteps", _GLM_TTS_RUNTIME_FLOW_DEFAULTS["n_timesteps"])
+        config_n_ts = getattr(config, "n_timesteps", None)
+        if config_n_ts is not None:
+            self.n_timesteps = int(config_n_ts)
         self.t_scheduler = self.hf_flow_config.get("t_scheduler", _GLM_TTS_RUNTIME_FLOW_DEFAULTS["t_scheduler"])
         self.inference_cfg_rate = self.hf_flow_config.get(
             "inference_cfg_rate", _GLM_TTS_RUNTIME_FLOW_DEFAULTS["inference_cfg_rate"]

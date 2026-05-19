@@ -46,7 +46,7 @@ def nucleus_sample_one(
             largest=True,
             sorted=True,
         )
-        sorted_prob = (top_scores - torch.logsumexp(weighted_scores, dim=0)).exp()
+        sorted_prob = (top_scores - torch.logsumexp(top_scores, dim=0)).exp()
     else:
         probs = weighted_scores.softmax(dim=0)
         sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
@@ -61,9 +61,11 @@ def nucleus_sample_one(
     cum_prob = sorted_prob_f32.cumsum(dim=0)
     # Mask: include tokens where cumsum *before* this token is still < top_p
     mask = (cum_prob - sorted_prob_f32) < top_p
-    if not mask.any():
-        # Fallback: always keep at least the top token
-        mask[0] = True
+    # Safety: ensure top token is always kept.  With sorted descending
+    # probabilities, mask[0] is always True when top_p > 0 (since the
+    # cumsum-before-self of the first element is 0 < top_p).  Setting it
+    # unconditionally avoids a GPU→CPU sync from the old `mask.any()` check.
+    mask[0] = True
 
     kept_probs = torch.nan_to_num(sorted_prob[mask], nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
     kept_indices = sorted_idx[mask]

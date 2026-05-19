@@ -202,11 +202,16 @@ def load_glm_tts_tokenizer(
         return cached
 
     # ChatGLM4Tokenizer is SentencePiece-backed with no fast (Rust) impl.
-    # Always load as slow tokenizer — no fallback loop needed.
+    # When tokenizer_path is a HF hub name (not a local dir), the actual
+    # tokenizer files live in the vq32k-phoneme-tokenizer subfolder.
+    extra_kwargs: dict[str, str] = {}
+    if not os.path.isdir(str(tokenizer_path)):
+        extra_kwargs["subfolder"] = _GLM_TTS_TOKENIZER_SUBDIR
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         use_fast=False,
         trust_remote_code=trust_remote_code,
+        **extra_kwargs,
         **kwargs,
     )
     _glm_tts_tokenizer_cache[cache_key] = tokenizer

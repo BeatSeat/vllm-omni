@@ -206,7 +206,7 @@ def test_ar_to_dit_async_chunk_keeps_progressive_block_pattern_fixed() -> None:
     assert final_payload.kv_metadata["glm_tts"]["block_pattern"] == [25, 50, 200]
 
 
-def test_ar_to_dit_async_chunk_terminal_flushes_boundary_prefix() -> None:
+def test_ar_to_dit_async_chunk_terminal_boundary_is_metadata_only() -> None:
     transfer = _transfer_manager()
     request = _Request()
     payloads = []
@@ -230,7 +230,7 @@ def test_ar_to_dit_async_chunk_terminal_flushes_boundary_prefix() -> None:
 
     assert len(payloads) == 2
     assert final_payload is not None
-    assert _audio_codes(final_payload) == list(range(50))
+    assert _audio_codes(final_payload) == []
     assert final_payload.meta.left_context_size == 50
     assert final_payload.meta.req_id == ["req-1"]
     assert bool(final_payload.meta.stream_finished.item())

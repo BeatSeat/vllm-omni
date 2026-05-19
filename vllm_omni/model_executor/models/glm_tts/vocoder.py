@@ -106,6 +106,7 @@ class HiFTWrapper:
         ).to(device)
         self.model.load_state_dict(state_dict)
         self.model.eval()
+        self.model.float()
 
     def __call__(self, mel: torch.Tensor) -> torch.Tensor:
         mel = mel.to(self.device)

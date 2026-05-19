@@ -34,13 +34,22 @@ def nucleus_sample_one(
 
     Vectorized via ``torch.cumsum`` — no Python loop over the vocabulary.
     """
-    probs = weighted_scores.softmax(dim=0)
-    sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
-
-    # Apply top-k truncation
-    if top_k > 0:
-        sorted_prob = sorted_prob[: int(top_k)]
-        sorted_idx = sorted_idx[: int(top_k)]
+    # Apply top-k before sort.  GLM-TTS and CosyVoice3 usually run with
+    # top_k=25, so sorting the whole audio vocabulary on every AR step is
+    # avoidable work in the hottest path.  Keep probabilities normalized over
+    # the full vocabulary so the top-p cumulative mass matches the old path.
+    if top_k > 0 and int(top_k) < int(weighted_scores.numel()):
+        top_scores, sorted_idx = torch.topk(
+            weighted_scores,
+            k=int(top_k),
+            dim=0,
+            largest=True,
+            sorted=True,
+        )
+        sorted_prob = (top_scores - torch.logsumexp(top_scores, dim=0)).exp()
+    else:
+        probs = weighted_scores.softmax(dim=0)
+        sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
 
     # Apply top-p (nucleus) filtering: keep the smallest prefix whose
     # cumulative probability exceeds top_p, always including the first token.
@@ -52,15 +61,25 @@ def nucleus_sample_one(
     cum_prob = sorted_prob_f32.cumsum(dim=0)
     # Mask: include tokens where cumsum *before* this token is still < top_p
     mask = (cum_prob - sorted_prob_f32) < top_p
-    if not mask.any():
-        # Fallback: always keep at least the top token
-        mask[0] = True
+    # Safety: ensure top token is always kept.  With sorted descending
+    # probabilities, mask[0] is always True when top_p > 0 (since the
+    # cumsum-before-self of the first element is 0 < top_p).  Setting it
+    # unconditionally avoids a GPU→CPU sync from the old `mask.any()` check.
+    mask[0] = True
 
-    kept_probs = sorted_prob[mask]
+    kept_probs = torch.nan_to_num(sorted_prob[mask], nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
     kept_indices = sorted_idx[mask]
+    # ``torch.multinomial`` accepts unnormalized weights, but not an all-zero
+    # vector.  Handle the extreme underflow case on-device by forcing the top
+    # retained token to be selectable without adding another CPU sync.
+    kept_probs[0] = torch.where(
+        kept_probs.sum() > 0,
+        kept_probs[0],
+        torch.ones_like(kept_probs[0]),
+    )
 
     sample_pos = multinomial_sample(kept_probs, generator=generator)
-    return int(kept_indices[int(sample_pos.item())].item())
+    return int(kept_indices[sample_pos].item())
 
 
 def ras_sample_one(
@@ -92,12 +111,8 @@ def ras_sample_one(
         generator=generator,
     )
     if win_size > 0 and decoded_tokens:
-        recent = torch.as_tensor(
-            list(decoded_tokens[-win_size:]),
-            device=weighted_scores.device,
-            dtype=torch.long,
-        )
-        rep_num = int((recent == top_id).sum().item())
+        recent = decoded_tokens[-win_size:]
+        rep_num = sum(1 for token in recent if int(token) == top_id)
         if rep_num >= win_size * tau_r:
             top_id = _random_sample_one()
     return top_id

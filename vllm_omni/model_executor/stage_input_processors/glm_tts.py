@@ -323,7 +323,10 @@ def ar_to_dit_async_chunk(
     # Terminal: no tokens, or finished on/before chunk boundary
     if finished and length <= emitted_token_len:
         state["terminal_sent"] = True
-        return _make_payload(list(token_frames), tok_offset=emitted_token_len, is_terminal=True)
+        # Boundary finish is metadata-only: the cumulative prefix has already
+        # been emitted, so resending it would make the DiT/vocoder redo work
+        # and can duplicate audio.
+        return _make_payload([], tok_offset=emitted_token_len, is_terminal=True)
 
     if length <= 0:
         return None
@@ -357,3 +360,6 @@ def ar_to_dit_async_chunk(
         state["emitted_token_len"] = max(emitted_token_len, end_index)
 
     return _make_payload(list(token_frames[:end_index]), tok_offset=token_offset, is_terminal=finished)
+
+
+ar_to_dit_async_chunk.inline_save_async = True  # type: ignore[attr-defined]

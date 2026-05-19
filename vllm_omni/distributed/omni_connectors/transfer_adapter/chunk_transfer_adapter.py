@@ -129,10 +129,39 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         self.requests_num_chunks_sent[request.external_req_id] = request.num_computed_tokens
+        is_finished = request.is_finished()
+        process_func = self.custom_process_next_stage_input_func
+        if process_func is not None and bool(getattr(process_func, "inline_save_async", False)):
+            pooling_data = unflatten_payload(pooling_output) if isinstance(pooling_output, dict) else pooling_output
+            try:
+                payload_data = process_func(
+                    transfer_manager=self,
+                    pooling_output=pooling_data,
+                    request=request,
+                    is_finished=is_finished,
+                )
+            except Exception as e:
+                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                return
+            if payload_data is None:
+                if is_finished:
+                    self.code_prompt_token_ids.pop(request.external_req_id, None)
+                    self.requests_num_chunks_sent.pop(request.external_req_id, None)
+                return
+            task = {
+                "payload_data": payload_data,
+                "request": request,
+                "is_finished": is_finished,
+            }
+            self._pending_save_reqs.append(task)
+            with self._save_cond:
+                self._save_cond.notify()
+            return
+
         task = {
             "pooling_output": pooling_output,
             "request": request,
-            "is_finished": request.is_finished(),
+            "is_finished": is_finished,
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
@@ -210,8 +239,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
-        raw_po = task["pooling_output"]
-        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
         request = task["request"]
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
@@ -220,8 +247,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
-        if self.custom_process_next_stage_input_func:
+        payload_data: OmniPayloadStruct | None = task.get("payload_data")
+        if payload_data is None and self.custom_process_next_stage_input_func:
+            raw_po = task["pooling_output"]
+            pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -46,6 +47,9 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -73,7 +77,28 @@ def _req_float(param: torch.Tensor | None, req_idx: int, default: float) -> floa
     return float(param.reshape(-1)[index].item())
 
 
+def _tensor_param_values(
+    param: torch.Tensor | None,
+    count: int,
+    default: float,
+) -> list[float]:
+    if param is None or param.numel() == 0:
+        return [default] * count
+    values = param.reshape(-1).detach().cpu().tolist()
+    if not values:
+        return [default] * count
+    if len(values) < count:
+        values.extend([values[-1]] * (count - len(values)))
+    return [float(value) for value in values[:count]]
+
+
 def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
+    """Resolve local vq32k-phoneme-tokenizer directory.
+
+    Only checks local filesystem paths.  Remote (Hub) tokenizer
+    downloading is handled by ``arg_utils._TOKENIZER_SUBFOLDER_MAP``
+    during engine init — no need to duplicate ``snapshot_download`` here.
+    """
     model_path = os.fspath(model_name_or_path)
     if os.path.exists(model_path):
         for candidate in [
@@ -82,20 +107,6 @@ def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
         ]:
             if os.path.isdir(candidate):
                 return candidate
-    name_lower = str(model_name_or_path).lower()
-    if "glm-tts" in name_lower or "glm_tts" in name_lower:
-        try:
-            from huggingface_hub import snapshot_download
-
-            snapshot_dir = snapshot_download(
-                model_path,
-                allow_patterns=f"{_GLM_TTS_TOKENIZER_SUBDIR}/*",
-            )
-            tokenizer_dir = os.path.join(snapshot_dir, _GLM_TTS_TOKENIZER_SUBDIR)
-            if os.path.isdir(tokenizer_dir):
-                return tokenizer_dir
-        except Exception as exc:
-            logger.debug("Failed to resolve GLM-TTS tokenizer subdir from Hub: %s", exc)
     return model_name_or_path
 
 
@@ -170,35 +181,36 @@ def _decode_glm_tts_audio_data(value: Any) -> tuple[torch.Tensor | None, int | N
     return None, None
 
 
+_glm_tts_tokenizer_cache: dict[str, Any] = {}
+
+
 def load_glm_tts_tokenizer(
     tokenizer_path: Any,
     *,
     model_name_or_path: Any | None = None,
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """Load GLM-TTS phoneme tokenizer (local path → subfolder → snapshot)."""
-    common = {**kwargs, "trust_remote_code": trust_remote_code}
-    attempts: list[tuple[Any, dict[str, Any]]] = [
-        (tokenizer_path, {"use_fast": False}),
-        (tokenizer_path, {}),
-    ]
-    if model_name_or_path is not None:
-        attempts += [
-            (model_name_or_path, {"subfolder": _GLM_TTS_TOKENIZER_SUBDIR, "use_fast": False}),
-            (model_name_or_path, {"subfolder": _GLM_TTS_TOKENIZER_SUBDIR}),
-        ]
+    """Load GLM-TTS phoneme tokenizer (ChatGLM4Tokenizer, slow-only).
 
-    last_exc: Exception | None = None
-    for path, extra in attempts:
-        try:
-            return AutoTokenizer.from_pretrained(path, **common, **extra)
-        except Exception as exc:
-            last_exc = exc
+    Results are cached by resolved *tokenizer_path* so repeated calls
+    (e.g. from ``build_glm_tts_prefill_metadata``) reuse the same instance.
+    """
+    cache_key = str(tokenizer_path)
+    cached = _glm_tts_tokenizer_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
-    if last_exc is not None:
-        raise last_exc
-    raise ValueError("Failed to load GLM-TTS tokenizer.")
+    # ChatGLM4Tokenizer is SentencePiece-backed with no fast (Rust) impl.
+    # Always load as slow tokenizer — no fallback loop needed.
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        use_fast=False,
+        trust_remote_code=trust_remote_code,
+        **kwargs,
+    )
+    _glm_tts_tokenizer_cache[cache_key] = tokenizer
+    return tokenizer
 
 
 def get_glm_tts_special_token_ids(tokenizer: Any) -> dict[str, int]:
@@ -256,17 +268,27 @@ def _normalize_glm_tts_processor_text(
     return normalized
 
 
+_glm_tts_text_frontend: GLMTTSTextFrontend | None = None
+
+
+def _get_text_frontend() -> GLMTTSTextFrontend:
+    global _glm_tts_text_frontend
+    if _glm_tts_text_frontend is None:
+        _glm_tts_text_frontend = GLMTTSTextFrontend()
+    return _glm_tts_text_frontend
+
+
 def build_glm_tts_prefill_metadata(
     model_name_or_path: Any,
     text: str,
     prompt_text: str | None,
     *,
     tokenizer_path: Any | None = None,
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
 ) -> dict[str, list[int]]:
     """Build request-local GLM-TTS length metadata for AR prefill.
 
-    These scalars are mirrored into ``additional_information`` so the model
+    These scalars are mirrored into ``model_intermediate_buffer`` so the model
     preprocess hook can initialize request state from the metadata alone.
     """
     if tokenizer_path is None:
@@ -276,7 +298,7 @@ def build_glm_tts_prefill_metadata(
         model_name_or_path=model_name_or_path,
         trust_remote_code=trust_remote_code,
     )
-    frontend = GLMTTSTextFrontend()
+    frontend = _get_text_frontend()
     text_len = max(1, len(tokenizer.encode(_normalize_glm_tts_processor_text(frontend, text))))
     prompt_text_len = 0
     if prompt_text:
@@ -721,6 +743,11 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # GLM-TTS async chunk transfer consumes speech_tokens plus voice-clone
+        # conditioning only. Avoid copying per-token hidden states to CPU for
+        # the downstream pooler payload; postprocess still receives GPU hidden
+        # states to maintain last_hidden for AR decode.
+        self.pooler_output_needs_hidden = False
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("last_hidden", "last")}
 
         self.model = LlamaModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
@@ -781,7 +808,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
         """Resolve the target-text token count before the first AR sample.
 
         The request builder mirrors the processor's length metadata into
-        additional_information before the first prefill.  Prefer lengths
+        model_intermediate_buffer before the first prefill.  Prefer lengths
         inferred from that metadata, then fall back to the explicit target
         scalar.  Never silently use a prompt-text length as the target length.
         """
@@ -937,68 +964,145 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         return logits
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: Any,
-    ) -> Any:
-        """Custom sampler: RAS (repetition-aware sampling) per CosyVoice3 pattern.
-
-        Min/max EOA enforcement is delegated to vLLM's standard
-        ``logit_bias_state`` via ``SamplingParams.min_tokens`` /
-        ``max_tokens`` set by the serving endpoint and ``stop_token_ids``
-        from the pipeline config.  This sampler only handles RAS and an
-        allowed-token mask restricting output to ``[ATS..ATE] ∪ {EOA}``.
-        """
-        if logits is None or logits.numel() == 0:
-            return None
+    def _glm_tts_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
         if self.model_stage != "glm_tts":
-            return None
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if sampling_metadata.temperature is None:
+            return False
+        if bool(sampling_metadata.bad_words_token_ids):
+            return False
+        if torch.any(sampling_metadata.frequency_penalties != 0):
+            return False
+        if torch.any(sampling_metadata.presence_penalties != 0):
+            return False
+        return True
 
-        logits = logits.to(torch.float32)
-
-        # Restrict sampling to valid audio tokens and EOA.  vLLM's
-        # logit_bias_state handles min_tokens (mask EOA early) and the
-        # engine enforces max_tokens, but without this mask the model
-        # could emit non-audio tokens that waste decode budget.
+    def _apply_allowed_mask(self, logits: torch.Tensor) -> torch.Tensor:
+        """Restrict logits to valid audio tokens [ATS..ATE] ∪ {EOA}."""
         allowed_mask = getattr(self, "_ar_allowed_mask", None)
         if allowed_mask is None or allowed_mask.device != logits.device or allowed_mask.shape[0] != logits.shape[-1]:
             allowed_mask = torch.full((logits.shape[-1],), float("-inf"), device=logits.device)
             allowed_mask[self._ats : self._ate + 1] = 0.0
             allowed_mask[self._eoa] = 0.0
             self._ar_allowed_mask = allowed_mask
+        return logits + allowed_mask
 
+    def _select_allowed_audio_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Return compact logits for [audio tokens] plus EOA.
+
+        The RAS path samples only from GLM-TTS audio tokens and EOA.  Keeping a
+        compact view avoids top-k/logsumexp over the full LLM vocabulary on
+        every AR step; this is equivalent to sampling after ``_apply_allowed_mask``.
+        """
+        audio_logits = logits[:, self._ats : self._ate + 1]
+        if self._ats <= self._eoa <= self._ate:
+            return audio_logits
+        return torch.cat((audio_logits, logits[:, self._eoa : self._eoa + 1]), dim=-1)
+
+    def _allowed_local_to_token_id(self, local_id: int) -> int:
+        audio_vocab = self._ate - self._ats + 1
+        return self._ats + local_id if local_id < audio_vocab else self._eoa
+
+    def _recent_allowed_local_ids(self, decoded_tokens: Sequence[int], win_size: int) -> list[int]:
+        if win_size <= 0 or not decoded_tokens:
+            return []
+        audio_vocab = self._ate - self._ats + 1
+        recent: list[int] = []
+        for token in decoded_tokens[-win_size:]:
+            token_id = int(token)
+            if self._ats <= token_id <= self._ate:
+                recent.append(token_id - self._ats)
+            elif token_id == self._eoa:
+                recent.append(audio_vocab)
+            else:
+                recent.append(-1)
+        return recent
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput | None:
+        """RAS sampler following CosyVoice3 pattern.
+
+        Uses vLLM Sampler for logits processing (logit_bias_state handles
+        min_tokens/max_tokens/stop_token_ids).  When RAS is enabled, applies
+        per-request nucleus+repetition-aware sampling; otherwise falls back
+        to standard vLLM sampling.
+        """
+        if logits is None or logits.numel() == 0:
+            return None
+        if self.model_stage != "glm_tts":
+            return None
+
+        sampler = getattr(self, "_ar_sampler", None)
+        if sampler is None:
+            sampler = Sampler()
+            self._ar_sampler = sampler
+
+        if not self._glm_tts_ras_enabled(sampling_metadata):
+            logits = self._apply_allowed_mask(logits)
+            return sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+        logits = logits.to(torch.float32)
+        sampling_for_processors = replace(sampling_metadata, no_penalties=True)
+        logits = sampler.apply_logits_processors(logits, sampling_for_processors, predict_bonus_token=False)
+        allowed_logits = self._select_allowed_audio_logits(logits)
+
+        default_top_p = self._ras_top_p
+        default_top_k = self._ras_top_k
         ws = self._ras_win_size
         tr = self._ras_tau_r
-        top_p = self._ras_top_p
-        top_k = self._ras_top_k
+
+        num_reqs = int(allowed_logits.shape[0])
+        t_data = sampling_metadata.temperature
+        tp_data = sampling_metadata.top_p
+        tk_data = sampling_metadata.top_k
+        cache_key = (
+            t_data.data_ptr() if t_data is not None else 0,
+            tp_data.data_ptr() if tp_data is not None else 0,
+            tk_data.data_ptr() if tk_data is not None else 0,
+            num_reqs,
+        )
+        _sp_cache = getattr(self, "_sampling_param_cache", None)
+        if _sp_cache is not None and _sp_cache[0] == cache_key:
+            temperatures, top_ps, top_ks = _sp_cache[1]
+        else:
+            temperatures = _tensor_param_values(t_data, num_reqs, 1.0)
+            top_ps = _tensor_param_values(tp_data, num_reqs, default_top_p)
+            top_ks = _tensor_param_values(tk_data, num_reqs, default_top_k)
+            self._sampling_param_cache = (cache_key, (temperatures, top_ps, top_ks))
 
         sampled_ids: list[int] = []
-        for req_idx in range(int(logits.shape[0])):
-            row_logits = logits[req_idx] + allowed_mask
+        for req_idx in range(num_reqs):
+            row_logits = allowed_logits[req_idx]
+            temperature = temperatures[req_idx]
+            if temperature < self._sampling_eps:
+                local_id = int(torch.argmax(row_logits).item())
+                sampled_ids.append(self._allowed_local_to_token_id(local_id))
+                continue
+
+            top_p = top_ps[req_idx]
+            top_k = int(top_ks[req_idx])
+            generator = sampling_metadata.generators.get(req_idx)
+            weighted_scores = row_logits / max(temperature, self._sampling_eps)
             decoded_tokens = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
-            temperature = float(_req_float(sampling_metadata.temperature, req_idx, 1.0))
-            if temperature < self._sampling_eps:
-                sampled_ids.append(int(torch.argmax(row_logits).item()))
-                continue
-            weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
-            generator = sampling_metadata.generators.get(req_idx)
-            sampled_id = _ras_sample_one(
+            local_id = _ras_sample_one(
                 weighted_scores,
-                decoded_tokens,
+                self._recent_allowed_local_ids(decoded_tokens, ws),
                 top_p=top_p,
                 top_k=top_k,
                 win_size=ws,
                 tau_r=tr,
                 generator=generator,
             )
-            sampled_ids.append(sampled_id)
+            sampled_ids.append(self._allowed_local_to_token_id(local_id))
 
         sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
-        from vllm.v1.outputs import SamplerOutput
-
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
@@ -1012,9 +1116,7 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             return model_outputs
 
         hidden = model_outputs
-        info_dicts = kwargs.get("model_intermediate_buffer")
-        if info_dicts is None:
-            info_dicts = kwargs.get("runtime_additional_information") or []
+        info_dicts = kwargs.get("model_intermediate_buffer") or []
         if isinstance(info_dicts, dict):
             info_dicts = [info_dicts]
 
@@ -1101,7 +1203,9 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
             )
 
         mm_prefill_done = bool(info_dict.get("glm_tts_mm_prefill_done"))
-        sampled_token = int(input_ids[0].item()) if span_len == 1 else None
+        sampled_token: int | None = None
+        if input_embeds is not None and span_len == 1:
+            sampled_token = int(input_ids[0].item())
         one_token_prefill_tail = (
             input_embeds is not None
             and span_len == 1
@@ -1152,7 +1256,8 @@ class GLMTTSForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         # Convert sampled token to speech token (relative to ATS)
         # -1 = invalid/EOA, valid range = [0, ATE-ATS]
-        sampled_token = int(input_ids[0].item())
+        if sampled_token is None:
+            sampled_token = int(input_ids[0].item())
         if self._ats <= sampled_token <= self._ate:
             speech_token = sampled_token - self._ats
         else:

@@ -188,6 +188,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
 
+    def _pooler_output_needs_hidden(self) -> bool:
+        return bool(getattr(self.model, "pooler_output_needs_hidden", True))
+
     def capture_model(self) -> int:
         result = super().capture_model()
         self._capture_talker_mtp_graphs()
@@ -912,9 +915,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
+        needs_hidden_payload = needs_pooler_payload and self._pooler_output_needs_hidden()
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        if needs_pooler_payload:
+        if needs_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
@@ -937,14 +941,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Prior to applying the post-processing func, extract
             # the prefix cached hidden states and multimodal states.
             if self.omni_prefix_cache is not None:
-                (
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._maybe_get_combined_prefix_cache_tensors(
-                    hidden_states,
-                    multimodal_outputs,
-                    scheduler_output.num_scheduled_tokens,
-                )
+                if needs_hidden_payload:
+                    (
+                        combined_hidden_states,
+                        combined_multimodal_outputs,
+                    ) = self._maybe_get_combined_prefix_cache_tensors(
+                        hidden_states,
+                        multimodal_outputs,
+                        scheduler_output.num_scheduled_tokens,
+                    )
+                else:
+                    combined_hidden_states = None
+                    combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
+                        query_start_loc=self.query_start_loc.cpu,
+                        input_batch=self.input_batch,
+                        multimodal_outputs=(
+                            flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                        ),
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None:
                 mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
@@ -976,19 +991,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                # If prefix cache is enabled, we have already split everything
-                # by request and converted the states to CPU tensors
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
-                else:
-                    req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
-                        combined_hidden_states,
-                        rid,
-                        start,
-                        end,
-                    )
-                payload: dict[str, object] = {"hidden": req_hidden_states}
+                payload: dict[str, object] = {}
+                if needs_hidden_payload:
+                    # If prefix cache is enabled, we have already split
+                    # everything by request and converted the states to CPU
+                    # tensors.
+                    if req_hidden_states_cpu is not None and combined_hidden_states is None:
+                        req_hidden_states = req_hidden_states_cpu[rid]
+                    else:
+                        req_hidden_states = self._resolve_req_hidden_states(
+                            hidden_states_cpu,
+                            combined_hidden_states,
+                            rid,
+                            start,
+                            end,
+                        )
+                    payload["hidden"] = req_hidden_states
 
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:

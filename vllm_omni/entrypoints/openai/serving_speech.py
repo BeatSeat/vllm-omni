@@ -2013,7 +2013,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "mm_processor_kwargs": {
                     "prompt_text": request.ref_text,
                 },
-                "model_intermediate_buffer": self._build_glm_tts_prefill_metadata(
+                "additional_information": self._build_glm_tts_prefill_metadata(
                     request.input,
                     request.ref_text,
                 ),
@@ -2058,11 +2058,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return max(1, len(cached.encode(normalized)))
 
     def _build_glm_tts_prefill_metadata(self, text: str, prompt_text: str | None) -> dict[str, Any]:
-        """Build GLM-TTS processor length metadata for model_intermediate_buffer.
+        """Build GLM-TTS processor length metadata for additional_information.
 
         The model preprocess hook runs before postprocess can mirror MM kwargs
-        into model_intermediate_buffer, so these scalar fields must originate
-        from the request payload rather than runner-level mm_features.
+        into additional_information, so these scalar fields must originate from
+        the request payload rather than runner-level mm_features.
         """
         text_len = self._estimate_glm_tts_text_token_len(text)
         prompt_text_len = (
@@ -2311,7 +2311,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             import copy
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
-            glm_metadata = prompt.get("model_intermediate_buffer") if isinstance(prompt, dict) else None
+            glm_metadata = prompt.get("additional_information") if isinstance(prompt, dict) else None
             text_len_value = None
             if isinstance(glm_metadata, dict):
                 text_len_value = glm_metadata.get("glm_tts_text_token_len")

@@ -92,12 +92,14 @@ def _tensor_param_values(
     return [float(value) for value in values[:count]]
 
 
-def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
-    """Resolve local vq32k-phoneme-tokenizer directory.
+def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> str:
+    """Resolve vq32k-phoneme-tokenizer directory to a local path.
 
-    Only checks local filesystem paths.  Remote (Hub) tokenizer
-    downloading is handled by ``arg_utils._TOKENIZER_SUBFOLDER_MAP``
-    during engine init — no need to duplicate ``snapshot_download`` here.
+    For local model dirs, scans for the tokenizer subfolder on disk.
+    For HF hub names, downloads the tokenizer subfolder via
+    ``snapshot_download`` (same pattern as CosyVoice3's
+    ``_ensure_cached_runtime_components`` and
+    ``arg_utils._TOKENIZER_SUBFOLDER_MAP``).
     """
     model_path = os.fspath(model_name_or_path)
     if os.path.exists(model_path):
@@ -107,7 +109,24 @@ def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> Any:
         ]:
             if os.path.isdir(candidate):
                 return candidate
-    return model_name_or_path
+        return model_path
+
+    from huggingface_hub import snapshot_download
+
+    local_dir = snapshot_download(
+        model_path,
+        allow_patterns=[
+            f"{_GLM_TTS_TOKENIZER_SUBDIR}/tokenizer*",
+            f"{_GLM_TTS_TOKENIZER_SUBDIR}/special_tokens*",
+            f"{_GLM_TTS_TOKENIZER_SUBDIR}/vocab*",
+            f"{_GLM_TTS_TOKENIZER_SUBDIR}/merges*",
+            f"{_GLM_TTS_TOKENIZER_SUBDIR}/added_tokens*",
+        ],
+    )
+    candidate = os.path.join(local_dir, _GLM_TTS_TOKENIZER_SUBDIR)
+    if os.path.isdir(candidate):
+        return candidate
+    return model_path
 
 
 def resolve_glm_tts_model_dir(
@@ -193,25 +212,18 @@ def load_glm_tts_tokenizer(
 ) -> Any:
     """Load GLM-TTS phoneme tokenizer (ChatGLM4Tokenizer, slow-only).
 
-    Results are cached by resolved *tokenizer_path* so repeated calls
-    (e.g. from ``build_glm_tts_prefill_metadata``) reuse the same instance.
+    Expects a resolved local directory (use ``resolve_glm_tts_tokenizer_path``
+    to handle HF hub names first).  Results are cached by *tokenizer_path*.
     """
     cache_key = str(tokenizer_path)
     cached = _glm_tts_tokenizer_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    # ChatGLM4Tokenizer is SentencePiece-backed with no fast (Rust) impl.
-    # When tokenizer_path is a HF hub name (not a local dir), the actual
-    # tokenizer files live in the vq32k-phoneme-tokenizer subfolder.
-    extra_kwargs: dict[str, str] = {}
-    if not os.path.isdir(str(tokenizer_path)):
-        extra_kwargs["subfolder"] = _GLM_TTS_TOKENIZER_SUBDIR
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         use_fast=False,
         trust_remote_code=trust_remote_code,
-        **extra_kwargs,
         **kwargs,
     )
     _glm_tts_tokenizer_cache[cache_key] = tokenizer

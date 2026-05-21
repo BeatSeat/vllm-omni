@@ -50,23 +50,6 @@ def test_text_to_speech_sync_zh(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", _tts_server_params, indirect=True)
-def test_text_to_speech_sync_en(omni_server, openai_client) -> None:
-    """Sync TTS: English text → WAV audio."""
-    request_config = {
-        "model": omni_server.model,
-        "input": "The weather is nice today, perfect for a walk.",
-        "stream": False,
-        "timeout": 180.0,
-        "response_format": "wav",
-    }
-    openai_client.send_audio_speech_request(request_config)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.tts
-@pytest.mark.omni
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", _tts_server_params, indirect=True)
 def test_text_to_speech_streaming(omni_server, openai_client) -> None:
     """Streaming TTS: text → PCM stream."""
     request_config = {

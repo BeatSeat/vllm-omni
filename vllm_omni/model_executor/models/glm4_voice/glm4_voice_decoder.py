@@ -15,7 +15,6 @@ This module is instantiated by ``GLM4VoiceForConditionalGeneration`` when
 from __future__ import annotations
 
 import logging
-import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,8 +55,9 @@ def _bool_value(v: Any) -> bool:
 class GLM4VoiceDecoderForGeneration(nn.Module):
     """Wrapper for CosyVoice flow decoder + HiFi-T vocoder.
 
-    Loads ``flow.pt`` and ``hift.pt`` from the ``glm-4-voice-decoder``
-    checkpoint directory via HyperPyYAML config.
+    Constructs flow (MaskedDiffWithXvec) and vocoder (HiFTGenerator) with
+    hardcoded GLM-4-Voice parameters, then loads ``flow.pt`` / ``hift.pt``
+    state dicts. No external dependencies (HyperPyYAML, matcha, CosyVoice).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -184,28 +184,37 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             if state is None:
                 state = _StreamState()
                 self._stream_state[req_id] = state
+            mel_overlap_snap = state.mel_overlap
+            hift_cache_mel_snap = state.hift_cache_mel
+            hift_cache_source_snap = state.hift_cache_source
 
-        if state.mel_overlap is not None and self.mel_overlap_len > 0:
-            tts_mel = self._fade_in_out(tts_mel, state.mel_overlap)
+        if mel_overlap_snap is not None and self.mel_overlap_len > 0:
+            tts_mel = self._fade_in_out(tts_mel, mel_overlap_snap)
 
-        if state.hift_cache_mel is not None:
-            tts_mel = torch.cat([state.hift_cache_mel, tts_mel], dim=2)
-            hift_cache_source = state.hift_cache_source
+        if hift_cache_mel_snap is not None:
+            tts_mel = torch.cat([hift_cache_mel_snap, tts_mel], dim=2)
+            hift_cache_source = hift_cache_source_snap
         else:
             hift_cache_source = torch.zeros(1, 1, 0, device=self.device)
 
         if not finalize:
+            new_mel_overlap = None
             if self.mel_overlap_len > 0:
-                state.mel_overlap = tts_mel[:, :, -self.mel_overlap_len :]
+                new_mel_overlap = tts_mel[:, :, -self.mel_overlap_len :]
                 tts_mel = tts_mel[:, :, : -self.mel_overlap_len]
 
-            tts_speech, tts_source = self.hift.inference(mel=tts_mel, cache_source=hift_cache_source)
+            tts_speech, tts_source = self.hift.inference(tts_mel, cache_source=hift_cache_source)
 
-            state.hift_cache_mel = tts_mel[:, :, -self.mel_cache_len :]
-            state.hift_cache_source = tts_source[:, :, -self.source_cache_len :]
+            with self._stream_lock:
+                if req_id in self._stream_state:
+                    st = self._stream_state[req_id]
+                    st.mel_overlap = new_mel_overlap
+                    st.hift_cache_mel = tts_mel[:, :, -self.mel_cache_len :]
+                    st.hift_cache_source = tts_source[:, :, -self.source_cache_len :]
+
             tts_speech = tts_speech[:, : -self.source_cache_len]
         else:
-            tts_speech, _ = self.hift.inference(mel=tts_mel, cache_source=hift_cache_source)
+            tts_speech, _ = self.hift.inference(tts_mel, cache_source=hift_cache_source)
             with self._stream_lock:
                 self._stream_state.pop(req_id, None)
 
@@ -276,51 +285,38 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             logger.warning("GLM-4-Voice decoder directory not found. Decoder will not produce audio.")
             return
 
-        config_path = decoder_dir / "config.yaml"
         flow_path = decoder_dir / "flow.pt"
         hift_path = decoder_dir / "hift.pt"
 
-        if not config_path.exists():
-            logger.error("Missing config.yaml in %s", decoder_dir)
-            return
-
-        try:
-            from hyperpyyaml import load_hyperpyyaml
-        except ImportError:
-            logger.error("hyperpyyaml is required for GLM-4-Voice decoder. Install with: pip install HyperPyYAML")
-            return
-
-        cosyvoice_paths = [
-            str(decoder_dir.parent),
-            str(decoder_dir),
-        ]
-        for p in cosyvoice_paths:
-            if p not in sys.path:
-                sys.path.insert(0, p)
-
-        with open(config_path) as f:
-            scratch_configs = load_hyperpyyaml(f)
-
-        self.flow = scratch_configs["flow"]
-        self.hift = scratch_configs["hift"]
-
+        self.flow = self._build_flow_model()
         if flow_path.exists():
             flow_state = torch.load(flow_path, map_location=self.device, weights_only=True)
-            self.flow.load_state_dict(flow_state)
-            logger.info("Loaded flow weights from %s", flow_path)
+            missing, unexpected = self.flow.load_state_dict(flow_state, strict=False)
+            if missing:
+                logger.warning("Flow missing keys (%d): %s", len(missing), missing[:5])
+            if unexpected:
+                logger.warning("Flow unexpected keys (%d): %s", len(unexpected), unexpected[:5])
+            logger.info("Loaded flow weights from %s (%d tensors)", flow_path, len(flow_state))
+        else:
+            logger.warning("flow.pt not found in %s", decoder_dir)
 
+        self.hift = self._build_hift_model()
         if hift_path.exists():
             hift_state = torch.load(hift_path, map_location=self.device, weights_only=True)
-            self.hift.load_state_dict(hift_state)
-            logger.info("Loaded HiFi-T weights from %s", hift_path)
+            hift_state = self._remap_hift_state_dict(hift_state)
+            missing, unexpected = self.hift.load_state_dict(hift_state, strict=False)
+            if missing:
+                logger.warning("HiFT missing keys (%d): %s", len(missing), missing[:5])
+            if unexpected:
+                logger.warning("HiFT unexpected keys (%d): %s", len(unexpected), unexpected[:5])
+            logger.info("Loaded HiFi-T weights from %s (%d tensors)", hift_path, len(hift_state))
+        else:
+            logger.warning("hift.pt not found in %s", decoder_dir)
 
-        self.flow.to(device=self.device, dtype=self.dtype)
-        self.hift.to(device=self.device, dtype=self.dtype)
-        self.flow.eval()
-        self.hift.eval()
+        self.flow.to(device=self.device, dtype=self.dtype).eval()
+        self.hift.to(device=self.device, dtype=self.dtype).eval()
 
-        input_frame_rate = getattr(self.flow, "input_frame_rate", 12.5)
-        self.mel_overlap_len = int(self.token_overlap_len / input_frame_rate * _SAMPLE_RATE / _MEL_HOP_SIZE)
+        self.mel_overlap_len = int(self.token_overlap_len / 12.5 * _SAMPLE_RATE / _MEL_HOP_SIZE)
         self.mel_window = np.hamming(2 * self.mel_overlap_len)
         self.source_cache_len = int(self.mel_cache_len * _MEL_HOP_SIZE)
 
@@ -352,6 +348,85 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             logger.debug("Could not download decoder from HuggingFace.")
 
         return None
+
+    def _build_flow_model(self) -> nn.Module:
+        from .flow_components import (
+            ConditionalCFM,
+            ConditionalDecoder,
+            ConformerEncoder,
+            InterpolateRegulator,
+            MaskedDiffWithXvec,
+        )
+
+        encoder = ConformerEncoder(
+            input_size=512, output_size=512, attention_heads=8,
+            linear_units=2048, num_blocks=6, dropout_rate=0.1,
+            positional_dropout_rate=0.1, attention_dropout_rate=0.0,
+            normalize_before=True, macaron_style=True,
+            use_cnn_module=True, cnn_module_kernel=15, causal=False,
+        )
+        length_regulator = InterpolateRegulator(
+            channels=80, sampling_ratios=(1, 1, 1, 1), groups=1,
+        )
+        estimator = ConditionalDecoder(
+            in_channels=320, out_channels=80, channels=(256, 256),
+            dropout=0.05, attention_head_dim=64, n_blocks=4,
+            num_mid_blocks=12, num_heads=8, act_fn="gelu",
+        )
+        decoder = ConditionalCFM(
+            in_channels=240, n_spks=1, spk_emb_dim=80,
+            estimator=estimator, cfm_params={
+                "sigma_min": 1e-6, "solver": "euler",
+                "t_scheduler": "cosine", "inference_cfg_rate": 0.7,
+            },
+        )
+        return MaskedDiffWithXvec(
+            input_size=512, output_size=80, spk_embed_dim=192,
+            vocab_size=16384, input_frame_rate=12.5,
+            encoder=encoder, length_regulator=length_regulator,
+            decoder=decoder,
+        )
+
+    def _build_hift_model(self) -> nn.Module:
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
+            HiFTGenerator,
+        )
+
+        from .flow_components import ConvRNNF0Predictor
+
+        f0_predictor = ConvRNNF0Predictor(num_class=1, in_channels=80, cond_channels=512)
+        return HiFTGenerator(
+            in_channels=80, base_channels=512, nb_harmonics=8,
+            sampling_rate=22050, upsample_rates=[8, 8],
+            upsample_kernel_sizes=[16, 16], f0_predictor=f0_predictor,
+        )
+
+    @staticmethod
+    def _remap_hift_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+        """Remap hift.pt keys: strip 'generator.' prefix, convert old weight_norm keys."""
+        if any(k.startswith("generator.") for k in state_dict):
+            state_dict = {k.replace("generator.", "", 1): v for k, v in state_dict.items()}
+
+        has_old_wn = any(k.endswith(".weight_g") or k.endswith(".weight_v") for k in state_dict)
+        if not has_old_wn:
+            return state_dict
+
+        converted: dict[str, Any] = {}
+        wn_count = 0
+        for k, v in state_dict.items():
+            if k.endswith(".weight_g"):
+                base = k[: -len(".weight_g")]
+                converted[f"{base}.parametrizations.weight.original1"] = v
+                wn_count += 1
+            elif k.endswith(".weight_v"):
+                base = k[: -len(".weight_v")]
+                converted[f"{base}.parametrizations.weight.original0"] = v
+                wn_count += 1
+            else:
+                converted[k] = v
+
+        logger.info("Converted %d old-style weight_norm keys to parametrizations format", wn_count)
+        return converted
 
 
 _GLM4_VOICE_DECODER_REPO = "THUDM/glm-4-voice-decoder"

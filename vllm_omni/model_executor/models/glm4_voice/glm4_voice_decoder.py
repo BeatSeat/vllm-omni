@@ -25,8 +25,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.sequence import OmniOutput
 

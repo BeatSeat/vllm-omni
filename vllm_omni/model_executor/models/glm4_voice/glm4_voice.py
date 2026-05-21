@@ -20,11 +20,11 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.sampler import get_sampler
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.chatglm import ChatGLMModel
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.glm4_voice.glm4_voice_decoder import (
     GLM4VoiceDecoderForGeneration,
@@ -97,7 +97,7 @@ class GLM4VoiceForConditionalGeneration(nn.Module):
         self._patch_config_for_chatglm()
         self.model = ChatGLMModel(vllm_config=vllm_config, prefix=f"{prefix}transformer")
         self.logits_processor = LogitsProcessor(self.config.vocab_size, logit_scale=1.0)
-        self.sampler = get_sampler()
+        self.sampler = Sampler()
 
         # Special token IDs — resolved lazily from tokenizer in
         # ``_ensure_token_ids`` to avoid requiring tokenizer at init.

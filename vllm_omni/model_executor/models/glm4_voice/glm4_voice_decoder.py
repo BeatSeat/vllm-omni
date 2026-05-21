@@ -362,8 +362,8 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             input_size=512, output_size=512, attention_heads=8,
             linear_units=2048, num_blocks=6, dropout_rate=0.1,
             positional_dropout_rate=0.1, attention_dropout_rate=0.0,
-            normalize_before=True, macaron_style=True,
-            use_cnn_module=True, cnn_module_kernel=15, causal=False,
+            normalize_before=True, macaron_style=False,
+            use_cnn_module=False, cnn_module_kernel=15, causal=False,
         )
         length_regulator = InterpolateRegulator(
             channels=80, sampling_ratios=(1, 1, 1, 1), groups=1,

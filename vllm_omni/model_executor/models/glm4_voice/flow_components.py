@@ -536,7 +536,7 @@ class ResnetBlock1D(nn.Module):
         self.mlp = nn.Sequential(nn.Mish(), nn.Linear(time_emb_dim, dim_out))
         self.block1 = Block1D(dim, dim_out)
         self.block2 = Block1D(dim_out, dim_out)
-        self.res_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv1d(dim, dim_out, 1)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, time_emb: torch.Tensor) -> torch.Tensor:
         h = self.block1(x, mask)

@@ -26,20 +26,20 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.80
+    gpu_memory_utilization: 0.85
     dtype: bfloat16
-    enforce_eager: false
+    enforce_eager: true
     async_scheduling: true
     enable_prefix_caching: false
     max_num_batched_tokens: 512
-    max_model_len: 4096
+    max_model_len: 1024
     devices: "0"
     output_connectors:
       to_stage_1: glm4_voice_shm
     default_sampling_params:
       temperature: 0.2
       top_p: 0.8
-      max_tokens: 4096
+      max_tokens: 1024
       min_tokens: 1
       detokenize: false
     hf_overrides:

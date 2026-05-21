@@ -29,7 +29,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.models.glm4_voice.glm4_voice_decoder import (
     GLM4VoiceDecoderForGeneration,
 )
-from vllm_omni.sequence import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
 

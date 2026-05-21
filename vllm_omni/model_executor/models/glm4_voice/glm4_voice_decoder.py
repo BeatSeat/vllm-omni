@@ -28,7 +28,7 @@ from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.sequence import OmniOutput
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
 

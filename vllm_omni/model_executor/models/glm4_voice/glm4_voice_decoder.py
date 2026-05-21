@@ -231,14 +231,14 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor | None:
         return None
 
     def sample(
         self,
         logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> list | None:
         return None
 
@@ -256,9 +256,9 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             multimodal_outputs["sample_rate"] = sr
             self._last_audio = None
 
-        hidden_states = model_output if isinstance(model_output, torch.Tensor) else torch.zeros(1, 1)
+        text_hs = model_output if isinstance(model_output, torch.Tensor) else torch.zeros(1, 1)
         return OmniOutput(
-            hidden_states=hidden_states,
+            text_hidden_states=text_hs,
             multimodal_outputs=multimodal_outputs,
         )
 

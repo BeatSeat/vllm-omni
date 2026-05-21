@@ -60,3 +60,5 @@ stages:
       max_tokens: 2048
     disable_hybrid_kv_cache_manager: true
     skip_mm_profiling: true
+    hf_overrides:
+      model_type: glm4_voice

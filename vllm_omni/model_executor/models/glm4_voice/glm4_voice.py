@@ -89,7 +89,9 @@ class GLM4VoiceForConditionalGeneration(nn.Module):
         # --- AR stage init ---
         self._patch_config_for_chatglm()
         self.model = ChatGLMModel(vllm_config=vllm_config, prefix=f"{prefix}transformer")
-        self.logits_processor = LogitsProcessor(self.config.vocab_size, logit_scale=1.0)
+        self.logits_processor = LogitsProcessor(
+            getattr(self.config, "padded_vocab_size", self.config.vocab_size),
+        )
         self.sampler = Sampler()
         self.has_preprocess = False
         self.has_postprocess = False
@@ -122,6 +124,18 @@ class GLM4VoiceForConditionalGeneration(nn.Module):
             cfg.original_rope = True
         if not hasattr(cfg, "rope_ratio"):
             cfg.rope_ratio = 500
+        if not hasattr(cfg, "fp32_residual_connection"):
+            cfg.fp32_residual_connection = False
+        if not hasattr(cfg, "layernorm_epsilon"):
+            cfg.layernorm_epsilon = getattr(cfg, "layer_norm_epsilon", 3.90625e-08)
+        if not hasattr(cfg, "hidden_dropout"):
+            cfg.hidden_dropout = 0.0
+        if not hasattr(cfg, "rmsnorm"):
+            cfg.rmsnorm = True
+        if not hasattr(cfg, "ffn_hidden_size"):
+            cfg.ffn_hidden_size = getattr(cfg, "intermediate_size", 13696)
+        if not hasattr(cfg, "kv_channels"):
+            cfg.kv_channels = getattr(cfg, "hidden_size", 4096) // getattr(cfg, "num_attention_heads", 32)
 
     def _ensure_token_ids(self) -> None:
         if self._tokenizer_resolved:
@@ -151,6 +165,21 @@ class GLM4VoiceForConditionalGeneration(nn.Module):
         self._ensure_token_ids()
         assert self._end_token_id is not None
         return self._end_token_id
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        is_multimodal=None,
+    ) -> torch.Tensor:
+        if self.model_stage == "glm4_voice_decoder":
+            return torch.zeros(
+                input_ids.shape[0],
+                getattr(self.config, "hidden_size", 4096),
+                device=input_ids.device,
+                dtype=torch.float32,
+            )
+        return self.model.embed_input_ids(input_ids)
 
     # ------------------------------------------------------------------
     # Forward
@@ -184,11 +213,11 @@ class GLM4VoiceForConditionalGeneration(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        **kwargs: Any,
     ) -> torch.Tensor | None:
         if self.model_stage == "glm4_voice_decoder":
-            return self.decoder.compute_logits(hidden_states, sampling_metadata)
-        logits = self.logits_processor(self.model.output_layer, hidden_states, sampling_metadata)
+            return self.decoder.compute_logits(hidden_states, kwargs.get("sampling_metadata"))
+        logits = self.logits_processor(self.model.output_layer, hidden_states)
         return logits
 
     def sample(
@@ -212,7 +241,7 @@ class GLM4VoiceForConditionalGeneration(nn.Module):
             return model_output
 
         return OmniOutput(
-            hidden_states=model_output,
+            text_hidden_states=model_output,
             multimodal_outputs={},
         )
 

@@ -416,11 +416,11 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         for k, v in state_dict.items():
             if k.endswith(".weight_g"):
                 base = k[: -len(".weight_g")]
-                converted[f"{base}.parametrizations.weight.original1"] = v
+                converted[f"{base}.parametrizations.weight.original0"] = v
                 wn_count += 1
             elif k.endswith(".weight_v"):
                 base = k[: -len(".weight_v")]
-                converted[f"{base}.parametrizations.weight.original0"] = v
+                converted[f"{base}.parametrizations.weight.original1"] = v
                 wn_count += 1
             else:
                 converted[k] = v

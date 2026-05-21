@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import pytest
 
-from tests.helpers.fixtures.runtime import OmniServerParams
-from tests.helpers.markers import hardware_test
-from tests.helpers.utils import get_deploy_config_path
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "THUDM/glm-4-voice-9b"
 

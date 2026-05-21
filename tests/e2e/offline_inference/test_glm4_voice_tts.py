@@ -16,7 +16,7 @@ import pytest
 import soundfile as sf
 import torch
 
-from tests.helpers.markers import hardware_test
+from tests.helpers.mark import hardware_test
 
 MODEL = "THUDM/glm-4-voice-9b"
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))

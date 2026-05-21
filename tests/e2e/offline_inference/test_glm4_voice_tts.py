@@ -71,14 +71,17 @@ def test_offline_text_to_speech_zh(async_chunk: bool) -> None:
 
     synth_text = "今天天气真不错，适合出去散散步。"
 
-    with Omni(
+    omni = Omni(
         model=MODEL,
         stage_configs_path=_get_deploy_config(async_chunk=async_chunk),
         trust_remote_code=True,
         stage_init_timeout=600,
-    ) as omni:
+    )
+    try:
         prompt_text = build_glm4_voice_prompt(synth_text)
         outputs = omni.generate([{"prompt": prompt_text}])
+    finally:
+        omni.close()
 
     assert outputs, "No outputs returned"
     mm = outputs[0].multimodal_output
@@ -112,14 +115,17 @@ def test_offline_text_to_speech_en() -> None:
 
     synth_text = "The weather is nice today, perfect for a walk in the park."
 
-    with Omni(
+    omni = Omni(
         model=MODEL,
         stage_configs_path=_get_deploy_config(async_chunk=True),
         trust_remote_code=True,
         stage_init_timeout=600,
-    ) as omni:
+    )
+    try:
         prompt_text = build_glm4_voice_prompt(synth_text)
         outputs = omni.generate([{"prompt": prompt_text}])
+    finally:
+        omni.close()
 
     assert outputs, "No outputs returned"
     mm = outputs[0].multimodal_output

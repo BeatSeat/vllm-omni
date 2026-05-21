@@ -18,14 +18,14 @@ connectors:
       connector_get_sleep_s: 0.002
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: [25, 50, 100, 150, 200]
+      codec_chunk_frames: 25
       codec_left_context_frames: 25
       crossfade_sec: 0.1
 
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.70
+    gpu_memory_utilization: 0.80
     dtype: bfloat16
     enforce_eager: false
     async_scheduling: true
@@ -46,10 +46,10 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 1
-    gpu_memory_utilization: 0.15
+    gpu_memory_utilization: 0.12
     enforce_eager: true
-    max_model_len: 8192
-    max_num_batched_tokens: 2048
+    max_model_len: 2048
+    max_num_batched_tokens: 512
     dtype: float32
     devices: "0"
     enable_prefix_caching: false

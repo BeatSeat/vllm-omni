@@ -3,182 +3,185 @@
 """Stage input processors for GLM-4-Voice: AR → Decoder bridge.
 
 Two functions:
-- ``ar_to_decoder``: Non-streaming (sync) transfer of all speech tokens.
-- ``ar_to_decoder_async_chunk``: Streaming transfer with progressive
-  chunk sizes [25, 50, 100, 150, 200] matching the reference
-  ``web_demo.py`` implementation.
+- ``ar_to_decoder``: Non-streaming (sync) — collects all speech tokens
+  from completed AR output and forwards to the decoder stage.
+- ``ar_to_decoder_async_chunk``: Streaming — filters audio tokens from
+  the interleaved AR stream and emits delta chunks via
+  ``OmniPayloadStruct``.
 
-Audio tokens in the AR output are interleaved with text tokens.  Only
-tokens >= ``audio_offset`` are forwarded to the decoder; text tokens
-are filtered out.  The ``audio_offset`` is extracted from the AR stage's
-``additional_information``.
+Audio tokens in the AR output are identified by ``token_id >= audio_offset``
+(151552 for THUDM/glm-4-voice-9b).  They are converted to 0-based speech
+tokens (0..16383) before forwarding to the decoder.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any
 
+import torch
+
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayloadStruct,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = logging.getLogger(__name__)
 
-# Progressive chunk sizes (from reference web_demo.py).
-_CHUNK_SIZES = [25, 50, 100, 150, 200]
+_AUDIO_OFFSET = 151552
+_AUDIO_VOCAB_SIZE = 16384
 
 
-def _extract_speech_tokens(
-    source_outputs: list[Any],
-) -> list[int]:
-    """Collect speech_tokens from all AR output steps."""
-    tokens: list[int] = []
-    for output in source_outputs:
-        mm = getattr(output, "multimodal_output", None)
-        if mm is None:
-            continue
-        st = mm.get("speech_tokens")
-        if st is not None:
-            if isinstance(st, list):
-                tokens.extend(st)
-            else:
-                tokens.append(int(st))
-    return tokens
-
-
-def _extract_last_speech_token(source_outputs: list[Any]) -> int:
-    """Extract the last speech token from AR output."""
-    for output in reversed(source_outputs):
-        mm = getattr(output, "multimodal_output", None)
-        if mm is None:
-            continue
-        last = mm.get("last_speech_token", -1)
-        if last >= 0:
-            return int(last)
-    return -1
+def _ensure_list(x: Any) -> list:
+    if isinstance(x, list):
+        return list(x)
+    if isinstance(x, tuple):
+        return list(x)
+    if x is None:
+        return []
+    try:
+        return list(x)
+    except TypeError:
+        return [x]
 
 
 def ar_to_decoder(
     source_outputs: list[Any],
-    prompt: Any,
+    prompt: Any = None,
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Non-streaming AR → Decoder transfer.
 
-    Collects all speech tokens from the AR stage output and packages
-    them as an ``OmniTokensPrompt`` for the decoder stage.
+    Collects all audio tokens from the AR stage output, converts them
+    to 0-based speech tokens, and packages as ``OmniTokensPrompt``
+    for the decoder stage.
     """
-    speech_tokens = _extract_speech_tokens(source_outputs)
-    if not speech_tokens:
-        logger.warning("GLM-4-Voice: no speech tokens from AR stage")
-        return []
+    engine_inputs: list[OmniTokensPrompt] = []
 
-    # Filter out any invalid tokens.
-    speech_tokens = [t for t in speech_tokens if 0 <= t < 16384]
+    for source_output in source_outputs:
+        output = source_output.outputs[0]
+        output_ids = _ensure_list(getattr(output, "cumulative_token_ids", []))
 
-    additional_info: dict[str, Any] = {
-        "speech_tokens": speech_tokens,
-        "stream_finished": True,
-        "prompt_token": None,
-        "prompt_feat": None,
-        "embedding": None,
-    }
+        speech_tokens: list[int] = []
+        for tok in output_ids:
+            tok_int = int(tok)
+            if tok_int >= _AUDIO_OFFSET:
+                speech_tok = tok_int - _AUDIO_OFFSET
+                if 0 <= speech_tok < _AUDIO_VOCAB_SIZE:
+                    speech_tokens.append(speech_tok)
 
-    # Propagate voice clone data if available.
-    if source_outputs:
-        last_mm = getattr(source_outputs[-1], "multimodal_output", None)
-        if last_mm is not None:
-            for key in ("prompt_token", "prompt_feat", "embedding"):
-                if key in last_mm:
-                    additional_info[key] = last_mm[key]
+        if not speech_tokens:
+            continue
 
-    # Build a minimal OmniTokensPrompt for the decoder.
-    return [
-        OmniTokensPrompt(
-            prompt_token_ids=[0],  # dummy token; decoder ignores input_ids
-            additional_information=additional_info,
+        req_id = str(getattr(source_output, "request_id", "0"))
+
+        additional_info: dict[str, Any] = {
+            "meta": {
+                "stream_finished": True,
+                "finished": True,
+                "req_id": [req_id],
+            },
+        }
+
+        engine_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=speech_tokens,
+                additional_information=additional_info,
+            )
         )
-    ]
 
+    if not engine_inputs:
+        logger.warning("GLM-4-Voice: no speech tokens from AR stage")
 
-# Per-request async state.
-_async_state: dict[str, dict[str, Any]] = {}
+    return engine_inputs
 
 
 def ar_to_decoder_async_chunk(
     transfer_manager: Any,
     pooling_output: Any,
     request: Any,
-    is_finished: bool,
-) -> Any | None:
-    """Streaming AR → Decoder transfer with progressive chunk sizes.
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """Streaming AR → Decoder transfer with delta chunks.
 
     Accumulates audio tokens from the interleaved AR stream and emits
-    cumulative prefix chunks at progressive sizes [25, 50, 100, 150, 200].
+    delta (new-only) chunks when ``codec_chunk_frames`` tokens are ready.
+    Each chunk becomes ``prompt_token_ids`` in the decoder via the
+    ``codes.audio`` → ``code_predictor_codes`` framework path.
     """
-    req_id = str(getattr(request, "request_id", "0"))
+    request_id = request.external_req_id
+    finished = bool(is_finished or request.is_finished())
 
-    # Initialize per-request state.
-    if req_id not in _async_state:
-        _async_state[req_id] = {
-            "audio_tokens": [],
-            "chunk_idx": 0,
-            "emitted_len": 0,
-            "terminal_sent": False,
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_size = int(cfg.get("codec_chunk_frames", 25))
+
+    request_state = transfer_manager.request_payload.get(request_id)
+    if not isinstance(request_state, dict) or "_glm4_voice_state" not in request_state:
+        request_state = {
+            "_glm4_voice_state": {
+                "seen_len": 0,
+                "emitted_len": 0,
+                "terminal_sent": False,
+            },
         }
+        transfer_manager.request_payload[request_id] = request_state
 
-    state = _async_state[req_id]
+    state = request_state["_glm4_voice_state"]
+    if state.get("terminal_sent", False):
+        return None
 
-    # Extract new speech token from this AR step.
-    if pooling_output is not None:
-        mm = getattr(pooling_output, "multimodal_output", None)
-        if mm is not None:
-            last_token = mm.get("last_speech_token", -1)
-            if last_token >= 0:
-                state["audio_tokens"].append(last_token)
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []))
+    seen_len = state["seen_len"]
+    new_tokens = output_token_ids[seen_len:]
+    state["seen_len"] = len(output_token_ids)
 
-    audio_tokens = state["audio_tokens"]
-    chunk_idx = state["chunk_idx"]
+    if not hasattr(transfer_manager, "code_prompt_token_ids"):
+        transfer_manager.code_prompt_token_ids = defaultdict(list)
+    token_list = transfer_manager.code_prompt_token_ids[request_id]
+    for tok in new_tokens:
+        tok_int = int(tok)
+        if tok_int >= _AUDIO_OFFSET:
+            speech_tok = tok_int - _AUDIO_OFFSET
+            if 0 <= speech_tok < _AUDIO_VOCAB_SIZE:
+                token_list.append([speech_tok])
+
+    total_audio = len(token_list)
     emitted_len = state["emitted_len"]
+    pending = total_audio - emitted_len
 
-    # Determine current chunk threshold.
-    if chunk_idx < len(_CHUNK_SIZES):
-        chunk_threshold = _CHUNK_SIZES[chunk_idx]
-    else:
-        chunk_threshold = _CHUNK_SIZES[-1]
-
-    pending = len(audio_tokens) - emitted_len
-    should_emit = pending >= chunk_threshold or (is_finished and pending > 0)
+    should_emit = pending >= chunk_size or (finished and pending > 0)
 
     if not should_emit:
-        if is_finished and not state["terminal_sent"]:
-            # No new tokens but generation is done — send terminal signal.
+        if finished and not state["terminal_sent"]:
             state["terminal_sent"] = True
-            _async_state.pop(req_id, None)
-            return OmniTokensPrompt(
-                prompt_token_ids=[0],
-                additional_information={
-                    "speech_tokens": [],
-                    "stream_finished": True,
-                },
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(
+                    finished=torch.tensor(True, dtype=torch.bool),
+                    stream_finished=torch.tensor(True, dtype=torch.bool),
+                    req_id=[request_id],
+                ),
             )
         return None
 
-    # Emit current chunk (cumulative prefix of all audio tokens so far).
-    current_tokens = list(audio_tokens)
-    state["emitted_len"] = len(audio_tokens)
-    if chunk_idx < len(_CHUNK_SIZES) - 1:
-        state["chunk_idx"] = chunk_idx + 1
+    delta_tokens = [int(frame[0]) for frame in token_list[emitted_len:total_audio]]
+    state["emitted_len"] = total_audio
 
-    additional_info: dict[str, Any] = {
-        "speech_tokens": current_tokens,
-        "stream_finished": is_finished,
-    }
-
-    if is_finished:
-        state["terminal_sent"] = True
-        _async_state.pop(req_id, None)
-
-    return OmniTokensPrompt(
-        prompt_token_ids=[0],
-        additional_information=additional_info,
+    payload = OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor(delta_tokens, dtype=torch.long)),
+        meta=MetaStruct(
+            finished=torch.tensor(finished, dtype=torch.bool),
+            stream_finished=torch.tensor(finished, dtype=torch.bool),
+            req_id=[request_id],
+        ),
     )
+
+    if finished:
+        state["terminal_sent"] = True
+
+    return payload

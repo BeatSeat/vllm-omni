@@ -74,6 +74,7 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         self.mel_window: np.ndarray | None = None
         self.mel_cache_len = 1
         self.source_cache_len: int = 0
+        self._mel_window_tensor: torch.Tensor | None = None
 
         self._stream_lock = threading.Lock()
         self._stream_state: dict[str, _StreamState] = {}
@@ -200,8 +201,15 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         if not finalize:
             new_mel_overlap = None
             if self.mel_overlap_len > 0:
-                new_mel_overlap = tts_mel[:, :, -self.mel_overlap_len :]
-                tts_mel = tts_mel[:, :, : -self.mel_overlap_len]
+                if tts_mel.shape[-1] > self.mel_overlap_len:
+                    new_mel_overlap = tts_mel[:, :, -self.mel_overlap_len :]
+                    tts_mel = tts_mel[:, :, : -self.mel_overlap_len]
+                else:
+                    with self._stream_lock:
+                        if req_id in self._stream_state:
+                            st = self._stream_state[req_id]
+                            st.mel_overlap = tts_mel
+                    return torch.zeros(1, 0, device=self.device, dtype=self.dtype)
 
             tts_speech, tts_source = self.hift.inference(tts_mel, cache_source=hift_cache_source)
 
@@ -224,14 +232,36 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         if self.mel_window is None or self.mel_overlap_len <= 0:
             return fade_in_mel
 
-        device = fade_in_mel.device
-        fade_in_mel = fade_in_mel.cpu()
-        fade_out_mel = fade_out_mel.cpu()
-        window = torch.from_numpy(self.mel_window).float()
-        half = self.mel_overlap_len
+        overlap = min(self.mel_overlap_len, fade_in_mel.shape[-1], fade_out_mel.shape[-1])
+        if overlap <= 0:
+            return fade_in_mel
 
-        fade_in_mel[..., :half] = fade_in_mel[..., :half] * window[:half] + fade_out_mel[..., -half:] * window[half:]
-        return fade_in_mel.to(device)
+        device = fade_in_mel.device
+        if overlap == self.mel_overlap_len:
+            if (
+                self._mel_window_tensor is None
+                or self._mel_window_tensor.device != device
+                or self._mel_window_tensor.dtype != fade_in_mel.dtype
+            ):
+                self._mel_window_tensor = torch.as_tensor(
+                    self.mel_window,
+                    device=device,
+                    dtype=fade_in_mel.dtype,
+                ).view(1, 1, -1)
+            window = self._mel_window_tensor
+        else:
+            window = torch.hamming_window(
+                2 * overlap,
+                periodic=False,
+                device=device,
+                dtype=fade_in_mel.dtype,
+            ).view(1, 1, -1)
+
+        fade_in_mel[..., :overlap] = (
+            fade_in_mel[..., :overlap] * window[..., :overlap]
+            + fade_out_mel[..., -overlap:] * window[..., overlap:]
+        )
+        return fade_in_mel
 
     # ------------------------------------------------------------------
     # Stubs for LLM_GENERATION execution type
@@ -318,6 +348,7 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
 
         self.mel_overlap_len = int(self.token_overlap_len / 12.5 * _SAMPLE_RATE / _MEL_HOP_SIZE)
         self.mel_window = np.hamming(2 * self.mel_overlap_len)
+        self._mel_window_tensor = None
         self.source_cache_len = int(self.mel_cache_len * _MEL_HOP_SIZE)
 
         logger.info(

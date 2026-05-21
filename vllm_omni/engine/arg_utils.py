@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "GLM4VoiceForConditionalGeneration": "glm4_voice",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
@@ -37,6 +38,9 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.glm4_voice import (
+            GLM4VoiceConfig,
+        )
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -51,6 +55,7 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
+        ("glm4_voice", GLM4VoiceConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

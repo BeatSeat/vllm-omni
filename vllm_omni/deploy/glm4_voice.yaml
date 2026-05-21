@@ -1,0 +1,61 @@
+# GLM-4-Voice-9B two-stage deploy config.
+#
+# Stage 0: ChatGLM4-9B AR model — generates interleaved text + audio tokens.
+# Stage 1: CosyVoice flow decoder + HiFi-T vocoder — tokens → 22050 Hz audio.
+#
+# Verified target: 1× L4 24GB (both stages share GPU 0) with bf16 AR.
+# For INT4 quantization (recommended on L4), set hf_overrides.quantization.
+# For 2-GPU setup, change stage 1 devices to "1".
+
+async_chunk: true
+trust_remote_code: true
+
+connectors:
+  glm4_voice_shm:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.002
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: [25, 50, 100, 150, 200]
+      codec_left_context_frames: 25
+      crossfade_sec: 0.1
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.70
+    dtype: bfloat16
+    enforce_eager: false
+    async_scheduling: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: glm4_voice_shm
+    default_sampling_params:
+      temperature: 0.2
+      top_p: 0.8
+      max_tokens: 4096
+      min_tokens: 1
+      detokenize: false
+    hf_overrides:
+      model_type: glm4_voice
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    max_model_len: 8192
+    max_num_batched_tokens: 2048
+    dtype: float32
+    devices: "0"
+    enable_prefix_caching: false
+    input_connectors:
+      from_stage_0: glm4_voice_shm
+    default_sampling_params:
+      max_tokens: 2048
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true

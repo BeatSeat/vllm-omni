@@ -194,6 +194,12 @@ _OMNI_MODELS = {
         "covo_audio_code2wav",
         "CovoAudioCode2WavForConditionalGeneration",
     ),
+    ## GLM-4-Voice (THUDM/glm-4-voice-9b)
+    "GLM4VoiceForConditionalGeneration": (
+        "glm4_voice",
+        "glm4_voice",
+        "GLM4VoiceForConditionalGeneration",
+    ),
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
         "moss_tts_nano",

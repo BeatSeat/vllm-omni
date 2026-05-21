@@ -15,6 +15,7 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| GLM-4-Voice | `THUDM/glm-4-voice-9b` | — | ✓ (PCM stream) | — | ✓ |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
@@ -139,6 +140,48 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 ### Notes
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## GLM-4-Voice
+
+ChatGLM4-9B AR + CosyVoice flow decoder at 22.05 kHz. Interleaved text+audio generation.
+
+### Launch
+```bash
+bash examples/online_serving/text_to_speech/glm4_voice/run_server.sh
+```
+Equivalent manual command:
+```bash
+python -m vllm_omni.entrypoints.openai.api_server \
+    --model THUDM/glm-4-voice-9b \
+    --stage-config-path vllm_omni/deploy/glm4_voice.yaml \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8000
+```
+
+### Sending requests
+```bash
+python examples/online_serving/text_to_speech/glm4_voice/openai_speech_client.py \
+    --text "今天天气真不错，适合出去散散步。"
+```
+
+Streaming PCM:
+```bash
+python examples/online_serving/text_to_speech/glm4_voice/openai_speech_client.py \
+    --text "Hello world" --stream --output output.pcm
+```
+
+### Gradio demo
+```bash
+python examples/online_serving/text_to_speech/glm4_voice/gradio_demo.py \
+    --server-url http://localhost:8000
+```
+
+### Notes
+- Output: 22.05 kHz mono. Streaming PCM player: `play -t raw -r 22050 -e signed -b 16 -c 1 -`.
+- Deploy config: `vllm_omni/deploy/glm4_voice.yaml`. For L4 (24GB), consider INT4 quantized model.
+- Default sampling: temperature=0.2, top_p=0.8.
 
 ---
 

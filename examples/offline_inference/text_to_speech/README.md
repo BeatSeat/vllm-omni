@@ -16,6 +16,7 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| GLM-4-Voice | `THUDM/glm-4-voice-9b` | 2 (AR + decoder) | — | ✓ | interleaved text+audio | 22.05 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
@@ -126,6 +127,40 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## GLM-4-Voice
+
+2-stage TTS pipeline (ChatGLM4 9B AR + CosyVoice flow decoder) at 22.05 kHz. The AR stage generates interleaved text and audio tokens; the decoder converts audio tokens to waveform via flow matching + HiFi-T vocoder.
+
+### Prerequisites
+```bash
+uv pip install -e .
+# Decoder weights auto-download from THUDM/glm-4-voice-decoder on first run.
+```
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/glm4_voice/end2end.py \
+    --text "今天天气真不错，适合出去散散步。"
+```
+
+### English
+```bash
+python examples/offline_inference/text_to_speech/glm4_voice/end2end.py \
+    --text "The weather is nice today, perfect for a walk."
+```
+
+### Streaming
+Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/glm4_voice.yaml`. The pipeline uses progressive chunk sizes (25, 50, 100, 150, 200 tokens) for smooth audio boundaries.
+
+### Notes
+- Stage 0 (AR): ChatGLM4-9B generates interleaved text + audio tokens. Audio tokens are identified by `token_id >= audio_offset` where `audio_offset` is the `<|audio_0|>` token ID.
+- Stage 1 (Decoder): CosyVoice flow matching + HiFi-T vocoder. Runs in float32 for ODE solver precision.
+- Deploy config: `vllm_omni/deploy/glm4_voice.yaml` (bf16 AR on ~70% VRAM, fp32 decoder on ~15%). For L4 (24GB), consider INT4 quantization (`cydxg/glm-4-voice-9b-int4`).
+- Output: 22.05 kHz mono WAV.
+- Default sampling: temperature=0.2, top_p=0.8.
 
 ---
 

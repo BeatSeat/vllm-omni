@@ -68,6 +68,7 @@ _COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
+_GLM4_VOICE_TTS_MODEL_STAGES = {"glm4_voice_ar"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -78,6 +79,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
+    | _GLM4_VOICE_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
 _TTS_LANGUAGES: set[str] = {
@@ -499,6 +501,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_flash_omni_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
+        if model_stage in _GLM4_VOICE_TTS_MODEL_STAGES:
+            return "glm4_voice"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -1135,6 +1139,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
             return self._validate_moss_tts_request(request)
+        if self._tts_model_type == "glm4_voice":
+            return self._validate_glm4_voice_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -1382,6 +1388,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
         params["prompt_audio_array"] = [[wav_list, sr]]
         return params
+
+    def _validate_glm4_voice_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate GLM-4-Voice request parameters."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
+
+    def _build_glm4_voice_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build prompt for GLM-4-Voice TTS."""
+        from vllm_omni.model_executor.models.glm4_voice.glm4_voice import (
+            build_glm4_voice_prompt,
+        )
+
+        prompt_text = build_glm4_voice_prompt(request.input)
+        return {"prompt": prompt_text}
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Fish Speech request parameters. Returns error message or None."""
@@ -2043,6 +2064,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params = {}
             elif self._tts_model_type == "ming_flash_omni_tts":
                 prompt = self._build_ming_prompt(request)
+                tts_params = {}
+            elif self._tts_model_type == "glm4_voice":
+                prompt = self._build_glm4_voice_prompt(request)
                 tts_params = {}
             elif self._tts_model_type == "moss_tts_nano":
                 tts_params = await self._build_moss_tts_params(request)

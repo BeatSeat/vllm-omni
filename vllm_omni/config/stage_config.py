@@ -1106,6 +1106,18 @@ class StageConfigFactory:
                     if hf_archs.intersection(registered.hf_architectures):
                         return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
 
+        # --- Deploy YAML pipeline field fallback ---
+        # Models whose HF model_type doesn't match the pipeline registry key
+        # (e.g. GLM-4-Voice reports "chatglm" but needs "glm4_voice") can set
+        # ``pipeline: <key>`` in their deploy YAML to force the correct route.
+        if deploy_config_path is not None:
+            try:
+                _deploy = load_deploy_config(deploy_config_path)
+                if _deploy.pipeline and _deploy.pipeline in _PIPELINE_REGISTRY:
+                    return cls._create_from_registry(_deploy.pipeline, cli_overrides, deploy_config_path)
+            except Exception:
+                pass
+
         # --- Legacy path: load from pipeline YAML ---
         pipeline = cls._load_pipeline(model, trust_remote_code=trust_remote_code)
 

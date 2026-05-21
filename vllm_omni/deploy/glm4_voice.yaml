@@ -7,6 +7,7 @@
 # For INT4 quantization (recommended on L4), set hf_overrides.quantization.
 # For 2-GPU setup, change stage 1 devices to "1".
 
+pipeline: glm4_voice
 async_chunk: true
 trust_remote_code: true
 

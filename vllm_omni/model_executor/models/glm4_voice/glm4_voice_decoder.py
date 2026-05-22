@@ -64,11 +64,15 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = torch.float32
+        self.dtype = self._resolve_decoder_dtype(getattr(self.config, "decoder_dtype", "float32"))
 
         self.flow: nn.Module | None = None
         self.hift: nn.Module | None = None
 
+        self.flow_n_timesteps = int(getattr(self.config, "flow_n_timesteps", 10))
+        self.enable_decoder_compile = bool(getattr(self.config, "enable_decoder_compile", False))
+        self.enable_tf32 = bool(getattr(self.config, "enable_tf32", False))
+        self.remove_weight_norm = bool(getattr(self.config, "remove_weight_norm", True))
         self.token_overlap_len = 5
         self.mel_overlap_len: int = 0
         self.mel_window: np.ndarray | None = None
@@ -78,6 +82,25 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
 
         self._stream_lock = threading.Lock()
         self._stream_state: dict[str, _StreamState] = {}
+
+    def _resolve_decoder_dtype(self, dtype_name: Any) -> torch.dtype:
+        if isinstance(dtype_name, torch.dtype):
+            dtype = dtype_name
+        else:
+            normalized = str(dtype_name).lower().replace("torch.", "")
+            dtype = {
+                "float": torch.float32,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+            }.get(normalized, torch.float32)
+        if self.device == "cpu" and dtype in (torch.float16, torch.bfloat16):
+            logger.warning("GLM-4-Voice decoder dtype %s is CUDA-only; falling back to float32 on CPU", dtype)
+            return torch.float32
+        return dtype
 
     # ------------------------------------------------------------------
     # Forward — reads speech tokens from input_ids
@@ -94,17 +117,16 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         if self.flow is None or self.hift is None:
             return torch.zeros(1, 1, device=self.device, dtype=self.dtype)
 
-        speech_tokens = input_ids.squeeze().tolist() if input_ids is not None and input_ids.numel() > 0 else []
-        if isinstance(speech_tokens, int):
-            speech_tokens = [speech_tokens]
-        speech_tokens = [t for t in speech_tokens if 0 <= t < 16384]
+        if input_ids is None or input_ids.numel() == 0:
+            return torch.zeros(1, 1, device=self.device, dtype=self.dtype)
 
-        if not speech_tokens:
+        token = input_ids.reshape(-1).to(device=self.device, dtype=torch.int64)
+        token = token[(token >= 0) & (token < 16384)].unsqueeze(0)
+
+        if token.numel() == 0:
             return torch.zeros(1, 1, device=self.device, dtype=self.dtype)
 
         is_finalize, req_id = self._parse_runtime_info(kwargs)
-
-        token = torch.tensor([speech_tokens], dtype=torch.int64, device=self.device)
 
         prompt_token = torch.zeros(1, 0, dtype=torch.int64, device=self.device)
         prompt_feat = torch.zeros(1, 0, 80, device=self.device, dtype=self.dtype)
@@ -178,6 +200,7 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             prompt_feat=prompt_feat,
             prompt_feat_len=prompt_feat_len,
             embedding=embedding,
+            n_timesteps=self.flow_n_timesteps,
         )
 
         with self._stream_lock:
@@ -196,7 +219,7 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
             tts_mel = torch.cat([hift_cache_mel_snap, tts_mel], dim=2)
             hift_cache_source = hift_cache_source_snap
         else:
-            hift_cache_source = torch.zeros(1, 1, 0, device=self.device)
+            hift_cache_source = torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype)
 
         if not finalize:
             new_mel_overlap = None
@@ -346,16 +369,81 @@ class GLM4VoiceDecoderForGeneration(nn.Module):
         self.flow.to(device=self.device, dtype=self.dtype).eval()
         self.hift.to(device=self.device, dtype=self.dtype).eval()
 
+        if self.enable_tf32 and self.device == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            logger.info(
+                "GLM-4-Voice decoder TF32 enabled process-wide: "
+                "matmul.allow_tf32=%s cudnn.allow_tf32=%s float32_matmul_precision=%s",
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision(),
+            )
+
+        if self.remove_weight_norm:
+            self._remove_weight_norm_all()
+        if self.enable_decoder_compile:
+            self._try_torch_compile()
+
         self.mel_overlap_len = int(self.token_overlap_len / 12.5 * _SAMPLE_RATE / _MEL_HOP_SIZE)
         self.mel_window = np.hamming(2 * self.mel_overlap_len)
         self._mel_window_tensor = None
         self.source_cache_len = int(self.mel_cache_len * _MEL_HOP_SIZE)
 
         logger.info(
-            "GLM-4-Voice decoder ready: mel_overlap=%d, source_cache=%d",
+            "GLM-4-Voice decoder ready: mel_overlap=%d, source_cache=%d, flow_steps=%d, dtype=%s",
             self.mel_overlap_len,
             self.source_cache_len,
+            self.flow_n_timesteps,
+            self.dtype,
         )
+
+    def _remove_weight_norm_all(self) -> None:
+        """Fold weight_norm parametrizations into plain weights (inference-equivalent, fewer ops)."""
+        count = 0
+        for model in [self.flow, self.hift]:
+            if model is None:
+                continue
+            for _name, mod in model.named_modules():
+                if hasattr(mod, "parametrizations") and hasattr(mod.parametrizations, "weight"):
+                    try:
+                        torch.nn.utils.parametrize.remove_parametrizations(mod, "weight")
+                        count += 1
+                    except Exception:
+                        pass
+                elif hasattr(mod, "weight_g") and hasattr(mod, "weight_v"):
+                    try:
+                        torch.nn.utils.remove_weight_norm(mod)
+                        count += 1
+                    except Exception:
+                        pass
+        if count:
+            logger.info("Removed weight_norm from %d modules (inference-equivalent)", count)
+
+    def _try_torch_compile(self) -> None:
+        """Apply torch.compile for kernel fusion (inference-equivalent, fewer kernel launches).
+
+        Compiles specific inference methods rather than entire modules, since the
+        call path uses .inference() not .forward(). Uses mode="default" (triton
+        fusion) instead of "reduce-overhead" (CUDA graphs) because mel sequence
+        lengths vary per chunk.
+        """
+        if not hasattr(torch, "compile"):
+            return
+        try:
+            self.hift.inference = torch.compile(self.hift.inference, mode="default")
+            logger.info("Applied torch.compile to HiFTGenerator.inference")
+        except Exception as e:
+            logger.warning("torch.compile failed for HiFTGenerator: %s", e)
+        try:
+            assert self.flow is not None and self.flow.decoder is not None
+            self.flow.decoder.estimator = torch.compile(
+                self.flow.decoder.estimator, mode="default",
+            )
+            logger.info("Applied torch.compile to flow ConditionalDecoder (estimator)")
+        except Exception as e:
+            logger.warning("torch.compile failed for flow estimator: %s", e)
 
     def _find_decoder_dir(self) -> Path | None:
         candidates = [

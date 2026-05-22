@@ -28,7 +28,7 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.85
     dtype: bfloat16
-    enforce_eager: true
+    enforce_eager: false
     async_scheduling: true
     enable_prefix_caching: false
     max_num_batched_tokens: 512
@@ -44,6 +44,11 @@ stages:
       detokenize: false
     hf_overrides:
       model_type: glm4_voice
+      decoder_dtype: bfloat16
+      flow_n_timesteps: 8
+      remove_weight_norm: true
+      enable_decoder_compile: true
+      enable_tf32: true
 
   - stage_id: 1
     max_num_seqs: 1

@@ -943,37 +943,39 @@ class ConditionalCFM(nn.Module):
     ) -> torch.Tensor:
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
         t = t.unsqueeze(dim=0)
-        sol = []
 
-        # Batched CFG: batch of 2 [conditional, unconditional]
-        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=mu.dtype)
-        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=mu.dtype)
-        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=mu.dtype)
+        seq_len = x.size(2)
+        x_in = torch.zeros([2, 80, seq_len], device=x.device, dtype=mu.dtype)
+        mask_in = torch.zeros([2, 1, seq_len], device=x.device, dtype=mu.dtype)
+        mu_in = torch.zeros([2, 80, seq_len], device=x.device, dtype=mu.dtype)
         t_in = torch.zeros([2], device=x.device, dtype=mu.dtype)
         spks_in = torch.zeros([2, self.spk_emb_dim], device=x.device, dtype=mu.dtype)
-        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=mu.dtype)
+        cond_in = torch.zeros([2, 80, seq_len], device=x.device, dtype=mu.dtype)
+
+        mask_in[:] = mask
+        if spks is not None:
+            spks_in[0] = spks
+        if cond is not None:
+            cond_in[0] = cond
+
+        cfg_scale = 1.0 + self.inference_cfg_rate
+        neg_cfg = self.inference_cfg_rate
 
         for step in range(1, len(t_span)):
             x_in[:] = x
-            mask_in[:] = mask
             mu_in[0] = mu
             t_in[:] = t.unsqueeze(0)
-            if spks is not None:
-                spks_in[0] = spks
-            if cond is not None:
-                cond_in[0] = cond
 
             dphi_dt = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+            dphi_dt, cfg_dphi_dt = dphi_dt[0:1], dphi_dt[1:2]
+            dphi_dt = cfg_scale * dphi_dt - neg_cfg * cfg_dphi_dt
 
             x = x + dt * dphi_dt
             t = t + dt
-            sol.append(x)
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
 
-        return sol[-1].float()
+        return x.float()
 
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1099,7 @@ class MaskedDiffWithXvec(nn.Module):
         prompt_feat_len: torch.Tensor,
         embedding: torch.Tensor,
         finalize: bool = True,
+        n_timesteps: int = 10,
     ) -> torch.Tensor:
         assert token.shape[0] == 1
 
@@ -1126,7 +1129,7 @@ class MaskedDiffWithXvec(nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=n_timesteps,
         )
 
         feat = feat[:, :, mel_len1:]

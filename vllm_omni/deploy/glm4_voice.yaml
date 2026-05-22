@@ -19,7 +19,8 @@ connectors:
       connector_get_sleep_s: 0.002
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 50
+      codec_chunk_frames_list: [25, 50, 100, 150, 200]
+      audio_offset: 151552
       codec_left_context_frames: 25
       crossfade_sec: 0.1
 
@@ -44,11 +45,6 @@ stages:
       detokenize: false
     hf_overrides:
       model_type: glm4_voice
-      decoder_dtype: bfloat16
-      flow_n_timesteps: 8
-      remove_weight_norm: true
-      enable_decoder_compile: true
-      enable_tf32: true
 
   - stage_id: 1
     max_num_seqs: 1
@@ -67,3 +63,8 @@ stages:
     skip_mm_profiling: true
     hf_overrides:
       model_type: glm4_voice
+      decoder_dtype: bfloat16
+      flow_n_timesteps: 8
+      remove_weight_norm: true
+      enable_decoder_compile: true
+      enable_tf32: true

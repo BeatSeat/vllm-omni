@@ -9,9 +9,10 @@ Two functions:
   the interleaved AR stream and emits delta chunks via
   ``OmniPayloadStruct``.
 
-Audio tokens in the AR output are identified by ``token_id >= audio_offset``
-(151552 for THUDM/glm-4-voice-9b).  They are converted to 0-based speech
-tokens (0..16383) before forwarding to the decoder.
+Audio tokens in the AR output are identified by ``token_id >= audio_offset``.
+The offset is resolved from runtime/config metadata when available, with
+151552 kept as the THUDM/glm-4-voice-9b fallback.  Audio tokens are converted
+to 0-based speech tokens (0..16383) before forwarding to the decoder.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _AUDIO_OFFSET = 151552
 _AUDIO_VOCAB_SIZE = 16384
+_OFFICIAL_STREAMING_CHUNK_SIZES = [25, 50, 100, 150, 200]
 
 
 def _ensure_list(x: Any) -> list:
@@ -46,6 +48,81 @@ def _ensure_list(x: Any) -> list:
         return list(x)
     except TypeError:
         return [x]
+
+
+def _connector_extra(transfer_manager: Any) -> dict[str, Any]:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    if isinstance(raw_cfg, dict):
+        extra = raw_cfg.get("extra", raw_cfg)
+        return extra if isinstance(extra, dict) else {}
+    return {}
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return default
+        return int(value.reshape(-1)[0].item())
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return default
+        return _as_int(value[0], default)
+    return int(value)
+
+
+def _resolve_audio_offset(cfg: dict[str, Any], request: Any | None = None) -> int:
+    """Resolve GLM-4-Voice audio token offset, matching the official tokenizer.
+
+    The official demo obtains this via
+    ``tokenizer.convert_tokens_to_ids("<|audio_0|>")``.  The stage processor
+    may run without tokenizer access, so prefer injected config/request
+    metadata and retain the known THUDM fallback.
+    """
+    for key in ("audio_offset", "glm4_voice_audio_offset"):
+        if key in cfg:
+            return _as_int(cfg.get(key), _AUDIO_OFFSET)
+
+    additional = getattr(request, "additional_information", None)
+    if isinstance(additional, dict):
+        for key in ("audio_offset", "glm4_voice_audio_offset"):
+            if key in additional:
+                return _as_int(additional.get(key), _AUDIO_OFFSET)
+
+    return _AUDIO_OFFSET
+
+
+def _parse_chunk_sizes(cfg: dict[str, Any]) -> list[int]:
+    """Return official progressive chunk sizes unless a fixed size is requested."""
+    raw_sizes = (
+        cfg.get("glm4_voice_chunk_sizes")
+        or cfg.get("codec_chunk_frames_list")
+        or cfg.get("streaming_chunk_sizes")
+    )
+    if raw_sizes is not None:
+        if isinstance(raw_sizes, str):
+            sizes = [int(x.strip()) for x in raw_sizes.split(",") if x.strip()]
+        else:
+            sizes = [int(x) for x in _ensure_list(raw_sizes)]
+        if not sizes or any(size <= 0 for size in sizes):
+            raise ValueError(f"Invalid GLM-4-Voice chunk sizes: {raw_sizes!r}")
+        return sizes
+
+    # Backward compatibility for existing configs/tests that set only a fixed
+    # codec_chunk_frames.  New GLM-4-Voice configs should use the official list.
+    if "codec_chunk_frames" in cfg:
+        chunk_size = int(cfg.get("codec_chunk_frames", 25))
+        if chunk_size <= 0:
+            raise ValueError(f"Invalid codec_chunk_frames={chunk_size}")
+        return [chunk_size]
+
+    return list(_OFFICIAL_STREAMING_CHUNK_SIZES)
+
+
+def _current_chunk_size(chunk_sizes: list[int], chunk_index: int) -> int:
+    return chunk_sizes[min(max(chunk_index, 0), len(chunk_sizes) - 1)]
 
 
 def ar_to_decoder(
@@ -115,10 +192,9 @@ def ar_to_decoder_async_chunk(
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
-    connector = getattr(transfer_manager, "connector", None)
-    raw_cfg = getattr(connector, "config", {}) or {}
-    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size = int(cfg.get("codec_chunk_frames", 25))
+    cfg = _connector_extra(transfer_manager)
+    audio_offset = _resolve_audio_offset(cfg, request)
+    chunk_sizes = _parse_chunk_sizes(cfg)
 
     request_state = transfer_manager.request_payload.get(request_id)
     if not isinstance(request_state, dict) or "_glm4_voice_state" not in request_state:
@@ -126,6 +202,7 @@ def ar_to_decoder_async_chunk(
             "_glm4_voice_state": {
                 "seen_len": 0,
                 "emitted_len": 0,
+                "chunk_idx": 0,
                 "terminal_sent": False,
             },
         }
@@ -145,14 +222,15 @@ def ar_to_decoder_async_chunk(
     token_list = transfer_manager.code_prompt_token_ids[request_id]
     for tok in new_tokens:
         tok_int = int(tok)
-        if tok_int >= _AUDIO_OFFSET:
-            speech_tok = tok_int - _AUDIO_OFFSET
+        if tok_int >= audio_offset:
+            speech_tok = tok_int - audio_offset
             if 0 <= speech_tok < _AUDIO_VOCAB_SIZE:
                 token_list.append([speech_tok])
 
     total_audio = len(token_list)
     emitted_len = state["emitted_len"]
     pending = total_audio - emitted_len
+    chunk_size = _current_chunk_size(chunk_sizes, int(state.get("chunk_idx", 0)))
 
     should_emit = pending >= chunk_size or (finished and pending > 0)
 
@@ -171,6 +249,7 @@ def ar_to_decoder_async_chunk(
 
     delta_tokens = [int(frame[0]) for frame in token_list[emitted_len:total_audio]]
     state["emitted_len"] = total_audio
+    state["chunk_idx"] = int(state.get("chunk_idx", 0)) + 1
 
     payload = OmniPayloadStruct(
         codes=CodesStruct(audio=torch.tensor(delta_tokens, dtype=torch.long)),

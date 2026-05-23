@@ -7,6 +7,15 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
 
+    def _get_routed_experts(self, request: Request):
+        """Return captured MoE routing data when present.
+
+        vLLM 0.21 does not expose this helper on its base schedulers, but
+        omni schedulers still pass the optional field through EngineCoreOutput.
+        Non-MoE models, including TTS models, naturally return None here.
+        """
+        return getattr(request, "routed_experts", None)
+
     def _replace_session_with_streaming_update(
         self,
         session: Request,

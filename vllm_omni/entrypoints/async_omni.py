@@ -684,6 +684,22 @@ class AsyncOmni(EngineClient, OmniBase):
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
+    async def notify_kv_transfer_request_rejected(self, request_id: str) -> None:
+        """Notify the engine that a KV-transfer-backed request was rejected.
+
+        vLLM 0.21 adds this hook to ``EngineClient`` for PD/KV-transfer
+        admission control. The omni orchestrator may not expose a concrete
+        handler on all backends yet, so delegate when available and otherwise
+        treat it as a best-effort notification.
+        """
+        handler = getattr(self.engine, "notify_kv_transfer_request_rejected", None)
+        if handler is not None:
+            result = handler(request_id)
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        logger.debug("[AsyncOmni] KV transfer rejection notification ignored for %s", request_id)
+
     async def pause_generation(
         self,
         *,

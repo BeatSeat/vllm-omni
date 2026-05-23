@@ -69,6 +69,7 @@ _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
+_INDEXTTS2_TTS_MODEL_STAGES = {"indextts2_talker"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -80,6 +81,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
+    | _INDEXTTS2_TTS_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
 _TTS_LANGUAGES: set[str] = {
@@ -361,6 +363,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_voxtral_prompt_async = make_async(self._build_voxtral_prompt, executor=self._tts_executor)
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
+        self._estimate_indextts2_prompt_len_async = make_async(
+            self._estimate_indextts2_prompt_len,
+            executor=self._tts_executor,
+        )
 
     async def warmup(self) -> None:
         """Run a synthetic speech request to trigger all first-request warmup.
@@ -507,6 +513,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_flash_omni_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
+        if model_stage in _INDEXTTS2_TTS_MODEL_STAGES:
+            return "indextts2"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -627,6 +635,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
         except Exception as e:
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
+            return 2048
+
+    def _estimate_indextts2_prompt_len(self, text: str) -> int:
+        """Estimate IndexTTS2 talker prefill placeholder length from request text."""
+        try:
+            from vllm_omni.model_executor.models.indextts2.prompt_utils import (
+                estimate_indextts2_prefill_prompt_len,
+            )
+
+            model_name = self.engine_client.model_config.model
+            return estimate_indextts2_prefill_prompt_len(model_name, text)
+        except Exception as e:
+            logger.warning("Failed to estimate IndexTTS2 prompt length, using fallback 2048: %s", e)
             return 2048
 
     def _estimate_fish_ref_code_len(self, ref_audio: object) -> int | None:
@@ -1149,6 +1170,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
             return self._validate_moss_tts_request(request)
+        if self._tts_model_type == "indextts2":
+            return self._validate_indextts2_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -1412,6 +1435,90 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return fmt_err
         return None
 
+    def _validate_indextts2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate IndexTTS2 request. Requires non-empty text and ref_audio for voice cloning."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        has_uploaded_voice = bool(
+            request.voice
+            and request.voice.lower() in self.uploaded_speakers
+            and self._get_uploaded_audio_data(request.voice) is not None
+        )
+        if request.ref_audio is None and not has_uploaded_voice:
+            return (
+                "IndexTTS2 requires 'ref_audio' for voice cloning, or a previously uploaded "
+                "voice name in the 'voice' field."
+            )
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+        if request.extra_params and isinstance(request.extra_params, dict):
+            emo_audio = request.extra_params.get("emo_audio")
+            if isinstance(emo_audio, str):
+                fmt_err = self._validate_ref_audio_format(emo_audio)
+                if fmt_err:
+                    return f"Invalid emo_audio: {fmt_err}"
+            emo_vector = request.extra_params.get("emo_vector")
+            if emo_vector is not None:
+                if not isinstance(emo_vector, list) or len(emo_vector) != 8:
+                    return "IndexTTS2 'emo_vector' must be a list of 8 numeric values"
+                if not all(isinstance(v, (int, float)) for v in emo_vector):
+                    return "IndexTTS2 'emo_vector' must contain only numeric values"
+            emo_alpha = request.extra_params.get("emo_alpha")
+            if emo_alpha is not None:
+                if not isinstance(emo_alpha, (int, float)) or not (0.0 <= emo_alpha <= 1.0):
+                    return "IndexTTS2 'emo_alpha' must be a number between 0.0 and 1.0"
+            emo_text = request.extra_params.get("emo_text")
+            if emo_text is not None and not isinstance(emo_text, str):
+                return "IndexTTS2 'emo_text' must be a string"
+            use_emo_text = request.extra_params.get("use_emo_text")
+            if use_emo_text is not None and not isinstance(use_emo_text, bool):
+                return "IndexTTS2 'use_emo_text' must be a boolean"
+            use_random = request.extra_params.get("use_random")
+            if use_random is not None and not isinstance(use_random, bool):
+                return "IndexTTS2 'use_random' must be a boolean"
+        return None
+
+    async def _build_indextts2_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build additional_information for IndexTTS2.
+
+        Stage 0 preprocess expects: text, voice (ref audio path/data),
+        and optional emotion parameters (emo_audio, emo_vector, emo_alpha).
+        """
+        params: dict[str, Any] = {"text": [request.input]}
+
+        # ref_audio for voice cloning
+        if request.ref_audio is not None:
+            wav_list, sr = await self._resolve_ref_audio(request.ref_audio, validate_duration=False)
+            params["voice"] = [[wav_list, sr]]
+        elif request.voice:
+            voice_lower = request.voice.lower()
+            if voice_lower in self.uploaded_speakers:
+                audio_data = self._get_uploaded_audio_data(request.voice)
+                if audio_data:
+                    wav_list, sr = await self._resolve_ref_audio(audio_data, validate_duration=False)
+                    params["voice"] = [[wav_list, sr]]
+
+        # Emotion via extra_params
+        if request.extra_params and isinstance(request.extra_params, dict):
+            if "emo_audio" in request.extra_params:
+                emo_audio = request.extra_params["emo_audio"]
+                wav_list, sr = await self._resolve_ref_audio(emo_audio, validate_duration=False)
+                params["emo_audio"] = [[wav_list, sr]]
+            if "emo_vector" in request.extra_params:
+                params["emo_vector"] = [request.extra_params["emo_vector"]]
+            if "emo_alpha" in request.extra_params:
+                params["emo_alpha"] = [request.extra_params["emo_alpha"]]
+            if "emo_text" in request.extra_params:
+                params["emo_text"] = [request.extra_params["emo_text"]]
+            if "use_emo_text" in request.extra_params:
+                params["use_emo_text"] = [request.extra_params["use_emo_text"]]
+            if "use_random" in request.extra_params:
+                params["use_random"] = [request.extra_params["use_random"]]
+
+        return params
+
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build additional_information for MOSS-TTS-Nano.
 
@@ -1478,7 +1585,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
+    async def _resolve_ref_audio(
+        self,
+        ref_audio_str: str,
+        *,
+        validate_duration: bool = True,
+    ) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
@@ -1500,12 +1612,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np = np.mean(wav_np, axis=-1)
         sr = int(sr)
         duration = len(wav_np) / sr if sr > 0 else 0.0
-        if duration < _REF_AUDIO_MIN_DURATION:
+        if validate_duration and duration < _REF_AUDIO_MIN_DURATION:
             raise ValueError(
                 f"Reference audio too short ({duration:.1f}s). "
                 f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
             )
-        if duration > _REF_AUDIO_MAX_DURATION:
+        if validate_duration and duration > _REF_AUDIO_MAX_DURATION:
             raise ValueError(
                 f"Reference audio too long ({duration:.1f}s). "
                 f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
@@ -2105,6 +2217,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+            elif self._tts_model_type == "indextts2":
+                tts_params = await self._build_indextts2_params(request)
+                ph_len = await self._estimate_indextts2_prompt_len_async(request.input)
+                prompt = tokens_input(prompt_token_ids=[1] * ph_len)
+                prompt["additional_information"] = tts_params
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2159,6 +2276,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "ming_flash_omni_tts"
         elif self._tts_model_type == "moss_tts_nano":
             model_type = "moss_tts_nano"
+        elif self._tts_model_type == "indextts2":
+            model_type = "indextts2"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -2177,7 +2296,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
 
         # Apply model-specific extra parameters
-        if request.extra_params is not None and sampling_params_list:
+        if request.extra_params is not None and sampling_params_list and self._tts_model_type != "indextts2":
             if not isinstance(request.extra_params, dict):
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,

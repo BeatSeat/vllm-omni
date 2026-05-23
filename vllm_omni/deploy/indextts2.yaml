@@ -1,0 +1,56 @@
+# IndexTTS2 deploy: GPT AR talker → S2Mel + BigVGAN vocoder.
+# Verified on 1x L40 48GB.
+#
+# Fields omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py). Notable choices for this model:
+#   * Stage 0 (talker) gpu_memory_utilization=0.4 — GPT-2 (24L, 1280D) + Wav2Vec2-BERT
+#     conditioning fits comfortably; keep headroom for KV cache.
+#   * Stage 1 (s2mel) enforce_eager=true — S2Mel DiT + BigVGAN vocoder
+#     run a 25-step ODE solver, not suited for CUDA graph.
+#   * async_chunk=false — S2Mel flow matching needs the full code sequence.
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.4
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    # 34(cond) + 602(text) + 1500(mel) ~ 2136, round up
+    max_model_len: 2560
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 30
+      max_tokens: 1500
+      repetition_penalty: 10.0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 8192
+    max_model_len: 32768
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 65536

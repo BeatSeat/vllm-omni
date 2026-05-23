@@ -120,6 +120,7 @@ exclude = [
     "build",
     "dist",
     "vllm_omni.egg-info",
+    "vllm_omni/model_executor/models/indextts2/s2mel/modules/bigvgan",
 ]
 
 [tool.ruff.lint]

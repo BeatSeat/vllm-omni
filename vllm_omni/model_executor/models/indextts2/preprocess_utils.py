@@ -111,7 +111,7 @@ def load_campplus(model_path: str, device: torch.device):
     return _campplus_model
 
 
-def load_qwen_emotion(model_path: str, device: torch.device):
+def load_qwen_emotion(model_path: str, device: torch.device, *, trust_remote_code: bool = True):
     global _qwen_emotion_model, _qwen_emotion_tokenizer
     if _qwen_emotion_model is not None:
         return _qwen_emotion_model, _qwen_emotion_tokenizer
@@ -123,12 +123,15 @@ def load_qwen_emotion(model_path: str, device: torch.device):
             f"QwenEmotion model directory 'qwen0.6bemo4-merge' was not found in {model_path}. "
             "It is required when IndexTTS2 use_emo_text=True."
         )
-    _qwen_emotion_tokenizer = AutoTokenizer.from_pretrained(qwen_emo_path, trust_remote_code=True)
+    _qwen_emotion_tokenizer = AutoTokenizer.from_pretrained(
+        qwen_emo_path,
+        trust_remote_code=trust_remote_code,
+    )
     _qwen_emotion_model = AutoModelForCausalLM.from_pretrained(
         qwen_emo_path,
         torch_dtype="float16",
         device_map="auto",
-        trust_remote_code=True,
+        trust_remote_code=trust_remote_code,
     )
     _qwen_emotion_model.eval()
     for p in _qwen_emotion_model.parameters():

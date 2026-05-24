@@ -35,6 +35,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_indextts2 import IndexTTS2Config
 from .gpt.conformer_encoder import ConformerEncoder
@@ -89,6 +90,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.has_preprocess = True
         self.has_postprocess = True
         self.requires_raw_input_tokens = True
+        self.enable_update_additional_information = True
+        self._speaker_cache = get_speaker_cache()
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "mel"),
             ("hidden_states", "latent"),
@@ -208,6 +211,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     def _extract_mel_offsets(self, positions: torch.Tensor, kwargs: dict[str, Any]) -> torch.Tensor:
         """Build per-token mel_start_offset from model_intermediate_buffer."""
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
         if not info_dicts:
             if self._decode_step <= 3:
                 logger.warning(
@@ -304,6 +309,8 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         info_dicts = kwargs.get("model_intermediate_buffer")
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
 
         mel_codes_list: list[torch.Tensor] = []
         latent_list: list[torch.Tensor] = []
@@ -510,28 +517,59 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         use_random_list = info_dict.get("use_random")
         use_random = bool(use_random_list[0]) if isinstance(use_random_list, list) and use_random_list else False
 
+        # --- Speaker cache lookup ---
+        voice_name_list = info_dict.get("voice_name")
+        _voice_name = voice_name_list[0] if isinstance(voice_name_list, list) and voice_name_list else None
+        _voice_created_at_list = info_dict.get("voice_created_at")
+        _voice_created_at = (
+            int(_voice_created_at_list[0]) if isinstance(_voice_created_at_list, list) and _voice_created_at_list else 0
+        )
+        _speaker_cache_key = None
+        _cached = None
+        if _voice_name:
+            _speaker_cache_key = self._speaker_cache.make_cache_key(_voice_name, "indextts2", _voice_created_at)
+            _cached = self._speaker_cache.get(_speaker_cache_key)
+
         # --- Load audio and extract features ---
         wav_16k, wav_22k = load_reference_audio(voice_path, device)
 
-        w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
-        self._ensure_w2v_stat_loaded(device)
-        spk_cond_emb = wav2vec_extract(wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
+        if _cached is not None:
+            s_ref = _cached["S_ref"].to(device)
+            style = _cached["style"].to(device)
+            ref_mel = _cached["ref_mel"].to(device)
+            spk_cond_emb = _cached["spk_cond_emb"].to(device)
+            logger.info("[PREFILL_PP] speaker cache HIT for %s", _voice_name)
+        else:
+            w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
+            self._ensure_w2v_stat_loaded(device)
+            spk_cond_emb = wav2vec_extract(wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
 
-        semantic_codec = load_semantic_codec(self.model_path, self.config.semantic_codec, device)
-        logger.info("[PREFILL_PP] spk_cond_emb=%s", spk_cond_emb.shape)
-        with torch.no_grad():
-            _, s_ref = semantic_codec.quantize(spk_cond_emb)  # [B, T, 1024] quantized embeddings
-        logger.info("[PREFILL_PP] S_ref=%s after quantize", s_ref.shape)
+            semantic_codec = load_semantic_codec(self.model_path, self.config.semantic_codec, device)
+            logger.info("[PREFILL_PP] spk_cond_emb=%s", spk_cond_emb.shape)
+            with torch.no_grad():
+                _, s_ref = semantic_codec.quantize(spk_cond_emb)  # [B, T, 1024] quantized embeddings
+            logger.info("[PREFILL_PP] S_ref=%s after quantize", s_ref.shape)
 
-        campplus = load_campplus(self.model_path, device)
-        fbank = compute_fbank(wav_16k, device)
-        logger.info("[PREFILL_PP] fbank=%s", fbank.shape)
-        with torch.no_grad():
-            style = campplus(fbank)  # [1, 192]
-        logger.info("[PREFILL_PP] style=%s", style.shape)
+            campplus = load_campplus(self.model_path, device)
+            fbank = compute_fbank(wav_16k, device)
+            logger.info("[PREFILL_PP] fbank=%s", fbank.shape)
+            with torch.no_grad():
+                style = campplus(fbank)  # [1, 192]
+            logger.info("[PREFILL_PP] style=%s", style.shape)
 
-        ref_mel = self._compute_mel_22k(wav_22k, device)  # [1, 80, T_ref]
-        logger.info("[PREFILL_PP] ref_mel=%s", ref_mel.shape)
+            ref_mel = self._compute_mel_22k(wav_22k, device)  # [1, 80, T_ref]
+            logger.info("[PREFILL_PP] ref_mel=%s", ref_mel.shape)
+
+            if _speaker_cache_key is not None:
+                self._speaker_cache.put(
+                    _speaker_cache_key,
+                    {
+                        "S_ref": s_ref.detach().cpu().contiguous(),
+                        "style": style.detach().cpu().contiguous(),
+                        "ref_mel": ref_mel.detach().cpu().contiguous(),
+                        "spk_cond_emb": spk_cond_emb.detach().cpu().contiguous(),
+                    },
+                )
 
         model_dtype = next(self.conditioning_encoder.parameters()).dtype
         spk_cond_emb = spk_cond_emb.to(device=device, dtype=model_dtype)
@@ -768,7 +806,11 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
     def _predict_emotion_from_text(self, text: str, device: torch.device) -> list[float] | None:
         """Use QwenEmotion CausalLM to predict 8-dim emotion vector from text (aligned with official)."""
-        model, tokenizer = load_qwen_emotion(self.model_path, device)
+        model, tokenizer = load_qwen_emotion(
+            self.model_path,
+            device,
+            trust_remote_code=self.vllm_config.model_config.trust_remote_code,
+        )
         if model is None or tokenizer is None:
             return None
 
@@ -1042,8 +1084,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         ]
         if missing_prefixes:
             raise RuntimeError(
-                "IndexTTS2 GPT checkpoint did not load required parameter groups: "
-                + ", ".join(missing_prefixes)
+                "IndexTTS2 GPT checkpoint did not load required parameter groups: " + ", ".join(missing_prefixes)
             )
 
         # Ensure all sub-modules on correct device (some nn.Parameter created

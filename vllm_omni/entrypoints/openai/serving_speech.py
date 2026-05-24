@@ -1591,12 +1591,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     wav_list, sr = await self._resolve_ref_audio(audio_data, validate_duration=False)
                     params["voice"] = [[wav_list, sr]]
 
+        # Speaker cache metadata
+        if request.voice:
+            params["voice_name"] = [request.voice.lower()]
+            params["voice_created_at"] = [self._voice_created_at(request.voice.lower())]
+
         # Emotion via extra_params
         if request.extra_params and isinstance(request.extra_params, dict):
             if "emo_audio" in request.extra_params:
-                wav_list, sr = await self._resolve_ref_audio(
-                    request.extra_params["emo_audio"], validate_duration=False
-                )
+                wav_list, sr = await self._resolve_ref_audio(request.extra_params["emo_audio"], validate_duration=False)
                 params["emo_audio"] = [[wav_list, sr]]
             for key in ("emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random"):
                 if key in request.extra_params:
@@ -1614,9 +1617,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         max_segment_tokens = _INDEXTTS2_DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT
         quick_streaming_tokens = 0
         if request.extra_params and isinstance(request.extra_params, dict):
-            max_segment_tokens = int(
-                request.extra_params.get("max_text_tokens_per_segment", max_segment_tokens)
-            )
+            max_segment_tokens = int(request.extra_params.get("max_text_tokens_per_segment", max_segment_tokens))
             quick_streaming_tokens = int(request.extra_params.get("quick_streaming_tokens", quick_streaming_tokens))
         segments = tokenizer._tok.split_segments(
             text_tokens,
@@ -1638,7 +1639,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     @staticmethod
     def _apply_indextts2_sampling_params(
-        sampling_params_list: list[Any], request: OpenAICreateSpeechRequest,
+        sampling_params_list: list[Any],
+        request: OpenAICreateSpeechRequest,
     ) -> list[Any]:
         """Apply IndexTTS2 upstream generation knobs to stage-0 SamplingParams."""
         if not sampling_params_list:

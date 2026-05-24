@@ -143,18 +143,23 @@ class IndexTTS2S2MelDecoder(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor | OmniOutput:
         """Run S2Mel flow matching + BigVGAN vocoding."""
-        # Extract the first request's additional_information
+        model_intermediate_buffer = kwargs.get("model_intermediate_buffer")
+        if model_intermediate_buffer is None:
+            model_intermediate_buffer = runtime_additional_information
+        if runtime_additional_information is not None and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
+
         additional_information: dict[str, Any] = {}
-        if runtime_additional_information and len(runtime_additional_information) > 0:
-            additional_information = runtime_additional_information[0]
+        if model_intermediate_buffer and len(model_intermediate_buffer) > 0:
+            additional_information = model_intermediate_buffer[0]
 
         device = input_ids.device
         model_dtype = self.s2mel.models["gpt_layer"][0].weight.dtype
 
         # Log raw additional_information shapes
         logger.info(
-            "[S2Mel forward] runtime_additional_information len=%d, keys=%s",
-            len(runtime_additional_information) if runtime_additional_information else 0,
+            "[S2Mel forward] model_intermediate_buffer len=%d, keys=%s",
+            len(model_intermediate_buffer) if model_intermediate_buffer else 0,
             list(additional_information.keys()) if additional_information else [],
         )
         for k, v in additional_information.items():
@@ -481,8 +486,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         ]
         if missing_prefixes:
             raise RuntimeError(
-                "IndexTTS2 S2Mel checkpoint did not load required parameter groups: "
-                + ", ".join(missing_prefixes)
+                "IndexTTS2 S2Mel checkpoint did not load required parameter groups: " + ", ".join(missing_prefixes)
             )
         return loaded_params
 

@@ -3,103 +3,10 @@
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from vllm_omni.model_executor.models.indextts2.s2mel.modules.encodec import SConv1d
 
 from . import commons
-
-LRELU_SLOPE = 0.1
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, channels, eps=1e-5):
-        super().__init__()
-        self.channels = channels
-        self.eps = eps
-
-        self.gamma = nn.Parameter(torch.ones(channels))
-        self.beta = nn.Parameter(torch.zeros(channels))
-
-    def forward(self, x):
-        x = x.transpose(1, -1)
-        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
-        return x.transpose(1, -1)
-
-
-class ConvReluNorm(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, n_layers, p_dropout):
-        super().__init__()
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.n_layers = n_layers
-        self.p_dropout = p_dropout
-        assert n_layers > 1, "Number of layers should be larger than 0."
-
-        self.conv_layers = nn.ModuleList()
-        self.norm_layers = nn.ModuleList()
-        self.conv_layers.append(nn.Conv1d(in_channels, hidden_channels, kernel_size, padding=kernel_size // 2))
-        self.norm_layers.append(LayerNorm(hidden_channels))
-        self.relu_drop = nn.Sequential(nn.ReLU(), nn.Dropout(p_dropout))
-        for _ in range(n_layers - 1):
-            self.conv_layers.append(nn.Conv1d(hidden_channels, hidden_channels, kernel_size, padding=kernel_size // 2))
-            self.norm_layers.append(LayerNorm(hidden_channels))
-        self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
-        self.proj.weight.data.zero_()
-        self.proj.bias.data.zero_()
-
-    def forward(self, x, x_mask):
-        x_org = x
-        for i in range(self.n_layers):
-            x = self.conv_layers[i](x * x_mask)
-            x = self.norm_layers[i](x)
-            x = self.relu_drop(x)
-        x = x_org + self.proj(x)
-        return x * x_mask
-
-
-class DDSConv(nn.Module):
-    """
-    Dialted and Depth-Separable Convolution
-    """
-
-    def __init__(self, channels, kernel_size, n_layers, p_dropout=0.0):
-        super().__init__()
-        self.channels = channels
-        self.kernel_size = kernel_size
-        self.n_layers = n_layers
-        self.p_dropout = p_dropout
-
-        self.drop = nn.Dropout(p_dropout)
-        self.convs_sep = nn.ModuleList()
-        self.convs_1x1 = nn.ModuleList()
-        self.norms_1 = nn.ModuleList()
-        self.norms_2 = nn.ModuleList()
-        for i in range(n_layers):
-            dilation = kernel_size**i
-            padding = (kernel_size * dilation - dilation) // 2
-            self.convs_sep.append(
-                nn.Conv1d(channels, channels, kernel_size, groups=channels, dilation=dilation, padding=padding)
-            )
-            self.convs_1x1.append(nn.Conv1d(channels, channels, 1))
-            self.norms_1.append(LayerNorm(channels))
-            self.norms_2.append(LayerNorm(channels))
-
-    def forward(self, x, x_mask, g=None):
-        if g is not None:
-            x = x + g
-        for i in range(self.n_layers):
-            y = self.convs_sep[i](x * x_mask)
-            y = self.norms_1[i](y)
-            y = F.gelu(y)
-            y = self.convs_1x1[i](y)
-            y = self.norms_2[i](y)
-            y = F.gelu(y)
-            y = self.drop(y)
-            x = x + y
-        return x * x_mask
 
 
 class WN(torch.nn.Module):

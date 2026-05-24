@@ -197,7 +197,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.speed_emb.weight.data.normal_(mean=0.0, std=0.0)
 
         self._decode_step = 0
-        self._decode_t0: float = 0.0
 
     # ------------------------------------------------------------------
     # vLLM required hooks
@@ -614,7 +613,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             int(text_emb.shape[1]),
         )
         self._decode_step = 0
-        self._decode_t0 = time.perf_counter()
 
         return input_ids_out, inputs_embeds, info_update
 
@@ -752,16 +750,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         }
     )
 
-    _CN_KEY_TO_EN = {
-        "高兴": "happy",
-        "愤怒": "angry",
-        "悲伤": "sad",
-        "恐惧": "afraid",
-        "反感": "disgusted",
-        "低落": "melancholic",
-        "惊讶": "surprised",
-        "自然": "calm",
-    }
     _DESIRED_ORDER = ["高兴", "愤怒", "悲伤", "恐惧", "反感", "低落", "惊讶", "自然"]
 
     _EMO_BIAS = [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625]

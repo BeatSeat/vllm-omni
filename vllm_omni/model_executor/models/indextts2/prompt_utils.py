@@ -4,11 +4,9 @@
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
-from transformers.utils.hub import cached_file
-
+from vllm_omni.model_executor.models.indextts2.preprocess_utils import resolve_model_file
 from vllm_omni.model_executor.models.indextts2.tokenizer import IndexTTS2Tokenizer
 
 _CONDITIONING_PREFIX_TOKENS = 34
@@ -17,14 +15,10 @@ _START_MEL_TOKENS = 1
 
 
 def _resolve_bpe_model_path(model_id_or_path: str) -> str:
-    local_path = os.path.join(model_id_or_path, "bpe.model")
-    if os.path.isfile(local_path):
-        return local_path
-
-    bpe_path = cached_file(model_id_or_path, "bpe.model")
-    if bpe_path is None:
+    path = resolve_model_file(model_id_or_path, "bpe.model")
+    if path is None:
         raise FileNotFoundError(f"Could not resolve bpe.model for {model_id_or_path!r}")
-    return bpe_path
+    return path
 
 
 @lru_cache(maxsize=16)

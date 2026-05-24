@@ -162,7 +162,7 @@ def talker2s2mel(
                 prompt_token_ids=[0],  # dummy token for vLLM scheduler
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
-                additional_information=additional_information if additional_information else None,
+                additional_information=additional_information,
             )
         )
 

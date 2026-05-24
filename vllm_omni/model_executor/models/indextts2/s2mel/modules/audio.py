@@ -3,40 +3,14 @@
 
 import numpy as np
 import torch
-from scipy.io.wavfile import read
-
-MAX_WAV_VALUE = 32768.0
-
-
-def load_wav(full_path):
-    sampling_rate, data = read(full_path)
-    return data, sampling_rate
-
-
-def dynamic_range_compression(x, compression=1, clip_val=1e-5):
-    return np.log(np.clip(x, a_min=clip_val, a_max=None) * compression)
-
-
-def dynamic_range_decompression(x, compression=1):
-    return np.exp(x) / compression
 
 
 def dynamic_range_compression_torch(x, compression=1, clip_val=1e-5):
     return torch.log(torch.clamp(x, min=clip_val) * compression)
 
 
-def dynamic_range_decompression_torch(x, compression=1):
-    return torch.exp(x) / compression
-
-
 def spectral_normalize_torch(magnitudes):
-    output = dynamic_range_compression_torch(magnitudes)
-    return output
-
-
-def spectral_de_normalize_torch(magnitudes):
-    output = dynamic_range_decompression_torch(magnitudes)
-    return output
+    return dynamic_range_compression_torch(magnitudes)
 
 
 def _mel_filterbank(sr: int, n_fft: int, n_mels: int, fmin: float, fmax: float | None) -> np.ndarray:
@@ -58,7 +32,6 @@ def _mel_filterbank(sr: int, n_fft: int, n_mels: int, fmin: float, fmax: float |
                 weights[i, j] = (f - lower) / (center_f - lower)
             elif center_f < f <= upper and upper != center_f:
                 weights[i, j] = (upper - f) / (upper - center_f)
-    # Slaney-style normalization
     enorm = 2.0 / (freqs[2 : n_mels + 2] - freqs[:n_mels])
     weights *= enorm[:, np.newaxis]
     return weights

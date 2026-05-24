@@ -5,36 +5,17 @@
 # https://github.com/lucidrains/naturalspeech2-pytorch/blob/659bec7f/
 #   naturalspeech2_pytorch/naturalspeech2_pytorch.py#L532
 
-from collections import namedtuple
-from functools import wraps
-
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from packaging import version
 from torch import einsum, nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def exists(val):
     return val is not None
 
-
-def once(fn):
-    called = False
-
-    @wraps(fn)
-    def inner(x):
-        nonlocal called
-        if called:
-            return
-        called = True
-        return fn(x)
-
-    return inner
-
-
-print_once = once(print)
 
 
 # main class
@@ -48,26 +29,19 @@ class Attend(nn.Module):
         self.register_buffer("mask", None, persistent=False)
 
         self.use_flash = use_flash
-        assert not (use_flash and version.parse(torch.__version__) < version.parse("2.0.0")), (
-            "in order to use flash attention, you must be using pytorch 2.0 or above"
-        )
 
-        # determine efficient attention configs for cuda and cpu
-        self.config = namedtuple("EfficientAttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"])
-        self.cpu_config = self.config(True, True, True)
-        self.cuda_config = None
+        all_backends = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        self.cpu_backends = all_backends
+        self.cuda_backends = None
 
         if not torch.cuda.is_available() or not use_flash:
             return
 
         device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
-
         if device_properties.major == 8 and device_properties.minor == 0:
-            print_once("A100 GPU detected, using flash attention if input tensor is on cuda")
-            self.cuda_config = self.config(True, False, False)
+            self.cuda_backends = [SDPBackend.FLASH_ATTENTION]
         else:
-            print_once("Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda")
-            self.cuda_config = self.config(False, True, True)
+            self.cuda_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
     def get_mask(self, n, device):
         if exists(self.mask) and self.mask.shape[-1] >= n:
@@ -96,13 +70,9 @@ class Attend(nn.Module):
             mask = rearrange(mask, "b j -> b 1 1 j")
             mask = mask.expand(-1, heads, q_len, -1)
 
-        # Check if there is a compatible device for flash attention
+        backends = self.cuda_backends if is_cuda else self.cpu_backends
 
-        config = self.cuda_config if is_cuda else self.cpu_config
-
-        # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
-
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
+        with sdpa_kernel(backends):
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0, is_causal=self.causal
             )

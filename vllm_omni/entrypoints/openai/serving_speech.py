@@ -1594,19 +1594,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Emotion via extra_params
         if request.extra_params and isinstance(request.extra_params, dict):
             if "emo_audio" in request.extra_params:
-                emo_audio = request.extra_params["emo_audio"]
-                wav_list, sr = await self._resolve_ref_audio(emo_audio, validate_duration=False)
+                wav_list, sr = await self._resolve_ref_audio(
+                    request.extra_params["emo_audio"], validate_duration=False
+                )
                 params["emo_audio"] = [[wav_list, sr]]
-            if "emo_vector" in request.extra_params:
-                params["emo_vector"] = [request.extra_params["emo_vector"]]
-            if "emo_alpha" in request.extra_params:
-                params["emo_alpha"] = [request.extra_params["emo_alpha"]]
-            if "emo_text" in request.extra_params:
-                params["emo_text"] = [request.extra_params["emo_text"]]
-            if "use_emo_text" in request.extra_params:
-                params["use_emo_text"] = [request.extra_params["use_emo_text"]]
-            if "use_random" in request.extra_params:
-                params["use_random"] = [request.extra_params["use_random"]]
+            for key in ("emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random"):
+                if key in request.extra_params:
+                    params[key] = [request.extra_params[key]]
 
         return params
 
@@ -1643,7 +1637,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
     @staticmethod
-    def _apply_indextts2_sampling_params(sampling_params_list: list[Any], request: OpenAICreateSpeechRequest) -> list[Any]:
+    def _apply_indextts2_sampling_params(
+        sampling_params_list: list[Any], request: OpenAICreateSpeechRequest,
+    ) -> list[Any]:
         """Apply IndexTTS2 upstream generation knobs to stage-0 SamplingParams."""
         if not sampling_params_list:
             return sampling_params_list
@@ -2910,8 +2906,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return item_val if item_val is not None else getattr(batch, field, None)
 
         extra_params: dict[str, Any] | None = None
-        batch_extra = batch.extra_params
-        item_extra = item.extra_params
+        batch_extra = getattr(batch, "extra_params", None)
+        item_extra = getattr(item, "extra_params", None)
         if batch_extra is not None or item_extra is not None:
             extra_params = {}
             if batch_extra:

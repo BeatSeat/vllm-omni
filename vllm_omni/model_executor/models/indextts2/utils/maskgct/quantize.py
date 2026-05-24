@@ -93,23 +93,6 @@ class FactorizedVectorQuantize(nn.Module):
             emb = self.out_project(emb)
         return emb
 
-    def latent2dist(self, latents):
-        encodings = rearrange(latents, "b d t -> (b t) d")
-        codebook = self.codebook.weight
-
-        if self.use_l2_normalize:
-            encodings = F.normalize(encodings)
-            codebook = F.normalize(codebook)
-
-        dist = (
-            encodings.pow(2).sum(1, keepdim=True)
-            - 2 * encodings @ codebook.t()
-            + codebook.pow(2).sum(1, keepdim=True).t()
-        )
-        indices = rearrange((-dist).max(1)[1], "(b t) -> b t", b=latents.size(0))
-        dist = rearrange(dist, "(b t) k -> b t k", b=latents.size(0))
-        z_q = self.decode_code(indices)
-        return -dist, indices, z_q
 
 
 class ResidualVQ(nn.Module):
@@ -217,27 +200,3 @@ class ResidualVQ(nn.Module):
             quantized_out += quantizer.vq2emb(vq[idx])
         return quantized_out
 
-    def latent2dist(self, z, n_quantizers=None):
-        quantized_out = 0.0
-        residual = z
-
-        all_dists = []
-        all_indices = []
-
-        if n_quantizers is None:
-            n_quantizers = self.num_quantizers
-
-        for i, quantizer in enumerate(self.quantizers):
-            if not self.training and i >= n_quantizers:
-                break
-            dist_i, indices_i, z_q_i = quantizer.latent2dist(residual)
-            all_dists.append(dist_i)
-            all_indices.append(indices_i)
-
-            quantized_out = quantized_out + z_q_i
-            residual = residual - z_q_i
-
-        all_dists = torch.stack(all_dists)
-        all_indices = torch.stack(all_indices)
-
-        return all_dists, all_indices

@@ -14,16 +14,6 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-def init_weights(m, mean=0.0, std=0.01):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        m.weight.data.normal_(mean, std)
-
-
-def get_padding(kernel_size, dilation=1):
-    return int((kernel_size * dilation - dilation) / 2)
-
-
 def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
     n_channels_int = n_channels[0]
     in_act = input_a + input_b
@@ -87,125 +77,10 @@ class MyModel(nn.Module):
         x = self.models["cfm"](x, target_lengths, prompt_len, cond, y)
         return x
 
-    def forward2(self, s_ori, target_lengths, f0_ori):
-        x = self.models["length_regulator"](s_ori, ylens=target_lengths, f0=f0_ori)
-        return x
-
-    def forward_emovec(self, x):
-        x = self.models["emo_layer"](x)
-        return x
-
-    def forward_emo_encoder(self, x):
-        x = self.models["emo_encoder"](x)
-        return x
-
     def forward_gpt(self, x):
         x = self.models["gpt_layer"](x)
         return x
 
     def enable_torch_compile(self):
-        """Enable torch.compile optimization."""
         if "cfm" in self.models:
             self.models["cfm"].enable_torch_compile()
-
-
-def load_checkpoint(
-    model,
-    optimizer,
-    path,
-    load_only_params=True,
-    ignore_modules=[],
-    is_distributed=False,
-    load_ema=False,
-):
-    state = torch.load(path, map_location="cpu")
-    params = state["net"]
-    if load_ema and "ema" in state:
-        logger.info("Loading EMA")
-        for key in model:
-            i = 0
-            for param_name in params[key]:
-                if "input_pos" in param_name:
-                    continue
-                assert params[key][param_name].shape == state["ema"][key][0][i].shape
-                params[key][param_name] = state["ema"][key][0][i].clone()
-                i += 1
-    for key in model:
-        if key in params and key not in ignore_modules:
-            if not is_distributed:
-                for k in list(params[key].keys()):
-                    if k.startswith("module."):
-                        params[key][k[len("module.") :]] = params[key][k]
-                        del params[key][k]
-            model_state_dict = model[key].state_dict()
-            filtered_state_dict = {
-                k: v for k, v in params[key].items() if k in model_state_dict and v.shape == model_state_dict[k].shape
-            }
-            skipped_keys = set(params[key].keys()) - set(filtered_state_dict.keys())
-            if skipped_keys:
-                logger.warning("Skipped loading some keys due to shape mismatch: %s", skipped_keys)
-            logger.debug("%s loaded", key)
-            model[key].load_state_dict(filtered_state_dict, strict=False)
-    _ = [model[key].eval() for key in model]
-
-    if not load_only_params:
-        epoch = state["epoch"] + 1
-        iters = state["iters"]
-        optimizer.load_state_dict(state["optimizer"])
-        optimizer.load_scheduler_state_dict(state["scheduler"])
-    else:
-        epoch = 0
-        iters = 0
-
-    return model, optimizer, epoch, iters
-
-
-def load_checkpoint2(
-    model,
-    optimizer,
-    path,
-    load_only_params=True,
-    ignore_modules=[],
-    is_distributed=False,
-    load_ema=False,
-):
-    state = torch.load(path, map_location="cpu")
-    params = state["net"]
-    if load_ema and "ema" in state:
-        logger.info("Loading EMA")
-        for key in model.models:
-            i = 0
-            for param_name in params[key]:
-                if "input_pos" in param_name:
-                    continue
-                assert params[key][param_name].shape == state["ema"][key][0][i].shape
-                params[key][param_name] = state["ema"][key][0][i].clone()
-                i += 1
-    for key in model.models:
-        if key in params and key not in ignore_modules:
-            if not is_distributed:
-                for k in list(params[key].keys()):
-                    if k.startswith("module."):
-                        params[key][k[len("module.") :]] = params[key][k]
-                        del params[key][k]
-            model_state_dict = model.models[key].state_dict()
-            filtered_state_dict = {
-                k: v for k, v in params[key].items() if k in model_state_dict and v.shape == model_state_dict[k].shape
-            }
-            skipped_keys = set(params[key].keys()) - set(filtered_state_dict.keys())
-            if skipped_keys:
-                logger.warning("Skipped loading some keys due to shape mismatch: %s", skipped_keys)
-            logger.debug("%s loaded", key)
-            model.models[key].load_state_dict(filtered_state_dict, strict=False)
-    model.eval()
-
-    if not load_only_params:
-        epoch = state["epoch"] + 1
-        iters = state["iters"]
-        optimizer.load_state_dict(state["optimizer"])
-        optimizer.load_scheduler_state_dict(state["scheduler"])
-    else:
-        epoch = 0
-        iters = 0
-
-    return model, optimizer, epoch, iters

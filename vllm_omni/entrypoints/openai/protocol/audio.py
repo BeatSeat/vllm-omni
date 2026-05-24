@@ -207,10 +207,6 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
-    extra_params: dict[str, Any] | None = Field(
-        default=None,
-        description="Optional model-specific parameters for this batch item.",
-    )
 
 
 class BatchSpeechRequest(BaseModel):
@@ -230,10 +226,6 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
-    extra_params: dict[str, Any] | None = Field(
-        default=None,
-        description="Shared model-specific parameters; item-level values override these.",
-    )
 
 
 class SpeechBatchItemResult(BaseModel):
@@ -256,7 +248,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None

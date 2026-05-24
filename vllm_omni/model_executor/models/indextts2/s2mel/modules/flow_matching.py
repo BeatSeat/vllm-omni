@@ -4,7 +4,6 @@
 from abc import ABC
 
 import torch
-from tqdm import tqdm
 
 from vllm_omni.model_executor.models.indextts2.s2mel.modules.diffusion_transformer import DiT
 
@@ -20,8 +19,6 @@ class BASECFM(torch.nn.Module, ABC):
         self.estimator = None
 
         self.in_channels = args.DiT.in_channels
-
-        self.criterion = torch.nn.MSELoss() if args.reg_loss_type == "l2" else torch.nn.L1Loss()
 
         if hasattr(args.DiT, "zero_prompt_speech_token"):
             self.zero_prompt_speech_token = args.DiT.zero_prompt_speech_token
@@ -83,7 +80,7 @@ class BASECFM(torch.nn.Module, ABC):
         x[..., :prompt_len] = 0
         if self.zero_prompt_speech_token:
             mu[..., :prompt_len] = 0
-        for step in tqdm(range(1, len(t_span))):
+        for step in range(1, len(t_span)):
             dt = t_span[step] - t_span[step - 1]
             if inference_cfg_rate > 0:
                 # Stack original and CFG (null) inputs for batched processing
@@ -119,53 +116,6 @@ class BASECFM(torch.nn.Module, ABC):
             x[:, :, :prompt_len] = 0
 
         return sol[-1]
-
-    def forward(self, x1, x_lens, prompt_lens, mu, style):
-        """Computes diffusion loss
-
-        Args:
-            mu (torch.Tensor): semantic info of reference audio and altered audio
-                shape: (batch_size, mel_timesteps(795+1069), 512)
-            x1: mel
-            x_lens (torch.Tensor): mel frames output
-                shape: (batch_size, mel_timesteps)
-            prompt (torch.Tensor): reference mel
-                shape: (batch_size, 80, 795)
-            style (torch.Tensor): reference global style
-                shape: (batch_size, 192)
-
-        Returns:
-            loss: conditional flow matching loss
-            y: conditional flow
-                shape: (batch_size, n_feats, mel_timesteps)
-        """
-        b, _, t = x1.shape
-
-        # random timestep
-        t = torch.rand([b, 1, 1], device=mu.device, dtype=x1.dtype)
-        # sample noise p(x_0)
-        z = torch.randn_like(x1)
-
-        y = (1 - (1 - self.sigma_min) * t) * z + t * x1
-        u = x1 - (1 - self.sigma_min) * z
-
-        prompt = torch.zeros_like(x1)
-        for bib in range(b):
-            prompt[bib, :, : prompt_lens[bib]] = x1[bib, :, : prompt_lens[bib]]
-            # range covered by prompt are set to 0
-            y[bib, :, : prompt_lens[bib]] = 0
-            if self.zero_prompt_speech_token:
-                mu[bib, :, : prompt_lens[bib]] = 0
-
-        estimator_out = self.estimator(y, prompt, x_lens, t.squeeze(1).squeeze(1), style, mu, prompt_lens)
-        loss = 0
-        for bib in range(b):
-            loss += self.criterion(
-                estimator_out[bib, :, prompt_lens[bib] : x_lens[bib]], u[bib, :, prompt_lens[bib] : x_lens[bib]]
-            )
-        loss /= b
-
-        return loss, estimator_out + (1 - self.sigma_min) * z
 
 
 class CFM(BASECFM):

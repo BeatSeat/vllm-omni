@@ -64,29 +64,6 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class StyleEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-
-    def __init__(self, input_size, hidden_size, dropout_prob):
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(int(use_cfg_embedding), hidden_size)
-        self.style_in = weight_norm(nn.Linear(input_size, hidden_size, bias=True))
-        self.input_size = input_size
-        self.dropout_prob = dropout_prob
-
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        else:
-            labels = self.style_in(labels)
-        embeddings = labels
-        return embeddings
-
-
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.

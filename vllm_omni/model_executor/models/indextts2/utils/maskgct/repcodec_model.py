@@ -6,7 +6,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -21,13 +20,6 @@ def init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.trunc_normal_(m.weight, std=0.02)
         nn.init.constant_(m.bias, 0)
-
-
-def compute_codebook_perplexity(indices, codebook_size):
-    indices = indices.flatten()
-    prob = torch.bincount(indices, minlength=codebook_size).float() / indices.size(0)
-    perp = torch.exp(-torch.sum(prob * torch.log(prob + 1e-10)))
-    return perp
 
 
 class RepCodec(nn.Module):
@@ -49,9 +41,13 @@ class RepCodec(nn.Module):
         hidden_size = cfg.hidden_size if cfg is not None and hasattr(cfg, "hidden_size") else hidden_size
         vocos_dim = cfg.vocos_dim if cfg is not None and hasattr(cfg, "vocos_dim") else vocos_dim
         vocos_intermediate_dim = (
-            cfg.vocos_intermediate_dim if cfg is not None and hasattr(cfg, "vocos_dim") else vocos_intermediate_dim
+            cfg.vocos_intermediate_dim
+            if cfg is not None and hasattr(cfg, "vocos_intermediate_dim")
+            else vocos_intermediate_dim
         )
-        vocos_num_layers = cfg.vocos_num_layers if cfg is not None and hasattr(cfg, "vocos_dim") else vocos_num_layers
+        vocos_num_layers = (
+            cfg.vocos_num_layers if cfg is not None and hasattr(cfg, "vocos_num_layers") else vocos_num_layers
+        )
         num_quantizers = cfg.num_quantizers if cfg is not None and hasattr(cfg, "num_quantizers") else num_quantizers
         downsample_scale = (
             cfg.downsample_scale if cfg is not None and hasattr(cfg, "downsample_scale") else downsample_scale
@@ -104,40 +100,6 @@ class RepCodec(nn.Module):
         )
 
         self.reset_parameters()
-
-    def forward(self, x):
-        # downsample
-        if self.downsample_scale is not None and self.downsample_scale > 1:
-            x = x.transpose(1, 2)
-            x = self.down(x)
-            x = F.gelu(x)
-            x = x.transpose(1, 2)
-
-        # encoder
-        x = self.encoder(x.transpose(1, 2)).transpose(1, 2)
-
-        # vq
-        (
-            quantized_out,
-            all_indices,
-            all_commit_losses,
-            all_codebook_losses,
-            _,
-        ) = self.quantizer(x)
-
-        # decoder
-        x = self.decoder(quantized_out)
-
-        # up
-        if self.downsample_scale is not None and self.downsample_scale > 1:
-            x = x.transpose(1, 2)
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
-            x_rec = self.up(x).transpose(1, 2)
-
-        codebook_loss = (all_codebook_losses + all_commit_losses).mean()
-        all_indices = all_indices
-
-        return x_rec, codebook_loss, all_indices
 
     def quantize(self, x):
         if self.downsample_scale is not None and self.downsample_scale > 1:

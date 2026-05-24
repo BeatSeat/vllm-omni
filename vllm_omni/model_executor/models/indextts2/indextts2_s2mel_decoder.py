@@ -7,6 +7,7 @@ to synthesize mel spectrogram, then BigVGAN to produce waveform audio.
 """
 
 from __future__ import annotations
+
 from collections.abc import Iterable
 from typing import Any
 
@@ -71,27 +72,9 @@ def _load_semantic_codec_for_vq2emb(model_path: str, config: dict, device: torch
     global _semantic_codec_decoder
     if _semantic_codec_decoder is not None:
         return _semantic_codec_decoder
-    from .utils.maskgct.repcodec_model import RepCodec
+    from .preprocess_utils import load_semantic_codec
 
-    codec = RepCodec(
-        codebook_size=config.get("codebook_size", 8192),
-        hidden_size=config.get("hidden_size", 1024),
-        codebook_dim=config.get("codebook_dim", 8),
-    )
-    ckpt_path = resolve_model_file(model_path, "semantic_codec.pth")
-    if ckpt_path is not None:
-        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        codec.load_state_dict(state, strict=False)
-    else:
-        import safetensors.torch
-        from huggingface_hub import hf_hub_download
-
-        ckpt_path = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
-        safetensors.torch.load_model(codec, ckpt_path)
-    codec = codec.to(device=device, dtype=torch.float32).eval()
-    for p in codec.parameters():
-        p.requires_grad_(False)
-    _semantic_codec_decoder = codec
+    _semantic_codec_decoder = load_semantic_codec(model_path, config, device)
     return _semantic_codec_decoder
 
 
@@ -164,10 +147,6 @@ class IndexTTS2S2MelDecoder(nn.Module):
         additional_information: dict[str, Any] = {}
         if runtime_additional_information and len(runtime_additional_information) > 0:
             additional_information = runtime_additional_information[0]
-        elif kwargs.get("runtime_additional_information"):
-            info_list = kwargs["runtime_additional_information"]
-            if info_list and len(info_list) > 0:
-                additional_information = info_list[0]
 
         device = input_ids.device
         model_dtype = self.s2mel.models["gpt_layer"][0].weight.dtype

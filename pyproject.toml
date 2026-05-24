@@ -120,7 +120,6 @@ exclude = [
     "build",
     "dist",
     "vllm_omni.egg-info",
-    "vllm_omni/model_executor/models/indextts2/s2mel/modules/bigvgan",
 ]
 
 [tool.ruff.lint]
@@ -145,6 +144,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+"vllm_omni/model_executor/models/indextts2/s2mel/modules/bigvgan/**" = [
+    "E501", "E741", "F403", "UP",  # upstream NVIDIA BigVGAN code
+]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"

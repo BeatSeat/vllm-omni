@@ -17,5 +17,3 @@ aenum==3.1.16
 pyzmq>=25.0.0
 janus>=1.0.0
 pydub
-wetext>=0.0.9; sys_platform != "linux"
-WeTextProcessing; sys_platform == "linux"

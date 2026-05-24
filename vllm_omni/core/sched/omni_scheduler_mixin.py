@@ -16,6 +16,12 @@ class OmniSchedulerMixin:
         """
         return getattr(request, "routed_experts", None)
 
+    def _free_input_coordinator_request(self, request_id: str) -> None:
+        """Prune full-payload coordinator state for a completed request."""
+        input_coordinator = getattr(self, "input_coordinator", None)
+        if input_coordinator is not None:
+            input_coordinator.free_finished_request(request_id)
+
     def _replace_session_with_streaming_update(
         self,
         session: Request,

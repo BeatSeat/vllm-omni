@@ -94,7 +94,6 @@ class FactorizedVectorQuantize(nn.Module):
         return emb
 
 
-
 class ResidualVQ(nn.Module):
     """Residual Vector Quantization (SoundStream).
 
@@ -199,4 +198,3 @@ class ResidualVQ(nn.Module):
                 break
             quantized_out += quantizer.vq2emb(vq[idx])
         return quantized_out
-

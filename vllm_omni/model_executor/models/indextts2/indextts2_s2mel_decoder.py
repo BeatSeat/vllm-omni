@@ -51,7 +51,7 @@ def _load_bigvgan(vocoder_name: str, device: torch.device):
         return _bigvgan_models[cache_key]
 
     try:
-        from .s2mel.modules.bigvgan import bigvgan as bigvgan_mod
+        from .s2mel.modules import bigvgan as bigvgan_mod
 
         _patch_bigvgan_compat(bigvgan_mod.BigVGAN)
         bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name)

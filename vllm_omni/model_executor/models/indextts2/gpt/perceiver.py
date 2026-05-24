@@ -17,7 +17,6 @@ def exists(val):
     return val is not None
 
 
-
 # main class
 class Attend(nn.Module):
     def __init__(self, dropout=0.0, causal=False, use_flash=False):

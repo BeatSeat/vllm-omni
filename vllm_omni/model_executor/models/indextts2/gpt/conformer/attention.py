@@ -208,28 +208,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         torch.nn.init.xavier_uniform_(self.pos_bias_u)
         torch.nn.init.xavier_uniform_(self.pos_bias_v)
 
-    def rel_shift(self, x, zero_triu: bool = False):
-        """Compute relative positinal encoding.
-        Args:
-            x (torch.Tensor): Input tensor (batch, time, size).
-            zero_triu (bool): If true, return the lower triangular part of
-                the matrix.
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-
-        zero_pad = torch.zeros((x.size()[0], x.size()[1], x.size()[2], 1), device=x.device, dtype=x.dtype)
-        x_padded = torch.cat([zero_pad, x], dim=-1)
-
-        x_padded = x_padded.view(x.size()[0], x.size()[1], x.size(3) + 1, x.size(2))
-        x = x_padded[:, :, 1:].view_as(x)
-
-        if zero_triu:
-            ones = torch.ones((x.size(2), x.size(3)))
-            x = x * torch.tril(ones, x.size(3) - x.size(2))[None, None, :, :]
-
-        return x
-
     def forward(
         self,
         query: torch.Tensor,
@@ -302,9 +280,6 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         # compute matrix b and matrix d
         # (batch, head, time1, time2)
         matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
-        # Remove rel_shift since it is useless in speech recognition,
-        # and it requires special attention for streaming.
-        # matrix_bd = self.rel_shift(matrix_bd)
 
         scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)  # (batch, head, time1, time2)
 

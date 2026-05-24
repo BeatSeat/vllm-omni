@@ -99,11 +99,6 @@ class TextTokenizer:
             text = pre_tokenizer(text)
         return self.sp_model.Encode(text, out_type=kwargs.pop("out_type", int), **kwargs)
 
-    def batch_encode(self, texts: list[str], **kwargs):
-        for pre_tokenizer in self.pre_tokenizers:
-            texts = [pre_tokenizer(text) for text in texts]
-        return self.sp_model.Encode(texts, out_type=kwargs.pop("out_type", int), **kwargs)
-
     def decode(self, ids: list[int] | int, do_lower_case=False, **kwargs):
         if isinstance(ids, int):
             ids = [ids]

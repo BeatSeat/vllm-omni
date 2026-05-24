@@ -329,8 +329,8 @@ def resolve_model_config_path(model: str) -> str:
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
-            # No config.json at all (e.g. IndexTTS2 ships only config.yaml).
-            # Fall back to deploy YAML stem matching.
+            # No config.json at repo root (e.g. IndexTTS2, GLM-TTS).
+            # Try matching against registered deploy YAML filenames.
             model_type = _try_resolve_omni_model_type(model)
             if model_type is None:
                 raise ValueError(

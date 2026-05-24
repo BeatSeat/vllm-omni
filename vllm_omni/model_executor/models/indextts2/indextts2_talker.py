@@ -517,6 +517,13 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         use_random_list = info_dict.get("use_random")
         use_random = bool(use_random_list[0]) if isinstance(use_random_list, list) and use_random_list else False
 
+        emo_voice_name_list = info_dict.get("emo_voice_name")
+        emo_voice_name = (
+            str(emo_voice_name_list[0]).strip().lower()
+            if isinstance(emo_voice_name_list, list) and emo_voice_name_list
+            else None
+        )
+
         # --- Speaker cache lookup ---
         voice_name_list = info_dict.get("voice_name")
         _voice_name = voice_name_list[0] if isinstance(voice_name_list, list) and voice_name_list else None
@@ -532,6 +539,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
 
         # --- Load audio and extract features ---
         wav_16k, wav_22k = load_reference_audio(voice_path, device)
+        w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)  # singleton; needed by emotion path too
 
         if _cached is not None:
             s_ref = _cached["S_ref"].to(device)
@@ -540,7 +548,6 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             spk_cond_emb = _cached["spk_cond_emb"].to(device)
             logger.info("[PREFILL_PP] speaker cache HIT for %s", _voice_name)
         else:
-            w2v_model, w2v_proc = load_wav2vec2(self.model_path, device)
             self._ensure_w2v_stat_loaded(device)
             spk_cond_emb = wav2vec_extract(wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
 
@@ -581,6 +588,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         emo_vec = self._compute_emotion_vector(
             wav_16k=wav_16k,
             emo_audio_path=emo_audio_path,
+            emo_voice_name=emo_voice_name,
             main_text=text,
             use_emo_text=use_emo_text,
             emo_text=emo_text,
@@ -718,6 +726,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         *,
         wav_16k: torch.Tensor,
         emo_audio_path: str | None,
+        emo_voice_name: str | None,
         main_text: str,
         use_emo_text: bool,
         emo_text: str | None,
@@ -761,13 +770,32 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # --- Audio-based emotion with alpha blending ---
         if emo_audio_path is None:
             effective_alpha = 1.0
-            emo_wav_16k = wav_16k
+            emo_cond_emb = spk_cond_emb  # reuse speaker embedding; skip redundant extraction
         else:
             effective_alpha = emo_alpha
-            emo_wav_16k, _ = load_reference_audio(emo_audio_path, device)
+            # emotion audio cache (enabled when emo_voice_name is provided)
+            _emo_cache_key = None
+            _emo_cached = None
+            if emo_voice_name:
+                _emo_cache_key = self._speaker_cache.make_cache_key(emo_voice_name, "indextts2_emo", 0)
+                _emo_cached = self._speaker_cache.get(_emo_cache_key)
 
-        self._ensure_w2v_stat_loaded(device)
-        emo_cond_emb = wav2vec_extract(emo_wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
+            if _emo_cached is not None:
+                emo_cond_emb = _emo_cached["spk_cond_emb"].to(device)
+                logger.info("[EMO] cache HIT for %s", emo_voice_name)
+            else:
+                emo_wav_16k, _ = load_reference_audio(emo_audio_path, device)
+                self._ensure_w2v_stat_loaded(device)
+                emo_cond_emb = wav2vec_extract(emo_wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
+                if _emo_cache_key is not None:
+                    self._speaker_cache.put(
+                        _emo_cache_key,
+                        {
+                            "spk_cond_emb": emo_cond_emb.detach().cpu().contiguous(),
+                        },
+                    )
+                    logger.info("[EMO] cache MISS, cached for %s", emo_voice_name)
+
         emovec = self._merge_emovec(spk_cond_emb, emo_cond_emb, effective_alpha)
 
         # --- Overlay emo_vector onto audio-based emovec ---

@@ -110,7 +110,6 @@ class DiT(torch.nn.Module):
         self.content_type = args.DiT.content_type  # 'discrete' or 'continuous'
         self.content_codebook_size = args.DiT.content_codebook_size  # for discrete content
         self.content_dim = args.DiT.content_dim  # for continuous content
-        self.cond_embedder = nn.Embedding(args.DiT.content_codebook_size, args.DiT.hidden_dim)  # discrete content
         self.cond_projection = nn.Linear(args.DiT.content_dim, args.DiT.hidden_dim, bias=True)  # continuous content
 
         self.is_causal = args.DiT.is_causal
@@ -186,7 +185,6 @@ class DiT(torch.nn.Module):
             class_dropout = True
         if not self.training and mask_content:
             class_dropout = True
-        # cond_in_module = self.cond_embedder if self.content_type == 'discrete' else self.cond_projection
         cond_in_module = self.cond_projection
 
         B, _, T = x.size()

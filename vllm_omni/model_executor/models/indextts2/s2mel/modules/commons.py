@@ -73,10 +73,6 @@ class MyModel(nn.Module):
         else:
             self.models = nn.ModuleDict({"cfm": CFM(args), "length_regulator": length_regulator})
 
-    def forward(self, x, target_lengths, prompt_len, cond, y):
-        x = self.models["cfm"](x, target_lengths, prompt_len, cond, y)
-        return x
-
     def forward_gpt(self, x):
         x = self.models["gpt_layer"](x)
         return x

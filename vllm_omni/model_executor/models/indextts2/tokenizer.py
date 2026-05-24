@@ -31,14 +31,6 @@ class IndexTTS2Tokenizer(PreTrainedTokenizer):
     def vocab_size(self):
         return self._tok.vocab_size
 
-    @property
-    def max_token_id(self):
-        return self.vocab_size - 1
-
-    @property
-    def max_chars_per_token(self):
-        return max(len(tok) for tok in self._tok.get_vocab())
-
     def get_vocab(self):
         return self._tok.get_vocab()
 

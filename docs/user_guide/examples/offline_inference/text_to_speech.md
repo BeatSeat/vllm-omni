@@ -20,6 +20,7 @@ list of supported architectures across all modalities, see
 | VoxCPM | local model dir | split | ✓ | ✓ (`voxcpm_async_chunk.yaml`) | — | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
+| GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants (`--query-type`) | 24 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets (`--voice`) | 24 kHz |
@@ -214,6 +215,35 @@ Streaming requires `async_chunk: true` in the stage config.
 
 ---
 
+## GLM-TTS
+
+2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
+    --model zai-org/GLM-TTS \
+    --text "你好，这是语音合成测试。" \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "这是参考音频的文本内容。" \
+    --output-dir ./output
+```
+
+### Architecture
+```
+Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
+        (Llama-based)    (32k vocab)      (Flow Matching)
+```
+
+### Notes
+- `--ref-audio` and `--ref-text` are **required** together; GLM-TTS does not support text-only synthesis.
+- Reference audio should be 3-10 seconds.
+- First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
+- Default sampling: temperature=1.0, top_k=25, top_p=0.8 (RAS method).
+- The `--model` path should point to the repository root (not `llm/` subdirectory).
+
+---
+
 ## OmniVoice
 
 Zero-shot multilingual TTS supporting 600+ languages, with three modes (auto / clone / design).
@@ -368,6 +398,10 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 ??? abstract "fish_speech/end2end.py"
     ``````py
     --8<-- "examples/offline_inference/text_to_speech/fish_speech/end2end.py"
+    ``````
+??? abstract "glm_tts/end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/text_to_speech/glm_tts/end2end.py"
     ``````
 ??? abstract "omnivoice/end2end.py"
     ``````py

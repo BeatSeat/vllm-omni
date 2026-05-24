@@ -52,14 +52,7 @@ class ConvNeXtBlock(nn.Module):
         return x
 
 
-class Backbone(nn.Module):
-    """Base class for the generator's backbone."""
-
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        raise NotImplementedError("Subclasses must implement the forward method.")
-
-
-class VocosBackbone(Backbone):
+class VocosBackbone(nn.Module):
     """Vocos backbone module built with ConvNeXt blocks."""
 
     def __init__(

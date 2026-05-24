@@ -98,9 +98,12 @@ def load_campplus(model_path: str, device: torch.device):
 
     campplus = CAMPPlus(feat_dim=80, embedding_size=192)
     ckpt_path = resolve_model_file(model_path, "campplus.pth")
-    if ckpt_path is not None:
-        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        campplus.load_state_dict(state, strict=False)
+    if ckpt_path is None:
+        from huggingface_hub import hf_hub_download
+
+        ckpt_path = hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    campplus.load_state_dict(state, strict=False)
     campplus = campplus.to(device=device, dtype=torch.float32).eval()
     for p in campplus.parameters():
         p.requires_grad_(False)
@@ -116,8 +119,10 @@ def load_qwen_emotion(model_path: str, device: torch.device):
 
     qwen_emo_path = resolve_model_dir(model_path, "qwen0.6bemo4-merge")
     if qwen_emo_path is None:
-        logger.warning("QwenEmotion model not found in %s, emotion text features disabled", model_path)
-        return None, None
+        raise FileNotFoundError(
+            f"QwenEmotion model directory 'qwen0.6bemo4-merge' was not found in {model_path}. "
+            "It is required when IndexTTS2 use_emo_text=True."
+        )
     _qwen_emotion_tokenizer = AutoTokenizer.from_pretrained(qwen_emo_path, trust_remote_code=True)
     _qwen_emotion_model = AutoModelForCausalLM.from_pretrained(
         qwen_emo_path,

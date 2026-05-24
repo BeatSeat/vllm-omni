@@ -196,7 +196,7 @@ class SpeechBatchItem(BaseModel):
     all other fields override the batch-level defaults when set."""
 
     input: str
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
@@ -207,6 +207,10 @@ class SpeechBatchItem(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional model-specific parameters for this batch item.",
+    )
 
 
 class BatchSpeechRequest(BaseModel):
@@ -215,7 +219,7 @@ class BatchSpeechRequest(BaseModel):
 
     model: str | None = None
     items: list[SpeechBatchItem] = Field(..., min_length=1)
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
@@ -226,6 +230,10 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Shared model-specific parameters; item-level values override these.",
+    )
 
 
 class SpeechBatchItemResult(BaseModel):

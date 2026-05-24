@@ -185,7 +185,13 @@ TEST_CASES = [
 ]
 
 EMO_TEST_CASES = [
-    {"id": "emo_text_01", "text": "今天天气真好，心情很开心！", "lang": "zh", "emo_text": "开心快乐"},
+    {
+        "id": "emo_text_01",
+        "text": "今天天气真好，心情很开心！",
+        "lang": "zh",
+        "use_emo_text": True,
+        "emo_text": "开心快乐",
+    },
     {
         "id": "emo_vec_01",
         "text": "这件事让我很生气。",
@@ -256,6 +262,8 @@ def run_offline_tests(args) -> list[dict]:
             additional["voice"] = [args.ref_audio]
         if "emo_text" in case:
             additional["emo_text"] = [case["emo_text"]]
+        if "use_emo_text" in case:
+            additional["use_emo_text"] = [case["use_emo_text"]]
         if "emo_vector" in case:
             additional["emo_vector"] = [case["emo_vector"]]
 

@@ -906,7 +906,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             bpe_path = resolve_model_file(self.model_path, "bpe.model")
             if bpe_path is None:
                 raise FileNotFoundError(f"BPE model not found in {self.model_path}")
-            self._text_tokenizer = IndexTTS2Tokenizer(bpe_path)
+            self._text_tokenizer = IndexTTS2Tokenizer(bpe_path, model_dir=self.model_path)
 
         token_ids = self._text_tokenizer.encode(text, add_special_tokens=False)
 
@@ -1032,6 +1032,31 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             "Loaded %d weights for IndexTTS2TalkerForConditionalGeneration",
             len(loaded_params),
         )
+        required_prefixes = [
+            "text_embedding.",
+            "mel_embedding.",
+            "text_pos_embedding.",
+            "mel_pos_embedding.",
+            "speed_emb.",
+            "emo_layer.",
+            "emovec_layer.",
+            "conditioning_encoder.",
+            "perceiver_encoder.",
+            "emo_conditioning_encoder.",
+            "emo_perceiver_encoder.",
+            "h.",
+            "ln_f.",
+        ]
+        if self.mel_head is not None:
+            required_prefixes.append("mel_head.")
+        missing_prefixes = [
+            prefix for prefix in required_prefixes if not any(name.startswith(prefix) for name in loaded_params)
+        ]
+        if missing_prefixes:
+            raise RuntimeError(
+                "IndexTTS2 GPT checkpoint did not load required parameter groups: "
+                + ", ".join(missing_prefixes)
+            )
 
         # Ensure all sub-modules on correct device (some nn.Parameter created
         # with torch.Tensor() end up on CPU even when model is on CUDA).

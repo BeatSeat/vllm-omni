@@ -7,7 +7,6 @@ to synthesize mel spectrogram, then BigVGAN to produce waveform audio.
 """
 
 from __future__ import annotations
-
 from collections.abc import Iterable
 from typing import Any
 
@@ -30,7 +29,7 @@ logger = init_logger(__name__)
 # Lazy loaders for external models
 # ---------------------------------------------------------------------------
 
-_bigvgan_model = None
+_bigvgan_models: dict[tuple[str, str], nn.Module] = {}
 _semantic_codec_decoder = None
 
 
@@ -45,25 +44,27 @@ def _patch_bigvgan_compat(cls):
     cls._from_pretrained = _compat
 
 
-def _load_bigvgan(vocoder_name: str, device: torch.device, use_cuda_kernel: bool = False):
-    global _bigvgan_model
-    if _bigvgan_model is not None:
-        return _bigvgan_model
+def _load_bigvgan(vocoder_name: str, device: torch.device):
+    cache_key = (vocoder_name, str(device))
+    if cache_key in _bigvgan_models:
+        return _bigvgan_models[cache_key]
+
     try:
         from .s2mel.modules.bigvgan import bigvgan as bigvgan_mod
 
         _patch_bigvgan_compat(bigvgan_mod.BigVGAN)
-        _bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name, use_cuda_kernel=use_cuda_kernel)
+        bigvgan_model = bigvgan_mod.BigVGAN.from_pretrained(vocoder_name)
     except (ImportError, ModuleNotFoundError):
         import bigvgan
 
         _patch_bigvgan_compat(bigvgan.BigVGAN)
-        _bigvgan_model = bigvgan.BigVGAN.from_pretrained(vocoder_name, use_cuda_kernel=use_cuda_kernel)
-    _bigvgan_model = _bigvgan_model.to(device=device).eval()
-    _bigvgan_model.remove_weight_norm()
-    for p in _bigvgan_model.parameters():
+        bigvgan_model = bigvgan.BigVGAN.from_pretrained(vocoder_name)
+    bigvgan_model = bigvgan_model.to(device=device).eval()
+    bigvgan_model.remove_weight_norm()
+    for p in bigvgan_model.parameters():
         p.requires_grad_(False)
-    return _bigvgan_model
+    _bigvgan_models[cache_key] = bigvgan_model
+    return bigvgan_model
 
 
 def _load_semantic_codec_for_vq2emb(model_path: str, config: dict, device: torch.device):
@@ -137,6 +138,7 @@ class IndexTTS2S2MelDecoder(nn.Module):
         self.diffusion_steps = 25
         self.inference_cfg_rate = 0.7
         self.mel_code_to_frame_ratio = 1.72
+        self._s2mel_torch_compile_attempted = False
 
     # ------------------------------------------------------------------
     # vLLM hooks
@@ -340,17 +342,35 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if estimator.transformer.freqs_cis is None:
             estimator.setup_caches(max_batch_size=2, max_seq_length=16384)
             logger.info("[S2Mel] DiT caches initialized (freqs_cis + causal_mask)")
+        self._maybe_enable_s2mel_torch_compile()
 
-        with torch.no_grad():
-            mel = cfm.inference(
-                cat_condition,
-                torch.tensor([cat_condition.size(1)], device=device, dtype=torch.long),
-                ref_mel,
-                style,
-                None,  # f0
-                self.diffusion_steps,
-                inference_cfg_rate=self.inference_cfg_rate,
-            )
+        x_lens = torch.tensor([cat_condition.size(1)], device=device, dtype=torch.long)
+        try:
+            with torch.no_grad():
+                mel = cfm.inference(
+                    cat_condition,
+                    x_lens,
+                    ref_mel,
+                    style,
+                    None,  # f0
+                    self.diffusion_steps,
+                    inference_cfg_rate=self.inference_cfg_rate,
+                )
+        except Exception as exc:
+            if not getattr(cfm, "_compiled", False) or not hasattr(cfm, "disable_torch_compile"):
+                raise
+            logger.warning("IndexTTS2 S2Mel compiled inference failed; retrying eager S2Mel: %s", exc)
+            cfm.disable_torch_compile()
+            with torch.no_grad():
+                mel = cfm.inference(
+                    cat_condition,
+                    x_lens,
+                    ref_mel,
+                    style,
+                    None,  # f0
+                    self.diffusion_steps,
+                    inference_cfg_rate=self.inference_cfg_rate,
+                )
         # Strip reference portion
         mel = mel[:, :, ref_mel.size(-1) :]
         logger.info("[S2Mel] step5 CFM done → mel=%s (stripped ref %d frames)", mel.shape, ref_mel.size(-1))
@@ -472,4 +492,37 @@ class IndexTTS2S2MelDecoder(nn.Module):
             loaded_params.add(mapped_name)
 
         logger.info("Loaded %d weights for IndexTTS2S2MelDecoder", len(loaded_params))
+        required_prefixes = [
+            "s2mel.models.cfm.",
+            "s2mel.models.length_regulator.",
+            "s2mel.models.gpt_layer.",
+        ]
+        missing_prefixes = [
+            prefix for prefix in required_prefixes if not any(name.startswith(prefix) for name in loaded_params)
+        ]
+        if missing_prefixes:
+            raise RuntimeError(
+                "IndexTTS2 S2Mel checkpoint did not load required parameter groups: "
+                + ", ".join(missing_prefixes)
+            )
         return loaded_params
+
+    def _maybe_enable_s2mel_torch_compile(self) -> None:
+        if self._s2mel_torch_compile_attempted:
+            return
+        self._s2mel_torch_compile_attempted = True
+
+        if getattr(self.vllm_config.model_config, "enforce_eager", False):
+            logger.info("Skipping IndexTTS2 S2Mel torch.compile because enforce_eager=True")
+            return
+
+        if not hasattr(self.s2mel, "enable_torch_compile"):
+            logger.warning("IndexTTS2 S2Mel does not expose enable_torch_compile")
+            return
+
+        try:
+            self.s2mel.enable_torch_compile()
+        except Exception as exc:
+            logger.warning("IndexTTS2 S2Mel torch.compile failed; using eager S2Mel: %s", exc)
+        else:
+            logger.info("Enabled IndexTTS2 S2Mel torch.compile")

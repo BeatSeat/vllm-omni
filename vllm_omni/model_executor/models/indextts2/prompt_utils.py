@@ -29,7 +29,7 @@ def _resolve_bpe_model_path(model_id_or_path: str) -> str:
 
 @lru_cache(maxsize=16)
 def _get_text_tokenizer(model_id_or_path: str) -> IndexTTS2Tokenizer:
-    return IndexTTS2Tokenizer(_resolve_bpe_model_path(model_id_or_path))
+    return IndexTTS2Tokenizer(_resolve_bpe_model_path(model_id_or_path), model_dir=model_id_or_path)
 
 
 def estimate_indextts2_prefill_prompt_len(model_id_or_path: str, text: str) -> int:

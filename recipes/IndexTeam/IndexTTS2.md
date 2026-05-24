@@ -108,5 +108,8 @@ Stage 0 (GPT-2 AR, PagedAttention)     Stage 1 (S2Mel + BigVGAN)
 - **Voice cloning**: Pass `ref_audio` (base64 data URL, file path, or HTTP URL)
 - **Emotion control**: Pass `emo_audio` (emotion reference audio) or `emo_vector`
   (8-dim emotion distribution) via `extra_params`
+- **Emotion text**: Pass both `use_emo_text: true` and `emo_text` via
+  `extra_params`. Matching upstream IndexTTS2, `emo_text` is only used to
+  predict an emotion vector; it does not replace the request `input` text.
 - **Multi-language**: Chinese, English, Japanese, and mixed-language text
 - **Non-streaming**: S2Mel flow matching produces the full spectrogram at once

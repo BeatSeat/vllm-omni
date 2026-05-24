@@ -173,8 +173,10 @@ class CFM(BASECFM):
         super().__init__(args)
         if args.dit_type == "DiT":
             self.estimator = DiT(args)
+            object.__setattr__(self, "_eager_estimator", self.estimator)
         else:
             raise NotImplementedError(f"Unknown diffusion type {args.dit_type}")
+        self._compiled = False
 
     def enable_torch_compile(self):
         """Enable torch.compile optimization for the estimator model.
@@ -186,7 +188,12 @@ class CFM(BASECFM):
         if torch.distributed.is_initialized():
             torch._inductor.config.reorder_for_compute_comm_overlap = True
         self.estimator = torch.compile(
-            self.estimator,
+            self._eager_estimator,
             fullgraph=True,
             dynamic=True,
         )
+        self._compiled = True
+
+    def disable_torch_compile(self):
+        self.estimator = self._eager_estimator
+        self._compiled = False

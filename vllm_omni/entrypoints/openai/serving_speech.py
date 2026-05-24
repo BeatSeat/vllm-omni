@@ -83,7 +83,36 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MOSS_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
 )
-_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
+_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
+    "fish_tts",
+    "qwen3_tts",
+    "voxtral_tts",
+    "cosyvoice3",
+    "voxcpm2",
+}
+_INDEXTTS2_EMOTION_EXTRA_PARAM_KEYS = {
+    "emo_audio",
+    "emo_vector",
+    "emo_alpha",
+    "emo_text",
+    "use_emo_text",
+    "use_random",
+}
+_INDEXTTS2_SAMPLING_EXTRA_PARAM_KEYS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "repetition_penalty",
+    "max_mel_tokens",
+    "max_tokens",
+}
+_INDEXTTS2_TEXT_EXTRA_PARAM_KEYS = {
+    "max_text_tokens_per_segment",
+    "quick_streaming_tokens",
+    "interval_silence",
+}
+_INDEXTTS2_UNSUPPORTED_EXTRA_PARAM_KEYS = {"length_penalty", "num_beams", "do_sample"}
+_INDEXTTS2_DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT = 120
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -1439,6 +1468,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Validate IndexTTS2 request. Requires non-empty text and ref_audio for voice cloning."""
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
+        if request.instructions is not None:
+            return "'instructions' is not supported for IndexTTS2; use extra_params.emo_text with use_emo_text=true"
+        if request.language is not None:
+            return "'language' is not supported for IndexTTS2 (language is inferred from input text)"
+        if request.task_type is not None:
+            return "'task_type' is not supported for IndexTTS2"
+        if request.x_vector_only_mode is not None:
+            return "'x_vector_only_mode' is not supported for IndexTTS2"
+        if request.speaker_embedding is not None:
+            return "'speaker_embedding' is not supported for IndexTTS2"
+        if request.initial_codec_chunk_frames is not None:
+            return "'initial_codec_chunk_frames' is not supported for IndexTTS2"
         has_uploaded_voice = bool(
             request.voice
             and request.voice.lower() in self.uploaded_speakers
@@ -1453,9 +1494,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             fmt_err = self._validate_ref_audio_format(request.ref_audio)
             if fmt_err:
                 return fmt_err
+        if request.extra_params is not None and not isinstance(request.extra_params, dict):
+            return "extra_params must be a JSON object/dict."
         if request.extra_params and isinstance(request.extra_params, dict):
+            supported_keys = (
+                _INDEXTTS2_EMOTION_EXTRA_PARAM_KEYS
+                | _INDEXTTS2_SAMPLING_EXTRA_PARAM_KEYS
+                | _INDEXTTS2_TEXT_EXTRA_PARAM_KEYS
+                | _INDEXTTS2_UNSUPPORTED_EXTRA_PARAM_KEYS
+            )
+            unsupported = sorted(set(request.extra_params) - supported_keys)
+            if unsupported:
+                return f"Unsupported IndexTTS2 extra_params: {', '.join(unsupported)}"
+            unsupported_generation = sorted(set(request.extra_params) & _INDEXTTS2_UNSUPPORTED_EXTRA_PARAM_KEYS)
+            if unsupported_generation:
+                return (
+                    "IndexTTS2 extra_params are not supported by the vLLM sampler yet: "
+                    f"{', '.join(unsupported_generation)}"
+                )
             emo_audio = request.extra_params.get("emo_audio")
-            if isinstance(emo_audio, str):
+            if emo_audio is not None:
+                if not isinstance(emo_audio, str):
+                    return "IndexTTS2 'emo_audio' must be a string URI"
                 fmt_err = self._validate_ref_audio_format(emo_audio)
                 if fmt_err:
                     return f"Invalid emo_audio: {fmt_err}"
@@ -1478,13 +1538,44 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             use_random = request.extra_params.get("use_random")
             if use_random is not None and not isinstance(use_random, bool):
                 return "IndexTTS2 'use_random' must be a boolean"
+            max_text_tokens = request.extra_params.get("max_text_tokens_per_segment")
+            if max_text_tokens is not None:
+                if not isinstance(max_text_tokens, int) or max_text_tokens <= 0:
+                    return "IndexTTS2 'max_text_tokens_per_segment' must be a positive integer"
+            quick_streaming_tokens = request.extra_params.get("quick_streaming_tokens")
+            if quick_streaming_tokens is not None:
+                if not isinstance(quick_streaming_tokens, int) or quick_streaming_tokens < 0:
+                    return "IndexTTS2 'quick_streaming_tokens' must be a non-negative integer"
+            interval_silence = request.extra_params.get("interval_silence")
+            if interval_silence is not None:
+                if not isinstance(interval_silence, int) or interval_silence < 0:
+                    return "IndexTTS2 'interval_silence' must be a non-negative integer"
+            for key in ("temperature", "top_p"):
+                value = request.extra_params.get(key)
+                if value is not None and (not isinstance(value, (int, float)) or value < 0):
+                    return f"IndexTTS2 '{key}' must be a non-negative number"
+            top_k = request.extra_params.get("top_k")
+            if top_k is not None and not isinstance(top_k, int):
+                return "IndexTTS2 'top_k' must be an integer"
+            repetition_penalty = request.extra_params.get("repetition_penalty")
+            if repetition_penalty is not None and (
+                not isinstance(repetition_penalty, (int, float)) or repetition_penalty <= 0
+            ):
+                return "IndexTTS2 'repetition_penalty' must be a positive number"
+            for key in ("max_mel_tokens", "max_tokens"):
+                value = request.extra_params.get(key)
+                if value is not None and (not isinstance(value, int) or value <= 0):
+                    return f"IndexTTS2 '{key}' must be a positive integer"
         return None
 
     async def _build_indextts2_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build additional_information for IndexTTS2.
 
         Stage 0 preprocess expects: text, voice (ref audio path/data),
-        and optional emotion parameters (emo_audio, emo_vector, emo_alpha).
+        and optional emotion parameters. Matching upstream IndexTTS2,
+        emo_text is only an emotion-description input when use_emo_text=True;
+        it never replaces the target synthesis text. ``ref_text`` is accepted
+        for API compatibility but intentionally ignored, matching upstream v2.
         """
         params: dict[str, Any] = {"text": [request.input]}
 
@@ -1518,6 +1609,63 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 params["use_random"] = [request.extra_params["use_random"]]
 
         return params
+
+    async def _split_indextts2_text_async(self, request: OpenAICreateSpeechRequest) -> list[str]:
+        """Split text with the official IndexTTS2 tokenizer/segmenter."""
+        from vllm_omni.model_executor.models.indextts2.prompt_utils import _get_text_tokenizer
+
+        model_name = self.engine_client.model_config.model
+        tokenizer = await make_async(_get_text_tokenizer)(model_name)
+        text_tokens = await make_async(tokenizer.tokenize)(request.input)
+        max_segment_tokens = _INDEXTTS2_DEFAULT_MAX_TEXT_TOKENS_PER_SEGMENT
+        quick_streaming_tokens = 0
+        if request.extra_params and isinstance(request.extra_params, dict):
+            max_segment_tokens = int(
+                request.extra_params.get("max_text_tokens_per_segment", max_segment_tokens)
+            )
+            quick_streaming_tokens = int(request.extra_params.get("quick_streaming_tokens", quick_streaming_tokens))
+        segments = tokenizer._tok.split_segments(
+            text_tokens,
+            max_text_tokens_per_segment=max_segment_tokens,
+            quick_streaming_tokens=quick_streaming_tokens,
+        )
+        segment_texts = [tokenizer.convert_tokens_to_string(segment).strip() for segment in segments]
+        return [text for text in segment_texts if text]
+
+    async def _ensure_indextts2_single_segment_async(self, request: OpenAICreateSpeechRequest) -> None:
+        """Guard direct generation paths from silently truncating multi-segment input."""
+        segments = await self._split_indextts2_text_async(request)
+        if len(segments) > 1:
+            raise ValueError(
+                "IndexTTS2 streaming/direct generation received text that splits into "
+                f"{len(segments)} official segments. Use non-streaming speech generation so "
+                "the server can synthesize and concatenate segments."
+            )
+
+    @staticmethod
+    def _apply_indextts2_sampling_params(sampling_params_list: list[Any], request: OpenAICreateSpeechRequest) -> list[Any]:
+        """Apply IndexTTS2 upstream generation knobs to stage-0 SamplingParams."""
+        if not sampling_params_list:
+            return sampling_params_list
+        import copy
+
+        sampling_params_list = copy.deepcopy(sampling_params_list)
+        sp = sampling_params_list[0]
+        extras = request.extra_params if isinstance(request.extra_params, dict) else {}
+        field_map = {
+            "temperature": "temperature",
+            "top_p": "top_p",
+            "top_k": "top_k",
+            "repetition_penalty": "repetition_penalty",
+            "max_tokens": "max_tokens",
+            "max_mel_tokens": "max_tokens",
+        }
+        for extra_key, attr in field_map.items():
+            if extra_key in extras:
+                setattr(sp, attr, extras[extra_key])
+        if request.max_new_tokens is not None:
+            sp.max_tokens = request.max_new_tokens
+        return sampling_params_list
 
     async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         """Build additional_information for MOSS-TTS-Nano.
@@ -2218,6 +2366,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
             elif self._tts_model_type == "indextts2":
+                await self._ensure_indextts2_single_segment_async(request)
                 tts_params = await self._build_indextts2_params(request)
                 ph_len = await self._estimate_indextts2_prompt_len_async(request.input)
                 prompt = tokens_input(prompt_token_ids=[1] * ph_len)
@@ -2296,7 +2445,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
 
         # Apply model-specific extra parameters
-        if request.extra_params is not None and sampling_params_list and self._tts_model_type != "indextts2":
+        if self._tts_model_type == "indextts2" and sampling_params_list:
+            sampling_params_list = self._apply_indextts2_sampling_params(sampling_params_list, request)
+        elif request.extra_params is not None and sampling_params_list:
             if not isinstance(request.extra_params, dict):
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2317,6 +2468,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._tts_model_type in _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES
             and request.max_new_tokens is not None
             and sampling_params_list
+            and self._tts_model_type != "indextts2"
         ):
             import copy
 
@@ -2368,6 +2520,43 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         base64_encode: bool = False,
         request_id: str | None = None,
     ) -> tuple[bytes | str, str]:
+        if self._tts_model_type == "indextts2":
+            segments = await self._split_indextts2_text_async(request)
+            if len(segments) > 1:
+                if request.stream:
+                    raise ValueError(
+                        "IndexTTS2 multi-segment streaming is not supported; "
+                        "use stream=false so segments can be concatenated."
+                    )
+                audio_parts: list[np.ndarray] = []
+                sample_rate: int | None = None
+                interval_silence = 200
+                if request.extra_params and isinstance(request.extra_params, dict):
+                    interval_silence = int(request.extra_params.get("interval_silence", interval_silence))
+                for idx, segment in enumerate(segments):
+                    segment_request = request.model_copy(update={"input": segment, "stream": False})
+                    segment_id = f"{request_id or 'speech'}-seg-{idx}"
+                    part, sr = await self._generate_indextts2_audio_array(segment_request, request_id=segment_id)
+                    sample_rate = sr if sample_rate is None else sample_rate
+                    if sample_rate != sr:
+                        raise ValueError("IndexTTS2 segments produced inconsistent sample rates")
+                    if part.size > 0:
+                        audio_parts.append(part)
+                    if idx < len(segments) - 1 and interval_silence > 0 and sample_rate:
+                        silence_len = int(sample_rate * interval_silence / 1000.0)
+                        audio_parts.append(np.zeros((silence_len,), dtype=np.float32))
+                audio_tensor = np.concatenate(audio_parts) if audio_parts else np.zeros((0,), dtype=np.float32)
+                audio_obj = CreateAudio(
+                    audio_tensor=audio_tensor,
+                    sample_rate=sample_rate or 22050,
+                    response_format=request.response_format or "wav",
+                    speed=request.speed or 1.0,
+                    stream_format=request.stream_format,
+                    base64_encode=base64_encode,
+                )
+                audio_response: AudioResponse = self.create_audio(audio_obj)
+                return audio_response.audio_data, audio_response.media_type
+
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
 
         # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
@@ -2464,6 +2653,38 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         audio_response: AudioResponse = self.create_audio(audio_obj)
         return audio_response.audio_data, audio_response.media_type
+
+    async def _generate_indextts2_audio_array(
+        self,
+        request: OpenAICreateSpeechRequest,
+        request_id: str | None = None,
+    ) -> tuple[np.ndarray, int]:
+        request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+        final_output: OmniRequestOutput | None = None
+        async for res in generator:
+            final_output = res
+        if final_output is None:
+            raise ValueError("No output generated from the model.")
+        audio_output, audio_key = self._extract_audio_output(final_output)
+        if audio_key is None:
+            raise ValueError("TTS model did not produce audio output.")
+        audio_tensor = audio_output[audio_key]
+        sr_raw = audio_output.get("sr", 22050)
+        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+        sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+        if isinstance(audio_tensor, list):
+            audio_history = audio_tensor
+            audio_tensor = np.zeros((0,), dtype=np.float32)
+            for candidate in reversed(audio_history):
+                if candidate.numel() > 0:
+                    audio_tensor = candidate
+                    break
+        if hasattr(audio_tensor, "float"):
+            audio_tensor = audio_tensor.float().detach().cpu().numpy()
+        audio_array = np.asarray(audio_tensor, dtype=np.float32)
+        if audio_array.ndim > 1:
+            audio_array = audio_array.squeeze()
+        return audio_array, sample_rate
 
     async def _create_diffusion_speech(
         self,
@@ -2688,6 +2909,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             item_val = getattr(item, field, None)
             return item_val if item_val is not None else getattr(batch, field, None)
 
+        extra_params: dict[str, Any] | None = None
+        batch_extra = batch.extra_params
+        item_extra = item.extra_params
+        if batch_extra is not None or item_extra is not None:
+            extra_params = {}
+            if batch_extra:
+                extra_params.update(batch_extra)
+            if item_extra:
+                extra_params.update(item_extra)
+
         picked_speed = _pick("speed")
         return OpenAICreateSpeechRequest(
             input=item.input,
@@ -2704,6 +2935,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             x_vector_only_mode=_pick("x_vector_only_mode"),
             max_new_tokens=_pick("max_new_tokens"),
             initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
+            extra_params=extra_params,
         )
 
     async def create_speech_batch(

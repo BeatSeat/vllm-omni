@@ -10,6 +10,10 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _shape(tensor: Any) -> tuple[int, ...] | None:
+    return tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else None
+
+
 def _strip_stop_token(
     codes: torch.Tensor,
     latent: torch.Tensor,
@@ -113,25 +117,25 @@ def talker2s2mel(
         ref_mel = meta.get("ref_mel")
         style = meta.get("style")
 
-        logger.info(
+        logger.debug(
             "[talker2s2mel] shapes — mel_codes=%s, latent=%s, S_ref=%s, ref_mel=%s, style=%s",
-            mel_codes.shape if isinstance(mel_codes, torch.Tensor) else None,
-            latent.shape if isinstance(latent, torch.Tensor) else None,
-            s_ref.shape if isinstance(s_ref, torch.Tensor) else None,
-            ref_mel.shape if isinstance(ref_mel, torch.Tensor) else None,
-            style.shape if isinstance(style, torch.Tensor) else None,
+            _shape(mel_codes),
+            _shape(latent),
+            _shape(s_ref),
+            _shape(ref_mel),
+            _shape(style),
         )
 
         # Official infer_v2.py only strips at the first stop token in this path.
         mel_codes_clean, latent_clean, code_lens = _strip_stop_token(mel_codes, latent)
 
-        logger.info(
-            "[talker2s2mel] after stop trim — mel_codes=%s→%s, latent=%s→%s, code_lens=%s",
-            mel_codes.shape,
-            mel_codes_clean.shape,
-            latent.shape,
-            latent_clean.shape,
-            code_lens.tolist(),
+        logger.debug(
+            "[talker2s2mel] after stop trim — mel_codes=%s→%s, latent=%s→%s, max_code_len=%d",
+            _shape(mel_codes),
+            _shape(mel_codes_clean),
+            _shape(latent),
+            _shape(latent_clean),
+            int(code_lens.max().item()) if code_lens.numel() else 0,
         )
 
         # Build additional_information for Stage 1

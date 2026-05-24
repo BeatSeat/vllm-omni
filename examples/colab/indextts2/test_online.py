@@ -191,7 +191,12 @@ TEST_CASES = [
 ]
 
 EMO_TEST_CASES = [
-    {"id": "emo_text_01", "text": "今天天气真好！", "lang": "zh", "extra_params": {"emo_text": "开心快乐"}},
+    {
+        "id": "emo_text_01",
+        "text": "今天天气真好！",
+        "lang": "zh",
+        "extra_params": {"use_emo_text": True, "emo_text": "开心快乐"},
+    },
     {
         "id": "emo_vec_01",
         "text": "这件事让我很生气。",

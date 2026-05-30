@@ -9,14 +9,13 @@ the FunCineForge repo.  FunCineForge requires reference audio + ref_text
 for voice cloning, and optionally face embeddings for lip-sync dubbing.
 """
 
+import base64
+import functools
 import os
+import pickle
+from pathlib import Path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-import functools
-import io
-import pickle
-from urllib.request import urlopen
 
 import numpy as np
 import pytest
@@ -30,34 +29,29 @@ pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 
 MODEL = "FunAudioLLM/Fun-CineForge"
 
-# Official test data from FunCineForge GitHub repo
-_GITHUB_DATA_BASE = "https://raw.githubusercontent.com/FunAudioLLM/FunCineForge/main/exps/data"
+_ASSET_DIR = Path(__file__).resolve().parents[2] / "assets" / "funcineforge"
 
-# Reference audio for voice cloning
-REF_AUDIO_URL = f"{_GITHUB_DATA_BASE}/ref.wav"
-
-# Vocal audio (source speaker) — used to estimate speech_len
-VOCAL_AUDIO_URL = f"{_GITHUB_DATA_BASE}/clipped/en_monologue_1.wav"
-
-# Face embedding for lip-sync conditioning (pickle format from official repo)
-FACE_EMB_URL = f"{_GITHUB_DATA_BASE}/embs_video/en_monologue_1.pkl"
-
-# Clue text matching official demo.jsonl en_monologue_1
 REF_TEXT = (
     "A single middle-aged male speaker describes a business or "
-    "construction requirement with a practical and matter-of-fact tone."
+    "construction requirement with a practical and matter-of-fact tone. "
+    "His voice is deep and slightly gravelly, maintaining a professional "
+    "and informative demeanor throughout the segment."
 )
 
-# FunCineForge token rate: 25 Hz (codec frames per second)
 _TOKEN_RATE = 25
 
 
 @functools.lru_cache(maxsize=1)
+def _ref_audio_data_url() -> str:
+    """Return vendored ref.wav as a base64 data URL for the speech API."""
+    data = (_ASSET_DIR / "ref.wav").read_bytes()
+    return f"data:audio/wav;base64,{base64.b64encode(data).decode('ascii')}"
+
+
+@functools.lru_cache(maxsize=1)
 def _load_vocal_audio() -> tuple[np.ndarray, int]:
-    """Download official vocal audio to estimate speech_len."""
-    with urlopen(VOCAL_AUDIO_URL, timeout=60) as resp:
-        data = resp.read()
-    audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+    """Load vendored vocal audio to estimate speech_len."""
+    audio, sr = sf.read(str(_ASSET_DIR / "en_monologue_1.wav"), dtype="float32", always_2d=False)
     if isinstance(audio, np.ndarray) and audio.ndim > 1:
         audio = np.mean(audio, axis=-1)
     return np.asarray(audio, dtype=np.float32), int(sr)
@@ -65,17 +59,12 @@ def _load_vocal_audio() -> tuple[np.ndarray, int]:
 
 @functools.lru_cache(maxsize=1)
 def _load_face_embedding_pkl() -> dict:
-    """Download official face embedding pkl and parse it."""
-    with urlopen(FACE_EMB_URL, timeout=60) as resp:
-        return pickle.loads(resp.read())  # noqa: S301
+    """Load vendored face embedding pkl from tests/assets/."""
+    return pickle.loads((_ASSET_DIR / "en_monologue_1.pkl").read_bytes())  # noqa: S301
 
 
 def _create_face_npz(dest: str) -> int:
-    """Convert official pkl face embedding to .npz and return speech_len.
-
-    ``load_face_embedding()`` in serving layer uses ``np.load(allow_pickle=False)``
-    which requires .npz format, while the official repo ships .pkl files.
-    """
+    """Convert vendored pkl face embedding to .npz and return speech_len."""
     face_dict = _load_face_embedding_pkl()
     embeddings = np.asarray(face_dict["embeddings"])
     face_indices = np.asarray(face_dict["faceI"])
@@ -150,7 +139,7 @@ def test_funcineforge_dubbing_en_sync(omni_server, openai_client) -> None:
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
     }
     openai_client.send_audio_speech_request(request_config)
@@ -174,7 +163,7 @@ def test_funcineforge_dubbing_en_async(omni_server, openai_client) -> None:
         "input": get_prompt("en"),
         "stream": True,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
     }
     openai_client.send_audio_speech_request(request_config)
@@ -198,7 +187,7 @@ def test_funcineforge_dubbing_zh_sync(omni_server, openai_client) -> None:
         "input": get_prompt("zh"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
     }
     openai_client.send_audio_speech_request(request_config)
@@ -226,7 +215,7 @@ def test_funcineforge_dubbing_speech_type(omni_server, openai_client) -> None:
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
         "speech_type": "旁白",
     }
@@ -257,7 +246,7 @@ def test_funcineforge_dubbing_with_face(omni_server, openai_client, tmp_path) ->
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
         "face_path": face_file,
         "speech_len": speech_len,
@@ -293,7 +282,7 @@ def test_funcineforge_dubbing_with_face_pkl(omni_server, openai_client, tmp_path
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
         "face_path": face_pkl_file,
         "speech_len": speech_len,
@@ -329,7 +318,7 @@ def test_funcineforge_dubbing_with_dialogue_metadata(omni_server, openai_client,
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
         "face_path": face_file,
         "speech_len": speech_len,
@@ -367,7 +356,7 @@ def test_funcineforge_dubbing_full_cinematic(omni_server, openai_client, tmp_pat
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "ref_audio": REF_AUDIO_URL,
+        "ref_audio": _ref_audio_data_url(),
         "ref_text": REF_TEXT,
         "face_path": face_file,
         "speech_len": speech_len,
@@ -386,13 +375,14 @@ def _has_video_preprocess() -> bool:
     """Check if video preprocessing dependencies are available."""
     try:
         import moviepy  # noqa: F401
+        import face_alignment  # noqa: F401
+        import python_speech_features  # noqa: F401
     except ImportError:
         return False
-    return os.environ.get("FUNCINEFORGE_DEMO_ROOT") is not None
+    return True
 
 
-# Official test video clip from FunCineForge GitHub repo
-VIDEO_CLIP_URL = f"{_GITHUB_DATA_BASE}/clipped/en_monologue_1.mp4"
+_VIDEO_CLIP_PATH = str(_ASSET_DIR / "en_monologue_1.mp4")
 
 
 @pytest.mark.omni
@@ -400,7 +390,7 @@ VIDEO_CLIP_URL = f"{_GITHUB_DATA_BASE}/clipped/en_monologue_1.mp4"
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 @pytest.mark.skipif(
     not _has_video_preprocess(),
-    reason="Video preprocessing requires moviepy + FUNCINEFORGE_DEMO_ROOT",
+    reason="Video preprocessing requires moviepy + face_alignment + python_speech_features",
 )
 def test_funcineforge_video_dubbing_sync(omni_server, openai_client) -> None:
     """
@@ -411,7 +401,7 @@ def test_funcineforge_video_dubbing_sync(omni_server, openai_client) -> None:
     embedding extraction, reference audio extraction). Matches the
     HuggingFace Space demo flow.
 
-    Requires: moviepy + FUNCINEFORGE_DEMO_ROOT environment variable.
+    Requires: moviepy, face_alignment, python_speech_features pip packages.
 
     Deploy Setting: funcineforge.yaml
     Input Modal: text + video + video_start + video_end + speaker metadata
@@ -423,7 +413,7 @@ def test_funcineforge_video_dubbing_sync(omni_server, openai_client) -> None:
         "input": get_prompt("en"),
         "stream": False,
         "response_format": "wav",
-        "video": VIDEO_CLIP_URL,
+        "video": f"file://{_VIDEO_CLIP_PATH}",
         "video_start": 0.0,
         "video_end": 5.0,
         "ref_text": REF_TEXT,

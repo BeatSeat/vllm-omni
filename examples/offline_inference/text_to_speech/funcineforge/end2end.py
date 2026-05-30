@@ -280,8 +280,15 @@ def _build_video_offline_prompt(args: argparse.Namespace) -> dict[str, Any]:
         build_video_conditions,
     )
 
+    model_dir = args.model
+    if not os.path.isdir(model_dir):
+        from huggingface_hub import snapshot_download
+
+        model_dir = snapshot_download(model_dir)
+
     conditions = build_video_conditions(
         video=args.video,
+        model_dir=model_dir,
         start=args.video_start,
         end=args.video_end,
         age=getattr(args, "speaker_age", None),

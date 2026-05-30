@@ -71,6 +71,13 @@ demo = [
     "gradio>=6.7.0",
 ]
 
+video = [
+    "face-alignment>=1.4",
+    "python-speech-features",
+    "opencv-python-headless",
+    "moviepy",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",

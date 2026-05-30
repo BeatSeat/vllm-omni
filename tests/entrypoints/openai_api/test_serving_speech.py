@@ -2345,7 +2345,10 @@ def funcineforge_server(mocker: MockerFixture):
 
     mock_engine_client = mocker.MagicMock()
     mock_engine_client.errored = False
-    mock_engine_client.model_config = mocker.MagicMock(model="FunAudioLLM/Fun-CineForge")
+    import tempfile
+
+    _tmpdir = tempfile.mkdtemp(prefix="funcineforge_test_model_")
+    mock_engine_client.model_config = mocker.MagicMock(model=_tmpdir)
     mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
     mock_engine_client.tts_batch_max_items = 32
     mock_engine_client.generate = mocker.MagicMock(return_value="generator")
@@ -2434,6 +2437,7 @@ class TestFunCineForgeServing:
         preprocess.assert_called_once()
         materialize.assert_awaited_once_with("file:///tmp/source.mp4", None)
         assert preprocess.call_args.kwargs["video"] == "/tmp/policy_checked_source.mp4"
+        assert preprocess.call_args.kwargs["model_dir"] == funcineforge_server.engine_client.model_config.model
         assert prompt["prompt"] == "Dubbing line"
         assert prompt["multi_modal_data"]["audio"][1] == 16000
         mm_kwargs = prompt["mm_processor_kwargs"]

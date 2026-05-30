@@ -41,7 +41,7 @@ class FunCineForgeVideoConditions:
     face_path: str
 
 
-_FRONTEND_CACHE: dict[tuple[str, str, str, str], object] = {}
+_FRONTEND_CACHE: dict[tuple[str, str], object] = {}
 
 
 def materialize_video_source(video: str, work_dir: str) -> str:
@@ -149,73 +149,23 @@ def _load_wav(path: str) -> tuple[np.ndarray, int]:
     return wav, int(sr)
 
 
-def _get_demo_root() -> str | None:
-    root = os.environ.get("FUNCINEFORGE_DEMO_ROOT")
-    if root:
-        return root
-
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        for candidate in (
-            parent / "tmp" / "Fun-CineForge-Demo",
-            parent / "tmp" / "FunCineForge",
-        ):
-            if (candidate / "speaker_diarization").exists():
-                return str(candidate)
-    return None
-
-
 def _build_frontend(
     *,
-    pretrained_dir: str | None = None,
-    diar_config_path: str | None = None,
+    model_dir: str,
     device: str | None = None,
 ) -> object:
-    """Create/cache the official visual frontend from the Gradio demo."""
-    demo_root = _get_demo_root()
-    if demo_root is None:
-        raise RuntimeError(
-            "FunCineForge video preprocessing needs the official demo checkout. "
-            "Clone https://huggingface.co/spaces/FunAudioLLM/Fun-CineForge-Demo "
-            "and set FUNCINEFORGE_DEMO_ROOT to that directory, or pass face_path directly."
-        )
+    """Create/cache the visual frontend from vendored modules."""
+    from vllm_omni.model_executor.models.funcineforge.vendor.vision import VisualFrontend
 
-    import sys
-
-    if demo_root not in sys.path:
-        sys.path.insert(0, demo_root)
-
-    if pretrained_dir is None:
-        pretrained_dir = os.environ.get("FUNCINEFORGE_PRETRAIN_DIR") or str(Path(demo_root) / "pretrained_models")
-    if diar_config_path is None:
-        diar_config_path = os.environ.get("FUNCINEFORGE_DIAR_CONFIG") or str(
-            Path(demo_root) / "decode_conf" / "diar.yaml"
-        )
     if device is None:
-        device = os.environ.get("FUNCINEFORGE_PREPROCESS_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    key = (demo_root, pretrained_dir, diar_config_path, device)
+    key = (model_dir, device)
     cached = _FRONTEND_CACHE.get(key)
     if cached is not None:
         return cached
 
-    try:
-        from speaker_diarization.run import GlobalModels
-    except ImportError as exc:
-        raise ImportError(
-            "Could not import speaker_diarization from the FunCineForge demo checkout. "
-            "Set FUNCINEFORGE_DEMO_ROOT to the cloned Space directory."
-        ) from exc
-
-    frontend = GlobalModels(
-        hf_token=None,
-        config_path=diar_config_path,
-        pretrained_dir=pretrained_dir,
-        device=device,
-        pool_sizes={"face": 1, "asd": 1, "fr": 1},
-        batch_size=1,
-        preload=True,
-    )
+    frontend = VisualFrontend(model_dir, device=device)
     _FRONTEND_CACHE[key] = frontend
     return frontend
 
@@ -228,10 +178,7 @@ def _extract_visual_embeddings(
     face_path: str,
     duration: float,
 ) -> None:
-    try:
-        from speaker_diarization.local.vision_processer import VisionProcesser
-    except ImportError as exc:
-        raise ImportError("Could not import VisionProcesser from the FunCineForge demo checkout.") from exc
+    from vllm_omni.model_executor.models.funcineforge.vendor.vision.vision_processer import VisionProcesser
 
     vp = VisionProcesser(
         video_file_path=video_clip_path,
@@ -239,8 +186,7 @@ def _extract_visual_embeddings(
         audio_vad=[[0.0, round(duration, 2)]],
         out_feat_path=face_path,
         visual_models=frontend,
-        conf=frontend.conf,
-        out_video_path=None,
+        conf=getattr(frontend, "conf", None),
     )
     try:
         vp.run()
@@ -251,6 +197,7 @@ def _extract_visual_embeddings(
 def build_video_conditions(
     *,
     video: str,
+    model_dir: str,
     start: float | None = None,
     end: float | None = None,
     age: str | None = None,
@@ -258,8 +205,6 @@ def build_video_conditions(
     speech_type: str | None = None,
     work_dir: str | None = None,
     frontend: object | None = None,
-    pretrained_dir: str | None = None,
-    diar_config_path: str | None = None,
     device: str | None = None,
 ) -> FunCineForgeVideoConditions:
     """Preprocess a video segment into direct FunCineForge model conditions."""
@@ -280,11 +225,7 @@ def build_video_conditions(
     video_clip_path, audio_clip_path = _clip_video_segment(video_path, padded_start, padded_end, work_dir)
 
     face_path = str(Path(work_dir) / "clip_0.pkl")
-    frontend = frontend or _build_frontend(
-        pretrained_dir=pretrained_dir,
-        diar_config_path=diar_config_path,
-        device=device,
-    )
+    frontend = frontend or _build_frontend(model_dir=model_dir, device=device)
     _extract_visual_embeddings(
         frontend,
         video_clip_path=video_clip_path,

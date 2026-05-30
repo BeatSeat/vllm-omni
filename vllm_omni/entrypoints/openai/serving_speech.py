@@ -2060,9 +2060,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 build_video_conditions,
             )
 
+            model_dir = self.engine_client.model_config.model
+            if not os.path.isdir(model_dir):
+                from huggingface_hub import snapshot_download
+
+                model_dir = snapshot_download(model_dir)
+
             video_path = await self._materialize_video_source(request.video, request.preprocess_work_dir)
             conditions = await make_async(build_video_conditions, executor=self._tts_executor)(
                 video=video_path,
+                model_dir=model_dir,
                 start=request.video_start,
                 end=request.video_end,
                 age=request.speaker_age,

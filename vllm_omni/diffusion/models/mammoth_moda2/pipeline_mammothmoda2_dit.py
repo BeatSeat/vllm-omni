@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -26,6 +27,17 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 logger = init_logger(__name__)
+
+
+def get_mammoth_moda2_post_process_func(
+    _od_config: OmniDiffusionConfig,
+):
+    image_processor = VaeImageProcessor()
+
+    def post_process_func(images: torch.Tensor):
+        return image_processor.postprocess(images)
+
+    return post_process_func
 
 
 def _build_mammoth_config(od_config: OmniDiffusionConfig) -> Mammothmoda2Config:

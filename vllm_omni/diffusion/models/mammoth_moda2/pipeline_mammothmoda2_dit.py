@@ -96,53 +96,98 @@ def _pad_cond_sequence(
     return out, mask
 
 
-def _resolve_grouping_dim(request: OmniDiffusionRequest, name: str) -> int | str:
-    """Best-effort height/width resolution for admission grouping.
+def _validate_request_for_admission(request: OmniDiffusionRequest) -> tuple[int, int, int]:
+    """Validate request at admission time to fail-fast before entering scheduler queue.
 
-    Mirrors ``_parse_request``'s precedence (prompt field, then sampling
-    params, then the 1024 default) but never raises: unparsable values are
-    carried raw into the key so invalid requests still group consistently
-    and fail later at the model boundary.
+    Returns (height, width, num_inference_steps).
     """
-    value = DiffusionRequestBatch.get_prompt_field(request.prompt, name)
-    if value is None:
-        value = getattr(request.sampling_params, name, None)
-    if value is None:
-        return 1024
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return str(value)
+    request_id = request.request_id
+    prompt = request.prompt if isinstance(request.prompt, dict) else {}
+    if not request.is_dummy_run():
+        info = prompt.get("additional_information")
+        if not isinstance(info, dict):
+            raise ValueError(f"Missing additional_information AR conditions for request {request_id}")
+        full_hidden_states = info.get("full_hidden_states")
+        full_token_ids = info.get("full_token_ids")
+        if not isinstance(full_hidden_states, torch.Tensor) or not isinstance(full_token_ids, list):
+            raise ValueError(f"Expected full_hidden_states tensor and full_token_ids list for request {request_id}")
+        try:
+            answer_start_index = int(info.get("answer_start_index"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid answer_start_index for request {request_id}") from exc
+        if full_hidden_states.ndim != 2:
+            raise ValueError(f"Expected 2D full_hidden_states for request {request_id}")
+        if full_hidden_states.shape[0] != len(full_token_ids):
+            raise ValueError(f"AR hidden-state/token-count mismatch for request {request_id}")
+        if not 0 <= answer_start_index <= len(full_token_ids):
+            raise ValueError(f"answer_start_index outside token range for request {request_id}")
+        try:
+            [int(token_id) for token_id in full_token_ids]
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid full_token_ids for request {request_id}") from exc
 
+    sampling = request.sampling_params
+    dimensions = []
+    for name in ("height", "width"):
+        value = DiffusionRequestBatch.get_prompt_field(prompt, name)
+        if value is None and sampling is not None:
+            value = getattr(sampling, name, None)
+        if value is None:
+            value = 1024
+        try:
+            dimensions.append(int(value))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid image size {name}={value!r} for request {request_id}") from exc
+    height, width = dimensions
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid image size: {height}x{width} for request {request_id}")
+    if height % 16 != 0 or width % 16 != 0:
+        raise ValueError(f"Image size must be multiples of 16, got {height}x{width} for request {request_id}")
 
-def _resolve_grouping_steps(request: OmniDiffusionRequest) -> int | str:
-    extra_args = request.sampling_params.extra_args or {}
-    value = extra_args.get("num_inference_steps")
-    if value is None:
-        value = request.sampling_params.num_inference_steps
-    if value is None:
-        return 50
+    extra_args = sampling.extra_args or {} if sampling else {}
+    raw_num_inference_steps = extra_args.get("num_inference_steps")
+    if raw_num_inference_steps is None and sampling:
+        raw_num_inference_steps = sampling.num_inference_steps
+    if raw_num_inference_steps is None:
+        raw_num_inference_steps = 50
     try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return str(value)
+        num_inference_steps = int(raw_num_inference_steps)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Invalid num_inference_steps for request {request_id}") from exc
+    if num_inference_steps <= 0:
+        raise ValueError(f"num_inference_steps must be positive for request {request_id}")
+
+    cfg_range = extra_args.get("cfg_range")
+    if cfg_range is not None:
+        if not isinstance(cfg_range, (list, tuple)) or len(cfg_range) != 2:
+            raise ValueError(f"cfg_range requires two values for request {request_id}")
+        try:
+            cfg_start, cfg_end = float(cfg_range[0]), float(cfg_range[1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"cfg_range requires two values convertible to floats for request {request_id}") from exc
+        if not 0 <= cfg_start <= cfg_end <= 1:
+            raise ValueError(f"cfg_range must satisfy 0 <= start <= end <= 1 for request {request_id}")
+
+    return height, width, num_inference_steps
 
 
 def get_mammoth_moda2_pre_process_func(od_config: OmniDiffusionConfig):
-    """Admission preprocessor: group-key requests that may share a denoise loop.
+    """Admission preprocessor: fail-fast per-request validation and grouping.
 
-    Output geometry and inference steps must be homogeneous within one batched
-    transformer loop; guidance scale, cfg_range, conditioning content and seeds
-    are applied per row and stay out of the key.
+    Validates AR conditions, dimensions, and sampling knobs at admission so
+    malformed requests are rejected individually with their request_id before
+    entering the scheduler queue. Admitted requests are assigned a
+    batch_compatibility_key based on output geometry and inference steps.
     """
     del od_config
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        height, width, num_inference_steps = _validate_request_for_admission(request)
         request.batch_compatibility_key = (
             "mammoth_moda2_dit",
-            _resolve_grouping_dim(request, "height"),
-            _resolve_grouping_dim(request, "width"),
-            _resolve_grouping_steps(request),
+            height,
+            width,
+            num_inference_steps,
         )
         return request
 
@@ -468,10 +513,11 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     def _group_requests(specs: list[_MammothRequest]) -> list[list[int]]:
         """Group request indices that may share one denoise loop.
 
-        Requests are batch-compatible when they share output geometry and
-        inference-step count (identical scheduler timesteps). Guidance scale,
-        cfg_range, conditioning content and seeds may still differ — those are
-        applied per row.
+        Admission grouping guarantees identical (height, width, num_inference_steps)
+        within any scheduled batch. This grouping inside forward() serves as
+        defense-in-depth (e.g. direct runner invocation with heterogeneous requests).
+        Guidance scale, cfg_range, conditioning content and seeds may still differ
+        and are applied per row.
         """
         groups: dict[tuple[int, int, int], list[int]] = {}
         for spec in specs:
@@ -491,12 +537,11 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         generators: list[torch.Generator] = []
         for spec in specs:
             gen = spec.generator[0] if isinstance(spec.generator, list) else spec.generator
-            if gen is None:
-                gen = torch.Generator(device=spec.generator_device or device)
-                if spec.seed is not None:
-                    gen.manual_seed(spec.seed)
-                else:
-                    gen.seed()  # entropy-seeded; keeps unseeded rows off the global stream
+            if gen is None and spec.seed is not None:
+                gen_device = torch.device(spec.generator_device) if spec.generator_device else device
+                gen = torch.Generator(device=gen_device).manual_seed(spec.seed)
+            elif gen is None:
+                gen = torch.Generator(device=device).manual_seed(torch.empty((), dtype=torch.int64).random_().item())
             generators.append(gen)
         return generators
 
@@ -635,7 +680,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             latents = latents / self.gen_vae.config.scaling_factor
         if self.gen_vae.config.shift_factor is not None:
             latents = latents + self.gen_vae.config.shift_factor
-        image = self.gen_vae.decode(latents, return_dict=False)[0]  # [B, C, H, W]
+        vae_dtype = next(self.gen_vae.parameters()).dtype
+        image = self.gen_vae.decode(latents.to(dtype=vae_dtype), return_dict=False)[0]  # [B, C, H, W]
         return [image[i : i + 1] for i in range(batch)]
 
     @torch.inference_mode()

@@ -138,12 +138,8 @@ class F5TTSSelfAttention(nn.Module):
             if self.pe_attn_head is not None:
                 # Partial RoPE: only first pe_attn_head heads
                 rotary_head_count = min(self.pe_attn_head, self.num_heads)
-                query[:, :, :rotary_head_count] = self.rope(
-                    query[:, :, :rotary_head_count], cos, sin
-                )
-                key[:, :, :rotary_head_count] = self.rope(
-                    key[:, :, :rotary_head_count], cos, sin
-                )
+                query[:, :, :rotary_head_count] = self.rope(query[:, :, :rotary_head_count], cos, sin)
+                key[:, :, :rotary_head_count] = self.rope(key[:, :, :rotary_head_count], cos, sin)
             else:
                 query = self.rope(query, cos, sin)
                 key = self.rope(key, cos, sin)
@@ -323,11 +319,19 @@ class TimestepEmbedding(nn.Module):
         # Broken out from nn.Sequential for ReplicatedLinear compatibility.
         # Precision-sensitive (time conditioning) — quant_config=None.
         self.time_mlp_linear1 = ReplicatedLinear(
-            freq_embed_dim, dim, bias=True, return_bias=False, quant_config=None,
+            freq_embed_dim,
+            dim,
+            bias=True,
+            return_bias=False,
+            quant_config=None,
         )
         self.time_mlp_silu = nn.SiLU()
         self.time_mlp_linear2 = ReplicatedLinear(
-            dim, dim, bias=True, return_bias=False, quant_config=None,
+            dim,
+            dim,
+            bias=True,
+            return_bias=False,
+            quant_config=None,
         )
 
     def forward(self, timestep: torch.Tensor):
@@ -347,7 +351,11 @@ class InputEmbedding(nn.Module):
     def __init__(self, mel_dim, text_dim, out_dim, conv_pos_embed_groups=1):
         super().__init__()
         self.proj = ReplicatedLinear(
-            mel_dim * 2 + text_dim, out_dim, bias=True, return_bias=False, quant_config=None,
+            mel_dim * 2 + text_dim,
+            out_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=None,
         )
         self.conv_pos_embed = ConvPositionEmbedding(
             dim=out_dim,
@@ -406,11 +414,16 @@ class F5RoPEPrepare(nn.Module):
         self._cached_len: int = 0
 
     def forward(self, seq_len: int, device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self._cached_len or self._cos is None or (
-            device is not None and self._cos is not None and self._cos.device != device
+        if (
+            seq_len > self._cached_len
+            or self._cos is None
+            or (device is not None and self._cos is not None and self._cos.device != device)
         ):
             self._cos, self._sin = _compute_rope_freqs(
-                seq_len, self.head_dim, self.theta, device=device,
+                seq_len,
+                self.head_dim,
+                self.theta,
+                device=device,
             )
             self._cached_len = seq_len
         return self._cos, self._sin
@@ -453,7 +466,11 @@ class AdaLayerNormZero(nn.Module):
 
         self.silu = nn.SiLU()
         self.linear = ReplicatedLinear(
-            dim, dim * 6, bias=True, return_bias=False, quant_config=None,
+            dim,
+            dim * 6,
+            bias=True,
+            return_bias=False,
+            quant_config=None,
         )
 
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -476,7 +493,11 @@ class AdaLayerNormZero_Final(nn.Module):
 
         self.silu = nn.SiLU()
         self.linear = ReplicatedLinear(
-            dim, dim * 2, bias=True, return_bias=False, quant_config=None,
+            dim,
+            dim * 2,
+            bias=True,
+            return_bias=False,
+            quant_config=None,
         )
 
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -703,12 +724,17 @@ class F5TTSDiTModel(nn.Module):
         )
         self.long_skip_connection = (
             ReplicatedLinear(dim * 2, dim, bias=False, return_bias=False, quant_config=quant_config)
-            if long_skip_connection else None
+            if long_skip_connection
+            else None
         )
 
         self.norm_out = AdaLayerNormZero_Final(dim)  # final modulation
         self.proj_out = ReplicatedLinear(
-            dim, mel_dim, bias=True, return_bias=False, quant_config=None,
+            dim,
+            mel_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=None,
         )
 
     @property

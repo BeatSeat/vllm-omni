@@ -3399,9 +3399,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
                 if async_chunk:
                     non_empty_chunks = [
-                        candidate
-                        for candidate in audio_tensor
-                        if self._audio_value_numel(candidate) > 0
+                        candidate for candidate in audio_tensor if self._audio_value_numel(candidate) > 0
                     ]
                     audio_tensor = (
                         torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
@@ -3545,9 +3543,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 extra["seed"] = request.seed
 
             import copy
-            sampling_params_list = copy.deepcopy(
-                self._diffusion_engine.default_sampling_params_list
-            )
+
+            sampling_params_list = copy.deepcopy(self._diffusion_engine.default_sampling_params_list)
             if request.num_inference_steps is not None:
                 sampling_params_list[0].num_inference_steps = request.num_inference_steps
             if request.guidance_scale is not None:

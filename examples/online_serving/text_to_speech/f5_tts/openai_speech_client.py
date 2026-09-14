@@ -29,10 +29,7 @@ import sys
 import httpx
 
 DEFAULT_API_BASE = "http://localhost:8091"
-REF_AUDIO_URL = (
-    "https://raw.githubusercontent.com/SWivid/F5-TTS/main/"
-    "src/f5_tts/infer/examples/basic/basic_ref_en.wav"
-)
+REF_AUDIO_URL = "https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/infer/examples/basic/basic_ref_en.wav"
 REF_TEXT = "Some call me nature, others call me mother nature."
 
 
@@ -78,10 +75,14 @@ def run(args) -> bool:
 
     try:
         with httpx.Client(timeout=300) as client:
-            resp = client.post(url, json=payload, headers={
-                "Authorization": f"Bearer {args.api_key}",
-                "Content-Type": "application/json",
-            })
+            resp = client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {args.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
         if resp.status_code != 200:
             print(f"Error {resp.status_code}: {resp.text}")
             return False
@@ -99,11 +100,14 @@ def parse_args():
     p.add_argument("--api-base", default=DEFAULT_API_BASE)
     p.add_argument("--api-key", default="EMPTY")
     p.add_argument("--model", default="SWivid/F5-TTS/F5TTS_v1_Base")
-    p.add_argument("--text", default=(
-        "I don't really care what you call me. "
-        "I've been a silent spectator, watching species evolve, "
-        "empires rise and fall. But always, I am here."
-    ))
+    p.add_argument(
+        "--text",
+        default=(
+            "I don't really care what you call me. "
+            "I've been a silent spectator, watching species evolve, "
+            "empires rise and fall. But always, I am here."
+        ),
+    )
     p.add_argument("--ref-audio", default=None, help="Path/URL to reference audio.")
     p.add_argument("--ref-text", default=None, help="Transcript of reference audio.")
     p.add_argument("--num-inference-steps", type=int, default=32)

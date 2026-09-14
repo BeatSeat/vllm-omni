@@ -40,19 +40,18 @@ from vllm_omni.entrypoints.omni import Omni  # noqa: E402
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams  # noqa: E402
 
 MODEL = "SWivid/F5-TTS/F5TTS_v1_Base"
-REF_AUDIO_URL = (
-    "https://raw.githubusercontent.com/SWivid/F5-TTS/main/"
-    "src/f5_tts/infer/examples/basic/basic_ref_en.wav"
-)
+REF_AUDIO_URL = "https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/infer/examples/basic/basic_ref_en.wav"
 REF_TEXT = "Some call me nature, others call me mother nature."
 
 
 def save_audio(audio_data: np.ndarray, path: str, sample_rate: int = 24000) -> None:
     try:
         import soundfile as sf
+
         sf.write(path, audio_data, sample_rate)
     except ImportError:
         import scipy.io.wavfile as wav
+
         if audio_data.dtype in (np.float32, np.float64):
             audio_data = np.clip(audio_data, -1.0, 1.0)
             audio_data = (audio_data * 32767).astype(np.int16)
@@ -169,11 +168,14 @@ def main():
 def parse_args():
     parser = FlexibleArgumentParser(description="F5-TTS offline inference")
     parser.add_argument("--model", default=MODEL)
-    parser.add_argument("--text", default=(
-        "I don't really care what you call me. "
-        "I've been a silent spectator, watching species evolve, "
-        "empires rise and fall. But always, I am here."
-    ))
+    parser.add_argument(
+        "--text",
+        default=(
+            "I don't really care what you call me. "
+            "I've been a silent spectator, watching species evolve, "
+            "empires rise and fall. But always, I am here."
+        ),
+    )
     parser.add_argument("--ref-audio", default=None, help="Path/URL to reference audio.")
     parser.add_argument("--ref-text", default=None, help="Transcript of reference audio.")
     parser.add_argument("--lang", default="en", choices=["en", "zh"])

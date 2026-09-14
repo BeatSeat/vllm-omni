@@ -237,12 +237,15 @@ class F5TTSDiTCUDAGraphWrapper:
             torch.accelerator.synchronize(device)
 
             graph = CUDAGraph()
-            with torch.no_grad(), torch.cuda.graph(
-                graph,
-                pool=current_platform.get_global_graph_pool(),
-                # Keep a failed capture from poisoning global CUDA state for
-                # other capture users (MOSS-TTS / MiniMax-Music3 pattern).
-                capture_error_mode="thread_local",
+            with (
+                torch.no_grad(),
+                torch.cuda.graph(
+                    graph,
+                    pool=current_platform.get_global_graph_pool(),
+                    # Keep a failed capture from poisoning global CUDA state for
+                    # other capture users (MOSS-TTS / MiniMax-Music3 pattern).
+                    capture_error_mode="thread_local",
+                ),
             ):
                 static_output = self._run_eager(
                     noisy_audio=state.noisy_audio,

@@ -17,8 +17,11 @@ import logging
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from pydub import AudioSegment
 
 import numpy as np
 import pybase64 as base64
@@ -248,7 +251,7 @@ def _load_audio_to_np(x: str | bytes | tuple[Any, int]) -> tuple[np.ndarray, int
     return audio.astype(np.float32), int(sr)
 
 
-def _audio_segment_from_np(audio: np.ndarray, sample_rate: int) -> "AudioSegment":
+def _audio_segment_from_np(audio: np.ndarray, sample_rate: int) -> AudioSegment:
     from pydub import AudioSegment
 
     clipped = np.clip(audio, -1.0, 1.0)
@@ -269,7 +272,7 @@ def _audio_segment_to_np(audio: AudioSegment) -> tuple[np.ndarray, int]:
     return (samples / scale).astype(np.float32), int(audio.frame_rate)
 
 
-def _remove_silence_edges(audio: "AudioSegment", silence_threshold_db: float = -42.0) -> "AudioSegment":
+def _remove_silence_edges(audio: AudioSegment, silence_threshold_db: float = -42.0) -> AudioSegment:
     from pydub import silence
 
     non_silent_start_idx = silence.detect_leading_silence(
@@ -331,8 +334,7 @@ def _preprocess_reference_audio(
     aseg = _remove_silence_edges(aseg) + AudioSegment.silent(duration=50)
     if len(aseg) < 100:
         logger.warning(
-            "Reference audio nearly empty (%dms) after silence removal; "
-            "falling back to original audio.",
+            "Reference audio nearly empty (%dms) after silence removal; falling back to original audio.",
             len(aseg),
         )
         aseg = _audio_segment_from_np(audio, sample_rate)
@@ -447,7 +449,6 @@ def _load_vocos_vocoder(*, sample_rate: int, device: str) -> Any:
 
     try:
         from vllm.transformers_utils.repo_utils import hf_api
-
         from vocos import Vocos  # type: ignore[import-untyped]
         from vocos.feature_extractors import EncodecFeatures  # type: ignore[import-untyped]
     except ImportError:

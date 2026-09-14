@@ -346,9 +346,7 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
         # which _can_graph detects at runtime).
         parallel_cfg = getattr(self.od_config, "parallel_config", None)
         if getattr(parallel_cfg, "use_hsdp", False):
-            logger.info_once(
-                "F5-TTS DiT CUDA Graph skipped: use_hsdp=True gathers parameters inside the forward."
-            )
+            logger.info_once("F5-TTS DiT CUDA Graph skipped: use_hsdp=True gathers parameters inside the forward.")
             return
         cache_backend = (self.od_config.cache_backend or "none").lower()
         if cache_backend not in ("", "none") and not self._dit_cudagraph_with_cache:
@@ -711,7 +709,7 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
             changed = False
             for p in prefixes:
                 if name.startswith(p):
-                    name = name[len(p):]
+                    name = name[len(p) :]
                     changed = True
         return name
 
@@ -723,7 +721,8 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
         if isinstance(value, Mapping):
             for nested_name, nested_value in value.items():
                 yield from F5TTSPipeline._iter_checkpoint_tensors(
-                    f"{name}.{nested_name}", nested_value,
+                    f"{name}.{nested_name}",
+                    nested_value,
                 )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -756,7 +755,7 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
                 # F5 checkpoints nest weights under "transformer." but
                 # named_parameters() on the sub-module omits that prefix.
                 if clean.startswith("transformer."):
-                    clean = clean[len("transformer."):]
+                    clean = clean[len("transformer.") :]
                 top = clean.split(".")[0]
                 if top in tf_prefixes:
                     transformer_weights.append((clean, tensor))

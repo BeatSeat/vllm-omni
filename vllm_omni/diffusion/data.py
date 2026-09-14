@@ -1462,10 +1462,12 @@ class OmniDiffusionConfig:
 
         # F5-TTS checkpoints have no standard config; use bespoke discovery.
         if is_f5_model(self.model):
+            assert self.model is not None
             if self.model_class_name is None:
                 self.model_class_name = F5_PIPELINE_CLASS
             tf_config_dict = build_f5_transformer_config(
-                self.model, revision=self.revision,
+                self.model,
+                revision=self.revision,
             )
             self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
             self.update_multimodal_support()

@@ -20,7 +20,6 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.diffusion.models.f5_tts.hf_utils import is_f5_model
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,

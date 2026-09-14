@@ -119,15 +119,16 @@ class AudioMixin:
 
         with BytesIO() as buffer:
             soundfile.write(buffer, audio_tensor, sample_rate, format=soundfile_format, **kwargs)
-            audio_data = buffer.getvalue()
+            audio_bytes = buffer.getvalue()
 
+        output_data: bytes | str = audio_bytes
         if base64_encode:
             import base64
 
-            audio_data = base64.b64encode(audio_data).decode("utf-8")
+            output_data = base64.b64encode(audio_bytes).decode("utf-8")
 
         return AudioResponse(
-            audio_data=audio_data,
+            audio_data=output_data,
             media_type=media_type,
             audio_metadata=AudioChunkMetadata(
                 format=response_format,

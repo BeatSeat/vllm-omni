@@ -5,7 +5,7 @@ F5-TTS is a flow-matching based text-to-speech model that generates high-quality
 ## Supported Models
 
 | Model ID | Vocoder | Notes |
-|----------|---------|-------|
+| ---------- | --------- | ------- |
 | `SWivid/F5-TTS/F5TTS_v1_Base` | Vocos | Recommended default |
 | `SWivid/F5-TTS/F5TTS_v1_Base_no_zero_init` | Vocos | Alternative checkpoint |
 | `SWivid/F5-TTS/F5TTS_Base` | Vocos | Older version, pe_attn_head=1 |
@@ -74,7 +74,7 @@ a speedup. Do not use `cache_backend="tea_cache"` with F5-TTS. See
 ## Key Parameters
 
 | Parameter | Default | Description |
-|-----------|---------|-------------|
+| ----------- | --------- | ------------- |
 | `num_inference_steps` | 32 | ODE solver steps (16 for faster, 32 for quality) |
 | `guidance_scale` | 2.0 | Classifier-free guidance strength |
 | `seed` | None | Random seed for reproducibility |

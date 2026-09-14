@@ -21,10 +21,7 @@ from tests.helpers.runtime import OmniServerParams
 MODEL = "SWivid/F5-TTS/F5TTS_v1_Base"
 
 # F5-TTS official example reference audio
-REF_AUDIO_URL = (
-    "https://raw.githubusercontent.com/SWivid/F5-TTS/main/"
-    "src/f5_tts/infer/examples/basic/basic_ref_en.wav"
-)
+REF_AUDIO_URL = "https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/infer/examples/basic/basic_ref_en.wav"
 REF_TEXT = "Some call me nature, others call me mother nature."
 
 

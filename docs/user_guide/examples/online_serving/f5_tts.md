@@ -60,7 +60,7 @@ EOF
 ## Supported Model Variants
 
 | Model ID | Vocoder |
-|----------|---------|
+| ---------- | --------- |
 | `SWivid/F5-TTS/F5TTS_v1_Base` | Vocos (recommended) |
 | `SWivid/F5-TTS/F5TTS_v1_Base_no_zero_init` | Vocos |
 | `SWivid/F5-TTS/F5TTS_Base` | Vocos |

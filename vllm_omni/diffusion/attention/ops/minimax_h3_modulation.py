@@ -18,6 +18,7 @@ def _iter_row_chunks(rows: int):
 
 def _launch_row_chunks(kernel, rows: int, device_type: str, *args, **kwargs) -> None:
     if device_type != "npu":
+        kwargs.setdefault("enable_fp_fusion", False)
         kernel[(rows,)](*args, 0, **kwargs)
         return
     for row_offset, chunk_rows in _iter_row_chunks(rows):

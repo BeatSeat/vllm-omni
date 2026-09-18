@@ -222,3 +222,22 @@ def test_fused_modulation_matches_pytorch_reference() -> None:
 
     torch.testing.assert_close(actual_residual, ref_residual, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(actual_modulated, ref_modulated, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
+def test_fused_modulation_exact_rounding_regression() -> None:
+    """Exact bit-level rounding regression: without enable_fp_fusion=False,
+    BF16 FMA skips intermediate rounding of gate * branch and differs from
+    PyTorch's unfused sequence."""
+    torch.manual_seed(42)
+    rows, hidden_size, conditions = 32, 1024, 2
+    residual = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(conditions, hidden_size, device="cuda", dtype=torch.bfloat16)
+    branch = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(rows, device="cuda") % conditions
+
+    expected_residual = (residual + gate.index_select(0, indices) * branch).to(torch.bfloat16)
+    actual_residual = indexed_gate(residual, gate, branch, indices)
+    assert torch.equal(actual_residual, expected_residual)

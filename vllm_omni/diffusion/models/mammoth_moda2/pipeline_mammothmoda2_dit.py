@@ -571,11 +571,14 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             # Apply optional refiner ONLY on image condition tokens.
             if image_embeds.shape[1] > 0:
                 image_embeds = self.gen_image_condition_refiner(image_embeds, ~image_mask.bool())
-            refined_mask = torch.ones(image_embeds.shape[:2], dtype=torch.bool, device=image_embeds.device)
-            prompt_embeds, prompt_attention_mask = _pad_cond_sequence(
-                [torch.cat([c.text_embeds, image_embeds[i : i + 1]], dim=1) for i, c in enumerate(conds)],
-                [torch.cat([c.text_mask, refined_mask[i : i + 1]], dim=1) for i, c in enumerate(conds)],
-            )
+            seq_embeds = []
+            seq_masks = []
+            for i, c in enumerate(conds):
+                valid_img_len = c.image_embeds.shape[1]
+                cur_img_embed = image_embeds[i : i + 1, :valid_img_len]
+                seq_embeds.append(torch.cat([c.text_embeds, cur_img_embed], dim=1))
+                seq_masks.append(torch.cat([c.text_mask, c.image_mask], dim=1))
+            prompt_embeds, prompt_attention_mask = _pad_cond_sequence(seq_embeds, seq_masks)
             ar_image_embeds = None
             ar_image_attention_mask = None
         elif nested_image_embedder is not None:
@@ -617,8 +620,17 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         vae_scale_factor = 16
         latent_channels = int(self.gen_transformer.config.in_channels)
         shape = (batch, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
+        single_shape = (1, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
         generators = self._make_latent_generators(specs, model_device)
-        latents = randn_tensor(shape, generator=generators, device=model_device, dtype=target_dtype)
+        if generators is not None:
+            noise_list = []
+            for gen in generators:
+                gen_device = gen.device if hasattr(gen, "device") else model_device
+                n = randn_tensor(single_shape, generator=gen, device=gen_device, dtype=target_dtype)
+                noise_list.append(n.to(device=model_device))
+            latents = torch.cat(noise_list, dim=0)
+        else:
+            latents = randn_tensor(shape, device=model_device, dtype=target_dtype)
 
         scheduler = FlowMatchEulerDiscreteScheduler()
         scheduler.set_timesteps(
@@ -634,8 +646,22 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         ).view(batch, 1, 1, 1)
         cfg_specs = [(s.text_guidance_scale > 1.0, float(s.cfg_range[0]), float(s.cfg_range[1])) for s in specs]
 
-        # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
+        # Precompute mixed-CFG active masks across timesteps to avoid CPU list
+        # comprehensions and H2D copies in the step loop.
         total_steps = max(1, len(scheduler.timesteps))
+        precomputed_active_masks = None
+        all_active_per_step = None
+        if needs_uncond:
+            precomputed_active_masks = torch.empty((total_steps, batch, 1, 1, 1), device=model_device, dtype=torch.bool)
+            all_active_per_step = []
+            for step_idx in range(total_steps):
+                frac = step_idx / total_steps
+                step_mask = [is_active and (lo <= frac <= hi) for is_active, lo, hi in cfg_specs]
+                all_active_per_step.append(all(step_mask))
+                mask_t = torch.tensor(step_mask, device=model_device, dtype=torch.bool)
+                precomputed_active_masks[step_idx] = mask_t.view(batch, 1, 1, 1)
+
+        # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
         for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(batch).to(latents.dtype)
             model_pred = self.gen_transformer(
@@ -648,10 +674,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 ar_image_attention_mask=ar_image_attention_mask,
                 freqs_cis=self.gen_freqs_cis,
             )
-            if needs_uncond:
-                frac = i / total_steps
-                active_mask = [is_active and (lo <= frac <= hi) for is_active, lo, hi in cfg_specs]
-                if any(active_mask):
+            if needs_uncond and precomputed_active_masks is not None:
+                active_tensor = precomputed_active_masks[i]
+                if active_tensor.any():
                     model_pred_uncond = self.gen_transformer(
                         hidden_states=latents,
                         timestep=timestep,
@@ -661,16 +686,13 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                         freqs_cis=self.gen_freqs_cis,
                     )
                     blended = model_pred_uncond + scale_vec * (model_pred - model_pred_uncond)
-                    if all(active_mask):
+                    if all_active_per_step[i]:
                         # Fast path: all requests in the batch are active.
                         model_pred = blended
                     else:
                         # Inactive rows keep their conditional prediction exactly:
                         # gating the blend with torch.where avoids propagating
                         # uncond-branch NaN/rounding into CFG-free rows.
-                        active_tensor = torch.tensor(active_mask, device=model_device, dtype=torch.bool).view(
-                            batch, 1, 1, 1
-                        )
                         model_pred = torch.where(active_tensor, blended, model_pred)
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=target_dtype)

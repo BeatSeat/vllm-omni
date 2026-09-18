@@ -36,11 +36,12 @@ from vllm_omni.diffusion.models.f5_tts.text_utils import (
     Tokenizer,
     estimate_duration,
     load_tokenizer,
-    pad_and_batch,
+    pad_and_batch_items,
     process_text,
 )
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
@@ -147,8 +148,8 @@ def _resolve_request_value(
     value = primary if primary is not None else fallback
     if value is None:
         return default
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else default
+    if isinstance(value, list):
+        return value[0] if len(value) == 1 else default
     return value
 
 
@@ -175,6 +176,7 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
     """
 
     support_audio_output = True
+    supports_request_batch = True
 
     # Default Euler steps when the request does not set num_inference_steps.
     # Exposed for the runner's per-request cache refresh
@@ -438,7 +440,7 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
         sway_sampling_coef: float | None = None,
         use_epss: bool = True,
         drop_ref_audio: bool = False,
-        generator: torch.Generator | None = None,
+        generator: torch.Generator | list[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """
         Generate mel spectrogram via Euler ODE sampling with flow-matching.
@@ -456,7 +458,7 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
                 ``None`` disables sway sampling.
             use_epss: Whether to use EPSS timestep schedule.
             drop_ref_audio: If ``True``, zero out reference audio (unconditional).
-            generator: Optional torch Generator for reproducible noise.
+            generator: Optional torch Generator (or list of generators) for reproducible noise.
 
         Returns:
             Mel spectrogram ``[B, T, D]``.
@@ -517,18 +519,30 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
                 cfg_normalize=False,
             )
 
-        # Ensure generator lives on the target device.
-        if generator is not None and generator.device != device:
-            seed = generator.initial_seed()
-            generator = torch.Generator(device=device).manual_seed(seed)
-
         # Initial noise
-        y0 = torch.randn(
-            step_cond_audio.shape,
-            dtype=step_cond_audio.dtype,
-            device=device,
-            generator=generator,
-        )
+        if isinstance(generator, list):
+            y0 = torch.empty(step_cond_audio.shape, dtype=step_cond_audio.dtype, device=device)
+            for i, gen in enumerate(generator):
+                g = gen
+                if g is not None and g.device != device:
+                    seed = g.initial_seed()
+                    g = torch.Generator(device=device).manual_seed(seed)
+                y0[i] = torch.randn(
+                    step_cond_audio.shape[1:],
+                    dtype=step_cond_audio.dtype,
+                    device=device,
+                    generator=g,
+                )
+        else:
+            if generator is not None and generator.device != device:
+                seed = generator.initial_seed()
+                generator = torch.Generator(device=device).manual_seed(seed)
+            y0 = torch.randn(
+                step_cond_audio.shape,
+                dtype=step_cond_audio.dtype,
+                device=device,
+                generator=generator,
+            )
 
         # Timestep schedule
         if use_epss:
@@ -547,128 +561,136 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
 
         return self._denormalize_mel(out)
 
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(
+        self,
+        req: DiffusionRequestBatch | OmniDiffusionRequest,
+    ) -> list[DiffusionOutput] | DiffusionOutput:
         """
-        Generate audio waveform from an OmniDiffusionRequest.
+        Generate audio waveform from an OmniDiffusionRequest or DiffusionRequestBatch.
 
         This is the sole entry point, called by the vLLM-Omni framework
         (``DiffusionModelRunner.execute_model`` -> ``pipeline.forward``).
 
         The full pipeline is:
 
-        1.  Extract data from the request.
+        1.  Extract data from request(s).
         2.  Audio preprocessing (mel extraction and RMS normalization).
         3.  Text preprocessing (tokenization, duration estimation).
-        4.  Flow-matching sampling (Euler ODE with EPSS / sway / CFG).
-        5.  Vocoder decoding (mel -> waveform).
-
-        Expected prompt format::
-
-            prompts = [{
-                "prompt": "<target text to synthesize>",
-                "additional_information": {
-                    "cond_text": "<transcript of conditioning audio>",
-                    "ref_audio": <conditioning audio bytes>,
-                    "lang": "<ISO language code>",
-                },
-            }]
-
-        TTS-specific parameters (via ``req.sampling_params.extra_args``):
-            speed (float): Speed factor (default 1.0).
-            target_rms (float | None): RMS normalization target (default 0.1).
-            sway_sampling_coef (float | None): Sway coefficient (default -1.0).
-            use_epss (bool): Use EPSS schedule (default True).
-            drop_ref_audio (bool): Drop reference audio (default False).
-
-        Returns:
-            DiffusionOutput containing the generated audio waveform.
+        4.  Batched flow-matching sampling (Euler ODE with EPSS / sway / CFG).
+        5.  Per-request vocoder decoding (mel -> waveform).
         """
         device = self.device
-        extra = req.sampling_params.extra_args if hasattr(req.sampling_params, "extra_args") else {}
-
-        # Extract data from request prompts
-        prompt_data = req.prompts[0] if req.prompts else {}
-
-        if isinstance(prompt_data, str):
-            target_text = prompt_data
-            cond_audio_raw = None
-            cond_text_str = ""
-            lang = "en"
-        else:
-            target_text = prompt_data.get("prompt", "")
-            additional = prompt_data.get("additional_information") or {}
-            cond_text_str = _resolve_request_value(
-                additional.get("ref_text"),
-                additional.get("cond_text", extra.get("ref_text", extra.get("cond_text"))),
-                default="",
-            )
-            cond_audio_raw = _resolve_request_value(
-                additional.get("ref_audio"),
-                extra.get("ref_audio"),
-                default=None,
-            )
-            lang = _resolve_request_value(
-                additional.get("lang"),
-                extra.get("lang"),
-                default="en",
-            )
-
-            cond_text_str = str(cond_text_str) if cond_text_str is not None else ""
-            lang = str(lang) if lang is not None else "en"
-
-        if cond_audio_raw is None:
-            # No conditioning audio (e.g. warmup dummy run)
-            logger.warning("No conditioning audio provided in request; returning empty DiffusionOutput.")
-            return DiffusionOutput(output=torch.zeros(1, 1, 1, device=device))
-
         if self._mel_spec is None or self._tokenizer is None or self._vocoder is None:
             raise RuntimeError("Required components (mel_spec, tokenizer, vocoder) are not initialized.")
 
-        speed = extra.get("speed", 1.0)
-        target_rms = extra.get("target_rms", 0.1)
+        is_batch = isinstance(req, DiffusionRequestBatch)
+        reqs: list[OmniDiffusionRequest] = req.requests if is_batch else [req]
+        if not reqs:
+            return [] if is_batch else DiffusionOutput(output=torch.zeros(1, 1, 1, device=device))
 
-        # Audio preprocessing
-        cond_mel, cond_rms = process_audio(
-            cond_audio_raw,
-            mel_spec=self._mel_spec,
-            target_rms=target_rms,
-        )
+        cond_mel_list: list[torch.Tensor] = []
+        cond_rms_list: list[float] = []
+        target_rms_list: list[float | None] = []
+        token_ids_list: list[list[int]] = []
+        total_mel_lens: list[int] = []
+        generators: list[torch.Generator | None] = []
 
-        # Text preprocessing
-        cond_text_str, target_text = process_text(cond_text_str, target_text, lang)
-        text_token_ids = self._tokenizer.encode(cond_text_str + target_text, lang=lang)
+        for r in reqs:
+            extra = (
+                r.sampling_params.extra_args
+                if hasattr(r.sampling_params, "extra_args") and r.sampling_params.extra_args
+                else {}
+            )
+            prompt_data = r.prompt
+            if isinstance(prompt_data, str):
+                target_text = prompt_data
+                cond_audio_raw = None
+                cond_text_str = ""
+                lang = "en"
+            else:
+                target_text = prompt_data.get("prompt", "")
+                additional = prompt_data.get("additional_information") or {}
+                cond_text_str = _resolve_request_value(
+                    additional.get("ref_text"),
+                    additional.get("cond_text", extra.get("ref_text", extra.get("cond_text"))),
+                    default="",
+                )
+                cond_audio_raw = _resolve_request_value(
+                    additional.get("ref_audio"),
+                    extra.get("ref_audio"),
+                    default=None,
+                )
+                lang = _resolve_request_value(
+                    additional.get("lang"),
+                    extra.get("lang"),
+                    default="en",
+                )
+                cond_text_str = str(cond_text_str) if cond_text_str is not None else ""
+                lang = str(lang) if lang is not None else "en"
 
-        cond_mel_len = cond_mel.shape[0]
-        total_mel_len = estimate_duration(cond_mel_len, cond_text_str, target_text, speed)
-        total_mel_len = max(total_mel_len, len(text_token_ids), cond_mel_len) + 1
+            if cond_audio_raw is None:
+                # No conditioning audio (e.g. warmup dummy run)
+                logger.warning("No conditioning audio provided in request; returning empty DiffusionOutput.")
+                empty_res = [DiffusionOutput(output=torch.zeros(1, 1, 1, device=device)) for _ in reqs]
+                return empty_res if is_batch else empty_res[0]
 
-        assert len(text_token_ids) <= total_mel_len, (
-            f"number of text tokens ({len(text_token_ids)}) must be <= number of mel frames ({total_mel_len})"
-        )
+            speed = extra.get("speed", 1.0)
+            target_rms = extra.get("target_rms", 0.1)
+
+            # Audio preprocessing
+            cond_mel, cond_rms = process_audio(
+                cond_audio_raw,
+                mel_spec=self._mel_spec,
+                target_rms=target_rms,
+            )
+
+            # Text preprocessing
+            cond_text_str, target_text = process_text(cond_text_str, target_text, lang)
+            text_token_ids = self._tokenizer.encode(cond_text_str + target_text, lang=lang)
+
+            cond_mel_len = cond_mel.shape[0]
+            total_mel_len = estimate_duration(cond_mel_len, cond_text_str, target_text, speed)
+            total_mel_len = max(total_mel_len, len(text_token_ids), cond_mel_len) + 1
+            if total_mel_len > 8192:
+                raise ValueError(
+                    f"Requested sequence duration ({total_mel_len} mel frames) exceeds "
+                    f"maximum supported limit of 8192 frames"
+                )
+
+            assert len(text_token_ids) <= total_mel_len, (
+                f"number of text tokens ({len(text_token_ids)}) must be <= number of mel frames ({total_mel_len})"
+            )
+
+            cond_mel_list.append(cond_mel)
+            cond_rms_list.append(cond_rms)
+            target_rms_list.append(target_rms)
+            token_ids_list.append(text_token_ids)
+            total_mel_lens.append(total_mel_len)
+
+            gen = r.sampling_params.generator
+            if gen is None and r.sampling_params.seed is not None:
+                gen = torch.Generator(device=device).manual_seed(r.sampling_params.seed)
+            generators.append(gen)
 
         # Padding and batching
-        cond_audio, cond_text_tensor, seq_len, _ = pad_and_batch(cond_mel, text_token_ids, total_mel_len)
-        # Batch-size-1 F5 inference runs without a padding mask to match F5-TTS.
-        # In that mode the model can emit meaningful speech into the quantized tail,
-        # so decoding only up to the heuristic `total_mel_len` can cut words off.
-        effective_total_mel_len = seq_len if cond_audio.shape[0] == 1 else total_mel_len
+        items = list(zip(cond_mel_list, token_ids_list, total_mel_lens))
+        cond_audio, cond_text_tensor, seq_len, effective_lens, cond_mel_lens, _ = pad_and_batch_items(
+            items, pad_multiple=64
+        )
 
         cond_audio = cond_audio.to(device)
         cond_text_tensor = cond_text_tensor.to(device)
-        cond_audio_lens = torch.tensor([cond_mel_len], device=device)
-        sample_lens = torch.tensor([effective_total_mel_len], device=device)
+        cond_audio_lens = torch.tensor(cond_mel_lens, device=device, dtype=torch.long)
+        sample_lens = torch.tensor(effective_lens, device=device, dtype=torch.long)
 
-        # Sampling parameters
-        steps = req.sampling_params.num_inference_steps or self.default_num_inference_steps
-        cfg_strength = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else 2.0
-        sway_sampling_coef = extra.get("sway_sampling_coef", -1.0)
-        use_epss = extra.get("use_epss", True)
-        drop_ref_audio = extra.get("drop_ref_audio", False)
-
-        # Generator for reproducibility
-        generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+        # Sampling parameters from first request (or common params)
+        primary_sp = reqs[0].sampling_params
+        primary_extra = primary_sp.extra_args if hasattr(primary_sp, "extra_args") and primary_sp.extra_args else {}
+        steps = primary_sp.num_inference_steps or self.default_num_inference_steps
+        cfg_strength = primary_sp.guidance_scale if primary_sp.guidance_scale_provided else 2.0
+        sway_sampling_coef = primary_extra.get("sway_sampling_coef", -1.0)
+        use_epss = primary_extra.get("use_epss", True)
+        drop_ref_audio = primary_extra.get("drop_ref_audio", False)
 
         # Flow-matching sampling
         mel_out = self.sample(
@@ -681,24 +703,24 @@ class F5TTSPipeline(nn.Module, CFGParallelMixin, SupportAudioOutput):
             sway_sampling_coef=sway_sampling_coef,
             use_epss=use_epss,
             drop_ref_audio=drop_ref_audio,
-            generator=generator,
+            generator=generators if any(g is not None for g in generators) else None,
         )
 
-        # Vocoder decoding (mel -> waveform)
-        # Slice out only the generated portion (exclude conditioning region)
-        gen_mel = mel_out[:, cond_mel_len:effective_total_mel_len, :]
+        # Vocoder decoding (mel -> waveform) per request
+        outputs: list[DiffusionOutput] = []
+        for i in range(len(reqs)):
+            c_len = cond_mel_lens[i]
+            eff_len = effective_lens[i]
+            gen_mel = mel_out[i : i + 1, c_len:eff_len, :]
+            gen_mel = gen_mel.permute(0, 2, 1)
+            audio = run_vocoder(gen_mel, self._vocoder, self._vocoder_name)
+            c_rms = cond_rms_list[i]
+            t_rms = target_rms_list[i]
+            if t_rms is not None and c_rms < t_rms:
+                audio = audio * c_rms / t_rms
+            outputs.append(DiffusionOutput(output=audio))
 
-        # Permute for vocoder: [B, T, D] -> [B, D, T]
-        gen_mel = gen_mel.permute(0, 2, 1)
-
-        # Run vocoder
-        audio = run_vocoder(gen_mel, self._vocoder, self._vocoder_name)
-
-        # RMS rescaling: if we scaled up the input, scale down the output
-        if target_rms is not None and cond_rms < target_rms:
-            audio = audio * cond_rms / target_rms
-
-        return DiffusionOutput(output=audio)
+        return outputs if is_batch else outputs[0]
 
     @staticmethod
     def _strip_ema_prefix(name: str) -> str:

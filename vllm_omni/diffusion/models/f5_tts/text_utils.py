@@ -345,6 +345,60 @@ def quantize(x: int, mul: int = 64) -> int:
     return math.ceil(x / mul) * mul
 
 
+def pad_and_batch_items(
+    items: list[tuple[torch.Tensor, list[int], int]],
+    *,
+    pad_multiple: int = 64,
+    text_pad_value: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor, int, list[int], list[int], list[int]]:
+    """Pad multiple (cond_mel, text_token_ids, total_mel_len) items to a shared
+    quantized sequence length and stack into batch tensors.
+
+    Args:
+        items: List of (cond_mel [T_cond, D], text_token_ids, total_mel_len).
+        pad_multiple: Pad to nearest multiple of this value.
+        text_pad_value: Padding value for text tokens (default -1).
+
+    Returns:
+        tuple: A tuple containing (cond_audio, cond_text, seq_len,
+            effective_lens, cond_mel_lens, total_mel_lens) where cond_audio
+            has shape [B, seq_len, D] and cond_text has shape [B, seq_len].
+    """
+    if not items:
+        raise ValueError("items cannot be empty")
+
+    batch_size = len(items)
+    device = items[0][0].device
+    dtype = items[0][0].dtype
+    mel_dim = items[0][0].shape[1]
+
+    cond_mel_lens = [item[0].shape[0] for item in items]
+    total_mel_lens = [item[2] for item in items]
+
+    max_total_mel_len = max(total_mel_lens)
+    seq_len = quantize(max_total_mel_len, pad_multiple)
+
+    # Effective length: for B=1, match upstream single-item behavior where
+    # effective length extends to quantized seq_len; for B>1, use total_mel_lens.
+    if batch_size == 1:
+        effective_lens = [seq_len]
+    else:
+        effective_lens = [min(t, seq_len) for t in total_mel_lens]
+
+    cond_audio = torch.zeros(batch_size, seq_len, mel_dim, dtype=dtype, device=device)
+    cond_text = torch.full((batch_size, seq_len), fill_value=text_pad_value, dtype=torch.long, device=device)
+
+    for i, (cond_mel, text_ids, _) in enumerate(items):
+        c_len = min(cond_mel.shape[0], seq_len)
+        cond_audio[i, :c_len] = cond_mel[:c_len]
+
+        t_len = min(len(text_ids), seq_len)
+        if t_len > 0:
+            cond_text[i, :t_len] = torch.tensor(text_ids[:t_len], dtype=torch.long, device=device)
+
+    return cond_audio, cond_text, seq_len, effective_lens, cond_mel_lens, total_mel_lens
+
+
 def pad_and_batch(
     cond_mel: torch.Tensor,
     text_token_ids: list[int],
@@ -359,7 +413,7 @@ def pad_and_batch(
 
     Args:
         cond_mel: Conditioning mel ``[T_cond, D]``.
-        text_token_ids: Token ID list (len ≤ total_mel_len).
+        text_token_ids: Token ID list (len <= total_mel_len).
         total_mel_len: Target total mel length (before quantization).
         pad_multiple: Pad to nearest multiple of this value.
         text_pad_value: Padding value for text tokens (default -1,
@@ -370,36 +424,14 @@ def pad_and_batch(
         where ``cond_audio`` is ``[1, seq_len, D]`` and
         ``cond_text`` is ``[1, seq_len]``.
     """
-    cond_mel_len = cond_mel.shape[0]
-    mel_dim = cond_mel.shape[1]
-    seq_len = quantize(total_mel_len, pad_multiple)
-
-    assert len(text_token_ids) <= total_mel_len, (
-        f"number of text tokens ({len(text_token_ids)}) must be <= number of mel frames ({total_mel_len})"
+    cond_audio, cond_text, seq_len, _, cond_mel_lens, _ = pad_and_batch_items(
+        [(cond_mel, text_token_ids, total_mel_len)],
+        pad_multiple=pad_multiple,
+        text_pad_value=text_pad_value,
     )
-
-    # Pad mel: [T_cond, D] -> [seq_len, D]
-    mel_pad_len = seq_len - cond_mel_len
-    if mel_pad_len > 0:
-        padded_mel = torch.zeros(seq_len, mel_dim, dtype=cond_mel.dtype, device=cond_mel.device)
-        padded_mel[:cond_mel_len] = cond_mel
-    else:
-        padded_mel = cond_mel[:seq_len]
-
-    # Pad text: list -> [seq_len]
-    text_tensor = torch.full(
-        (seq_len,),
-        fill_value=text_pad_value,
-        dtype=torch.long,
-        device=cond_mel.device,
-    )
-    token_len = min(len(text_token_ids), seq_len)
-    text_tensor[:token_len] = torch.tensor(text_token_ids[:token_len], dtype=torch.long)
-
-    # Add batch dimension
     return (
-        padded_mel.unsqueeze(0),  # [1, seq_len, D]
-        text_tensor.unsqueeze(0),  # [1, seq_len]
+        cond_audio,
+        cond_text,
         seq_len,
-        cond_mel_len,
+        cond_mel_lens[0],
     )

@@ -19,7 +19,7 @@ trust_remote_code: true
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    max_num_seqs: 4
     gpu_memory_utilization: 0.85
     # Keeps the in-stage vLLM engine eager; orthogonal to the F5 DiT CUDA
     # Graph replay below, which is a pipeline-owned capture of the DiT hot

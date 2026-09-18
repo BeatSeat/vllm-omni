@@ -380,6 +380,8 @@ def process_audio(
 
     # RMS normalization
     audio_rms = torch.sqrt(torch.mean(torch.square(audio))).item()
+    if audio_rms < 1e-6:
+        raise ValueError("Reference audio is completely silent or below measurable threshold")
     if target_rms is not None and audio_rms < target_rms:
         audio = audio * target_rms / audio_rms
 

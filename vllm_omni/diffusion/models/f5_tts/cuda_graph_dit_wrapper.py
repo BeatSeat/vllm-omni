@@ -40,6 +40,7 @@ class _GraphKey:
     batch: int
     seq_len: int
     mel_dim: int
+    has_mask: bool
 
 
 @dataclass
@@ -51,6 +52,7 @@ class _GraphState:
     drop_audio_mask: torch.Tensor
     drop_text_mask: torch.Tensor
     output: torch.Tensor
+    mask: torch.Tensor | None = None
     # Assigned right after successful capture; ``None`` on the pre-capture
     # placeholder so a failed capture leaves no half-built CUDAGraph alive.
     graph: CUDAGraph | None = None
@@ -110,6 +112,10 @@ class F5TTSDiTCUDAGraphWrapper:
     def _masks_compatible(mask: torch.Tensor | None, batch: int, device: torch.device) -> bool:
         return mask is None or (mask.dtype == torch.bool and mask.shape == (batch,) and mask.device == device)
 
+    @staticmethod
+    def _mask_compatible(mask: torch.Tensor | None, batch: int, seq_len: int, device: torch.device) -> bool:
+        return mask is None or (mask.dtype == torch.bool and mask.shape == (batch, seq_len) and mask.device == device)
+
     def _can_graph(
         self,
         noisy_audio: torch.Tensor,
@@ -126,7 +132,6 @@ class F5TTSDiTCUDAGraphWrapper:
             or noisy_audio.device.type != "cuda"
             or self.transformer.training
             or torch.cuda.is_current_stream_capturing()
-            or mask is not None
             or rotary_embedding is not None
             # RowParallelLinear issues TP collectives inside the forward —
             # manual graph capture without vLLM's capture-aware all-reduce
@@ -139,6 +144,8 @@ class F5TTSDiTCUDAGraphWrapper:
             or (timestep.ndim == 1 and timestep.shape[0] != noisy_audio.shape[0])
         ):
             return False
+        if not self._mask_compatible(mask, noisy_audio.shape[0], noisy_audio.shape[1], noisy_audio.device):
+            return False
         if not self._masks_compatible(drop_audio_mask, noisy_audio.shape[0], noisy_audio.device):
             return False
         if not self._masks_compatible(drop_text_mask, noisy_audio.shape[0], noisy_audio.device):
@@ -150,6 +157,7 @@ class F5TTSDiTCUDAGraphWrapper:
         noisy_audio: torch.Tensor,
         cond_text: torch.Tensor,
         timestep: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> _GraphKey:
         # _can_graph() already guaranteed a CUDA tensor, whose device index is
         # always concrete; get_device() returns the ordinal without touching
@@ -163,6 +171,7 @@ class F5TTSDiTCUDAGraphWrapper:
             int(noisy_audio.shape[0]),
             int(noisy_audio.shape[1]),
             int(noisy_audio.shape[2]),
+            bool(mask is not None),
         )
 
     def _copy_inputs(
@@ -172,13 +181,16 @@ class F5TTSDiTCUDAGraphWrapper:
         cond_audio: torch.Tensor,
         cond_text: torch.Tensor,
         timestep: torch.Tensor,
-        drop_audio_mask: torch.Tensor | None,
-        drop_text_mask: torch.Tensor | None,
+        mask: torch.Tensor | None = None,
+        drop_audio_mask: torch.Tensor | None = None,
+        drop_text_mask: torch.Tensor | None = None,
     ) -> None:
         state.noisy_audio.copy_(noisy_audio)
         state.cond_audio.copy_(cond_audio)
         state.cond_text.copy_(cond_text)
         state.timestep.copy_(timestep.expand_as(state.timestep) if timestep.ndim == 0 else timestep)
+        if state.mask is not None and mask is not None:
+            state.mask.copy_(mask)
         if drop_audio_mask is None:
             state.drop_audio_mask.fill_(False)
         else:
@@ -195,8 +207,9 @@ class F5TTSDiTCUDAGraphWrapper:
         cond_audio: torch.Tensor,
         cond_text: torch.Tensor,
         timestep: torch.Tensor,
-        drop_audio_mask: torch.Tensor | None,
-        drop_text_mask: torch.Tensor | None,
+        mask: torch.Tensor | None = None,
+        drop_audio_mask: torch.Tensor | None = None,
+        drop_text_mask: torch.Tensor | None = None,
     ) -> _GraphState | None:
         if len(self.graphs) >= self.max_graphs:
             logger.warning_once("F5-TTS DiT CUDA Graph max_graphs=%d reached; using eager", self.max_graphs)
@@ -204,7 +217,9 @@ class F5TTSDiTCUDAGraphWrapper:
 
         try:
             batch = noisy_audio.shape[0]
+            seq_len = noisy_audio.shape[1]
             device = noisy_audio.device
+            static_mask = torch.empty((batch, seq_len), device=device, dtype=torch.bool) if mask is not None else None
             state = _GraphState(
                 noisy_audio=torch.empty_like(noisy_audio),
                 cond_audio=torch.empty_like(cond_audio),
@@ -213,8 +228,18 @@ class F5TTSDiTCUDAGraphWrapper:
                 drop_audio_mask=torch.empty((batch,), device=device, dtype=torch.bool),
                 drop_text_mask=torch.empty((batch,), device=device, dtype=torch.bool),
                 output=torch.empty_like(noisy_audio),
+                mask=static_mask,
             )
-            self._copy_inputs(state, noisy_audio, cond_audio, cond_text, timestep, drop_audio_mask, drop_text_mask)
+            self._copy_inputs(
+                state,
+                noisy_audio,
+                cond_audio,
+                cond_text,
+                timestep,
+                mask=mask,
+                drop_audio_mask=drop_audio_mask,
+                drop_text_mask=drop_text_mask,
+            )
 
             with torch.no_grad():
                 # Side-stream warmup (MOSS-TTS codec/decoder pattern): run a
@@ -230,6 +255,7 @@ class F5TTSDiTCUDAGraphWrapper:
                             cond_audio=state.cond_audio,
                             cond_text=state.cond_text,
                             timestep=state.timestep,
+                            mask=state.mask,
                             drop_audio_mask=state.drop_audio_mask,
                             drop_text_mask=state.drop_text_mask,
                         )
@@ -252,6 +278,7 @@ class F5TTSDiTCUDAGraphWrapper:
                     cond_audio=state.cond_audio,
                     cond_text=state.cond_text,
                     timestep=state.timestep,
+                    mask=state.mask,
                     drop_audio_mask=state.drop_audio_mask,
                     drop_text_mask=state.drop_text_mask,
                 )
@@ -292,10 +319,19 @@ class F5TTSDiTCUDAGraphWrapper:
                 rotary_embedding=rotary_embedding,
             )
 
-        key = self._make_key(noisy_audio, cond_text, timestep)
+        key = self._make_key(noisy_audio, cond_text, timestep, mask=mask)
         state = None if key in self.disabled_keys else self.graphs.get(key)
         if state is None and key not in self.disabled_keys:
-            state = self._capture(key, noisy_audio, cond_audio, cond_text, timestep, drop_audio_mask, drop_text_mask)
+            state = self._capture(
+                key,
+                noisy_audio,
+                cond_audio,
+                cond_text,
+                timestep,
+                mask=mask,
+                drop_audio_mask=drop_audio_mask,
+                drop_text_mask=drop_text_mask,
+            )
         if state is None:
             return self._run_eager(
                 noisy_audio=noisy_audio,
@@ -309,7 +345,16 @@ class F5TTSDiTCUDAGraphWrapper:
             )
 
         try:
-            self._copy_inputs(state, noisy_audio, cond_audio, cond_text, timestep, drop_audio_mask, drop_text_mask)
+            self._copy_inputs(
+                state,
+                noisy_audio,
+                cond_audio,
+                cond_text,
+                timestep,
+                mask=mask,
+                drop_audio_mask=drop_audio_mask,
+                drop_text_mask=drop_text_mask,
+            )
         except Exception:
             logger.warning("F5-TTS DiT CUDA Graph input copy failed; using eager", exc_info=True)
             self.disabled_keys.add(key)

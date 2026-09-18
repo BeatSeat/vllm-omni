@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from cache_dit import ForwardPattern
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -31,6 +32,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.layers.ops.gated_residual import gated_residual
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 if TYPE_CHECKING:
@@ -136,10 +138,13 @@ class F5TTSSelfAttention(nn.Module):
             cos = cos.to(device=query.device, dtype=query.dtype)
             sin = sin.to(device=query.device, dtype=query.dtype)
             if self.pe_attn_head is not None:
-                # Partial RoPE: only first pe_attn_head heads
-                rotary_head_count = min(self.pe_attn_head, self.num_heads)
-                query[:, :, :rotary_head_count] = self.rope(query[:, :, :rotary_head_count], cos, sin)
-                key[:, :, :rotary_head_count] = self.rope(key[:, :, :rotary_head_count], cos, sin)
+                # Partial RoPE: only global heads 0 .. pe_attn_head - 1
+                tp_rank = get_tensor_model_parallel_rank()
+                head_start = tp_rank * self.num_heads
+                rotary_head_count = max(0, min(self.num_heads, self.pe_attn_head - head_start))
+                if rotary_head_count > 0:
+                    query[:, :, :rotary_head_count] = self.rope(query[:, :, :rotary_head_count], cos, sin)
+                    key[:, :, :rotary_head_count] = self.rope(key[:, :, :rotary_head_count], cos, sin)
             else:
                 query = self.rope(query, cos, sin)
                 key = self.rope(key, cos, sin)
@@ -257,7 +262,7 @@ class TextEmbedding(nn.Module):
         valid_pos_mask = None
         if torch.is_tensor(audio_seq_len):
             audio_seq_len = audio_seq_len.to(device=text.device, dtype=torch.long)
-            max_seq_len = int(audio_seq_len.max().item())
+            max_seq_len = text.shape[1]
         else:
             max_seq_len = int(audio_seq_len)
 
@@ -598,11 +603,11 @@ class DiTBlock(nn.Module):
         attn_output = self.attn(norm, rope, mask)
 
         # process attention output for input x
-        noisy_audio = noisy_audio + gate_msa.unsqueeze(1) * attn_output
+        noisy_audio = gated_residual(noisy_audio, attn_output, gate_msa.unsqueeze(1))
 
         norm = self.ff_norm(noisy_audio) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         ff_output = self.ff(norm)
-        noisy_audio = noisy_audio + gate_mlp.unsqueeze(1) * ff_output
+        noisy_audio = gated_residual(noisy_audio, ff_output, gate_mlp.unsqueeze(1))
 
         return noisy_audio
 

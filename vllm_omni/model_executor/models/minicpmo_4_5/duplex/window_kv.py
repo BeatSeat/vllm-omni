@@ -349,6 +349,8 @@ def assert_uniform_position_shift(positions: torch.Tensor, moved_from: int) -> N
     caller must re-prefill that session instead. Duplex audio and text advance
     every row together, so the streaming tail satisfies this.
     """
+    if positions.dim() == 1:
+        return
     if positions.dim() != 2:
         raise ValueError(f"expected a (rows, tokens) position tensor, got {tuple(positions.shape)}")
     tail = positions[:, int(moved_from) :]
@@ -374,9 +376,12 @@ def rotate_keys(keys: torch.Tensor, delta: int, inv_freq: torch.Tensor) -> torch
     half = keys.shape[-1] // 2
     if inv_freq.numel() != half:
         raise ValueError(f"expected {half} RoPE frequencies for head_dim={keys.shape[-1]}, got {inv_freq.numel()}")
-    angle = (int(delta) * inv_freq).to(device=keys.device, dtype=keys.dtype)
-    cos = torch.cos(angle).unsqueeze(0).unsqueeze(1)
-    sin = torch.sin(angle).unsqueeze(0).unsqueeze(1)
+    # Angle and trigonometric computations must stay in float32 to avoid catastrophic
+    # quantization error: delta * inv_freq can exceed 1024, where bfloat16 has ULP = 8
+    # (quantization error ~4-5.7 rad, completely randomizing trig values).
+    angle = float(delta) * inv_freq.to(device=keys.device, dtype=torch.float32)
+    cos = torch.cos(angle).to(dtype=keys.dtype).unsqueeze(0).unsqueeze(1)
+    sin = torch.sin(angle).to(dtype=keys.dtype).unsqueeze(0).unsqueeze(1)
     k1, k2 = keys[..., :half], keys[..., half:]
     # Complex multiply by exp(-i*angle): the inverse of the forward rotation.
     return torch.cat([k1 * cos + k2 * sin, k2 * cos - k1 * sin], dim=-1)

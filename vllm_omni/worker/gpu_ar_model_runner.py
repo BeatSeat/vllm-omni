@@ -481,7 +481,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if reanchor is None:
                 continue
 
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import rotate_cached_keys
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                assert_uniform_position_shift,
+                rotate_cached_keys,
+            )
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import PositionReanchor
 
             plan = PositionReanchor(
@@ -508,7 +511,26 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             old_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
             self.input_batch.num_computed_tokens_cpu[req_idx] = max(0, old_computed - plan.delta)
 
+            req_state = self.requests.get(req_id)
+            mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
+            if mrope_pos is not None:
+                assert_uniform_position_shift(mrope_pos, plan.moved_from)
+                sink_tokens = plan.sink_blocks * block_size
+                if mrope_pos.shape[1] >= old_computed:
+                    req_state.mrope_positions = torch.cat(
+                        [
+                            mrope_pos[:, :sink_tokens],
+                            mrope_pos[:, plan.moved_from : old_computed] - plan.delta,
+                        ],
+                        dim=1,
+                    )
+                if getattr(req_state, "mrope_position_delta", None) is not None:
+                    req_state.mrope_position_delta = max(0, req_state.mrope_position_delta - plan.delta)
+
             positions = torch.arange(plan.moved_from, old_computed, dtype=torch.long, device=self.device)
+            if mrope_pos is None:
+                assert_uniform_position_shift(positions, plan.moved_from)
+
             if positions.numel() > 0 and hasattr(self, "kv_caches") and self.kv_caches:
                 inv_freq = getattr(self, "_duplex_inv_freq", None)
                 if inv_freq is None:

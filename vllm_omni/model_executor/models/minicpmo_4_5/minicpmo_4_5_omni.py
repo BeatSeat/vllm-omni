@@ -105,7 +105,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self.model = self.thinker
             self.talker = None
 
-            if getattr(vllm_config, "session_mode", None) == "duplex":
+            if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
                 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
                     duplex_window_geometry,
                     install_duplex_window_layers,

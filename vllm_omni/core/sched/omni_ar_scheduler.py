@@ -880,9 +880,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._finish_streaming_session_update(session, update)
                 return
 
-        if stage_id == 0:
-            self._maybe_reanchor_minicpmo45_stage0_window(session, update)
-
         replace_streaming_prompt = any(
             isinstance(info, dict)
             and isinstance(info.get("meta"), dict)
@@ -893,6 +890,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
+
+        if stage_id == 0:
+            self._maybe_reanchor_minicpmo45_stage0_window(session, update)
         if self._streaming_update_overflows(session, update):
             return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1

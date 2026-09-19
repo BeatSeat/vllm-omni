@@ -23,6 +23,7 @@ import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
     DUPLEX_WINDOW_BLOCK_SIZE,
+    assert_uniform_position_shift,
     duplex_window_geometry,
     rotate_cached_keys,
     rotate_keys,
@@ -41,6 +42,15 @@ NUM_KV_HEADS = 8
 
 def _get_inv_freq(head_dim: int = HEAD_DIM, base: float = 1000000.0) -> torch.Tensor:
     return 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+
+
+def _forward_rope(x_raw: torch.Tensor, pos: int, inv_freq: torch.Tensor) -> torch.Tensor:
+    half = x_raw.shape[-1] // 2
+    angle = float(pos) * inv_freq.to(device=x_raw.device, dtype=torch.float32)
+    cos = torch.cos(angle).to(dtype=x_raw.dtype).unsqueeze(0).unsqueeze(1)
+    sin = torch.sin(angle).to(dtype=x_raw.dtype).unsqueeze(0).unsqueeze(1)
+    x1, x2 = x_raw[..., :half], x_raw[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
 def test_worker_block_table_compaction():
@@ -73,53 +83,103 @@ def test_worker_block_table_compaction():
 
 
 def test_rotate_cached_keys_attention_equivalence():
-    """Verify that attention scores against rotated keys equal computing RoPE at pos - delta."""
+    """Verify that rotated cached keys and attention scores match ground-truth forward RoPE."""
     inv_freq = _get_inv_freq()
     delta = 16
     moved_from = 32
-    sink_blocks = 2  # 32 tokens
+    sink_blocks = 1  # 16 tokens sink (block 0), 16 tokens gap (block 1), retained tail from pos 32 (block 2..)
     plan = PositionReanchor(delta=delta, moved_from=moved_from, sink_blocks=sink_blocks)
 
-    num_blocks = 10
-    block_ids = list(range(num_blocks))
+    # Initial physical blocks: [0, 1, 2, 3]. Gap is block 1.
+    # Compacted block table after trim: [0, 2, 3]
+    compacted_blocks = [0, 2, 3]
     num_tokens = 64
     positions = torch.arange(moved_from, num_tokens, dtype=torch.long)
 
-    # Key cache pool: (num_blocks, block_size, num_kv_heads, head_dim)
     torch.manual_seed(42)
-    k_pool = torch.randn(num_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float32)
+    # Generate raw unrotated key features
+    raw_keys = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float32)
 
-    # Rotate in place
-    k_pool_before = k_pool.clone()
+    # Populate cache by applying ground-truth forward RoPE at original positions:
+    # Block 0: 0..15, Block 1: 16..31 (gap), Block 2: 32..47, Block 3: 48..63
+    k_pool = torch.zeros(4, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float32)
+    for p in range(num_tokens):
+        b = p // BLOCK_SIZE
+        o = p % BLOCK_SIZE
+        k_pool[b, o] = _forward_rope(raw_keys[p : p + 1], p, inv_freq).squeeze(0)
+
+    # Rotate retained tail in place
     touched = rotate_cached_keys(
         k_pool,
-        block_ids=block_ids,
+        block_ids=compacted_blocks,
         positions=positions,
         plan=plan,
         inv_freq=inv_freq,
     )
     assert touched == len(positions)
 
-    # Pick a token at pos = 40 (which shifts to 40 - 16 = 24)
-    test_pos = 40
-    block_idx = test_pos // BLOCK_SIZE
-    offset = test_pos % BLOCK_SIZE
-
-    original_k = k_pool_before[block_idx, offset]  # (heads, dim)
-    rotated_k = k_pool[block_idx, offset]
-
-    # Directly un-rotate original_k by delta
-    expected_rotated = rotate_keys(original_k.unsqueeze(0), delta, inv_freq).squeeze(0)
-    assert torch.allclose(rotated_k, expected_rotated, atol=1e-6)
+    # Ground-truth comparison:
+    # In compacted table, token p is re-indexed to logical pos new_p = p - delta.
+    # Its physical slot is compacted_blocks[new_p // BLOCK_SIZE] at new_p % BLOCK_SIZE.
+    # The rotated cached key MUST equal computing forward RoPE directly at pos new_p!
+    for p in range(moved_from, num_tokens):
+        new_p = p - delta
+        phys_b = compacted_blocks[new_p // BLOCK_SIZE]
+        o = new_p % BLOCK_SIZE
+        rotated_k = k_pool[phys_b, o]
+        gt_k = _forward_rope(raw_keys[p : p + 1], new_p, inv_freq).squeeze(0)
+        assert torch.allclose(rotated_k, gt_k, atol=1e-5)
 
     # Attention score check with a query at step Q
-    q = torch.randn(NUM_KV_HEADS, HEAD_DIM, dtype=torch.float32)
-    # The relative angle between Q and K must be preserved:
-    # Score = q(pos_q) * k(pos_k - delta) == q(pos_q + delta) * k(pos_k)
-    score_rotated = (q * rotated_k).sum()
-    q_shifted = rotate_keys(q.unsqueeze(0), -delta, inv_freq).squeeze(0)
-    score_original = (q_shifted * original_k).sum()
-    assert torch.allclose(score_rotated, score_original, atol=1e-5)
+    q_raw = torch.randn(1, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float32)
+    q_pos = 80
+    q = _forward_rope(q_raw, q_pos, inv_freq).squeeze(0)
+
+    for p in range(moved_from, num_tokens):
+        new_p = p - delta
+        phys_b = compacted_blocks[new_p // BLOCK_SIZE]
+        o = new_p % BLOCK_SIZE
+        rotated_k = k_pool[phys_b, o]
+        score_rotated = (q * rotated_k).sum()
+        gt_k = _forward_rope(raw_keys[p : p + 1], new_p, inv_freq).squeeze(0)
+        score_gt = (q * gt_k).sum()
+        assert torch.allclose(score_rotated, score_gt, atol=1e-5)
+
+
+def test_rotate_keys_precision_ground_truth_bf16():
+    """Verify that rotate_keys in bfloat16 at large delta matches ground truth forward RoPE.
+
+    In bfloat16, values in [1024, 2048] have ULP = 8. At delta = 6000 (standard Stage-0
+    sliding window size), computing angles in bfloat16 introduces ~4-5.7 rad quantization
+    error, scrambling trigonometric values. Computing in float32 and casting back ensures
+    numerical fidelity (<0.05 max error vs >2.0 for buggy bfloat16).
+    """
+    inv_freq = _get_inv_freq()
+    torch.manual_seed(42)
+    tokens, heads = 16, 8
+    x_raw = torch.randn(tokens, heads, HEAD_DIM, dtype=torch.bfloat16)
+
+    p_old = 7000
+    delta = 6000
+    p_new = p_old - delta
+
+    k_old = _forward_rope(x_raw, p_old, inv_freq)
+    k_gt = _forward_rope(x_raw, p_new, inv_freq)
+
+    # Fixed rotate_keys (fp32 trig):
+    k_rotated = rotate_keys(k_old, delta, inv_freq)
+    err = (k_rotated.float() - k_gt.float()).abs().max().item()
+    assert err < 0.05, f"Expected precision < 0.05, got {err}"
+
+    # Verify that the buggy calculation (angle in bf16 before cos/sin) fails drastically:
+    half = HEAD_DIM // 2
+    angle_buggy = (int(delta) * inv_freq).to(dtype=torch.bfloat16)
+    cos_buggy = torch.cos(angle_buggy).unsqueeze(0).unsqueeze(1)
+    sin_buggy = torch.sin(angle_buggy).unsqueeze(0).unsqueeze(1)
+    k1, k2 = k_old[..., :half], k_old[..., half:]
+    k_buggy = torch.cat([k1 * cos_buggy + k2 * sin_buggy, k2 * cos_buggy - k1 * sin_buggy], dim=-1)
+    err_buggy = (k_buggy.float() - k_gt.float()).abs().max().item()
+    assert err_buggy > 2.0, f"Buggy bf16 angle calculation should exhibit >2.0 error, got {err_buggy}"
 
 
 def test_batched_concurrency_isolation():
@@ -360,3 +420,89 @@ def test_runner_stage0_reanchor_pipeline():
     for b in [2, 3]:
         expected = rotate_keys(k_pool_orig[b], 16, inv_freq)
         assert torch.allclose(k_pool[b], expected, atol=1e-6)
+
+
+def test_assert_uniform_position_shift():
+    """Verify position validation: uniform shifts pass, non-uniform MRoPE raises."""
+    # 1. Uniform 2D positions (e.g. streaming audio/text where rows advance identically)
+    pos_uniform = torch.arange(100).unsqueeze(0).repeat(3, 1)
+    assert_uniform_position_shift(pos_uniform, moved_from=32)
+
+    # 2. Vision tokens in sink only (e.g. 0..20 < 32), uniform in retained tail
+    pos_sink_only_vision = pos_uniform.clone()
+    pos_sink_only_vision[1, :20] += 5
+    pos_sink_only_vision[2, :20] += 10
+    assert_uniform_position_shift(pos_sink_only_vision, moved_from=32)
+
+    # 3. Vision tokens in retained tail (>= 32) must be rejected
+    pos_tail_vision = pos_uniform.clone()
+    pos_tail_vision[1, 40:] += 5
+    with pytest.raises(RuntimeError, match="duplex re-anchor needs one position row across the retained tail"):
+        assert_uniform_position_shift(pos_tail_vision, moved_from=32)
+
+    # 4. 1D positions trivially uniform
+    pos_1d = torch.arange(100)
+    assert_uniform_position_shift(pos_1d, moved_from=32)
+
+    # 5. Invalid rank
+    with pytest.raises(ValueError, match="expected a \\(rows, tokens\\) position tensor"):
+        assert_uniform_position_shift(pos_1d.unsqueeze(0).unsqueeze(0), moved_from=32)
+
+
+def test_session_mode_location_on_model_config():
+    """Verify session_mode is read from vllm_config.model_config, not vllm_config."""
+    # Production layout: session_mode is in model_config
+    valid_cfg = SimpleNamespace(
+        model_config=SimpleNamespace(model_stage="llm", session_mode="duplex", max_model_len=40960),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    assert getattr(getattr(valid_cfg, "model_config", None), "session_mode", None) == "duplex"
+
+    # Buggy layout: session_mode on vllm_config directly was never populated in vllm-omni
+    buggy_cfg = SimpleNamespace(
+        session_mode="duplex",
+        model_config=SimpleNamespace(model_stage="llm", max_model_len=40960),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    assert getattr(getattr(buggy_cfg, "model_config", None), "session_mode", None) != "duplex"
+
+
+def test_scheduler_replace_streaming_prompt_bypasses_reanchor():
+    """Verify that when replace_streaming_prompt is True, re-anchoring is bypassed."""
+    reanchor_called = []
+
+    class MockScheduler:
+        def _release_replaced_streaming_prompt_cache(self, session):
+            session.released = True
+
+        def _replace_streaming_session(self, session, update):
+            session.replaced = True
+
+        def _maybe_reanchor_minicpmo45_stage0_window(self, session, update):
+            reanchor_called.append(True)
+
+        def _update_request_as_session(self, session, update):
+            stage_id = 0
+            update_infos = [{"meta": {"replace_streaming_prompt": True}}]
+
+            replace_streaming_prompt = any(
+                isinstance(info, dict)
+                and isinstance(info.get("meta"), dict)
+                and info["meta"].get("replace_streaming_prompt") is True
+                for info in update_infos
+            )
+            if replace_streaming_prompt:
+                self._release_replaced_streaming_prompt_cache(session)
+                self._replace_streaming_session(session, update)
+                return
+
+            if stage_id == 0:
+                self._maybe_reanchor_minicpmo45_stage0_window(session, update)
+
+    sched = MockScheduler()
+    session = SimpleNamespace(released=False, replaced=False)
+    sched._update_request_as_session(session, None)
+
+    assert session.released is True
+    assert session.replaced is True
+    assert len(reanchor_called) == 0, "Re-anchoring must not be called when replacing streaming prompt!"

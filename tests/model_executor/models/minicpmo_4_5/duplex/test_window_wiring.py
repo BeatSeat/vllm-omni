@@ -15,25 +15,24 @@ Covers:
 
 from __future__ import annotations
 
-import math
 from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
-    DuplexWindowGeometry,
-    PositionReanchor,
-    plan_position_reanchor,
-)
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
     DUPLEX_WINDOW_BLOCK_SIZE,
-    MiniCPMO45DuplexWindowManager,
-    MiniCPMO45DuplexWindowSpec,
     duplex_window_geometry,
     rotate_cached_keys,
     rotate_keys,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+    PositionReanchor,
+    plan_position_reanchor,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 BLOCK_SIZE = DUPLEX_WINDOW_BLOCK_SIZE  # 16
 HEAD_DIM = 128
@@ -62,9 +61,7 @@ def test_worker_block_table_compaction():
     # Worker-side compaction helper
     total = int(num_blocks_per_row[row_idx])
     assert total == 7
-    table_np[row_idx, sink_blocks : total - gap_blocks] = table_np[
-        row_idx, sink_blocks + gap_blocks : total
-    ]
+    table_np[row_idx, sink_blocks : total - gap_blocks] = table_np[row_idx, sink_blocks + gap_blocks : total]
     table_np[row_idx, total - gap_blocks : total] = 0
     num_blocks_per_row[row_idx] -= gap_blocks
 
@@ -105,7 +102,6 @@ def test_rotate_cached_keys_attention_equivalence():
 
     # Pick a token at pos = 40 (which shifts to 40 - 16 = 24)
     test_pos = 40
-    new_pos = test_pos - delta
     block_idx = test_pos // BLOCK_SIZE
     offset = test_pos % BLOCK_SIZE
 
@@ -327,9 +323,9 @@ def test_runner_stage0_reanchor_pipeline():
                 bt = self.input_batch.block_table
                 total = int(bt.num_blocks_per_row[req_idx])
                 if sink_blocks + gap_blocks <= total:
-                    bt.block_table.np[req_idx, sink_blocks : total - gap_blocks] = (
-                        bt.block_table.np[req_idx, sink_blocks + gap_blocks : total]
-                    )
+                    bt.block_table.np[req_idx, sink_blocks : total - gap_blocks] = bt.block_table.np[
+                        req_idx, sink_blocks + gap_blocks : total
+                    ]
                     bt.block_table.np[req_idx, total - gap_blocks : total] = 0
                     bt.num_blocks_per_row[req_idx] -= gap_blocks
                 compacted_block_ids = list(bt.block_table.np[req_idx, : bt.num_blocks_per_row[req_idx]])
@@ -364,4 +360,3 @@ def test_runner_stage0_reanchor_pipeline():
     for b in [2, 3]:
         expected = rotate_keys(k_pool_orig[b], 16, inv_freq)
         assert torch.allclose(k_pool[b], expected, atol=1e-6)
-

@@ -25,6 +25,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     unit_starts,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # Block size 4, a 10-token session context prefix (reference audio + system
 # prompt), a 64-token attention budget, 4096 positions and 2 tokens of sample
 # room: small enough to assert on by hand, same shape as the real stage.

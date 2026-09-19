@@ -481,8 +481,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if reanchor is None:
                 continue
 
-            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import PositionReanchor
             from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import rotate_cached_keys
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import PositionReanchor
 
             plan = PositionReanchor(
                 delta=reanchor["delta"],
@@ -498,9 +498,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             for bt in getattr(bt_group, "block_tables", [bt_group]):
                 total = int(bt.num_blocks_per_row[req_idx])
                 if sink_blocks + gap_blocks <= total:
-                    bt.block_table.np[req_idx, sink_blocks : total - gap_blocks] = (
-                        bt.block_table.np[req_idx, sink_blocks + gap_blocks : total]
-                    )
+                    bt.block_table.np[req_idx, sink_blocks : total - gap_blocks] = bt.block_table.np[
+                        req_idx, sink_blocks + gap_blocks : total
+                    ]
                     bt.block_table.np[req_idx, total - gap_blocks : total] = 0
                     bt.num_blocks_per_row[req_idx] -= gap_blocks
                 compacted_block_ids = list(bt.block_table.np[req_idx, : bt.num_blocks_per_row[req_idx]])

@@ -907,6 +907,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
             MiniCPMO45DuplexWindowManager,
         )
+
         for mgr in getattr(coordinator, "single_type_managers", ()):
             if isinstance(mgr, MiniCPMO45DuplexWindowManager):
                 return mgr
@@ -949,6 +950,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             DuplexWindowGeometry,
             plan_position_reanchor,
         )
+
         geometry = DuplexWindowGeometry(
             prefix_tokens=prefix_tokens,
             window_tokens=low_watermark,

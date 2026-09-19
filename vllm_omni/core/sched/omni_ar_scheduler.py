@@ -879,6 +879,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         session.mm_features.extend(update.mm_features)
                 self._finish_streaming_session_update(session, update)
                 return
+
+        if stage_id == 0:
+            self._maybe_reanchor_minicpmo45_stage0_window(session, update)
+
         replace_streaming_prompt = any(
             isinstance(info, dict)
             and isinstance(info.get("meta"), dict)
@@ -895,6 +899,82 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _find_duplex_window_manager(self):
+        coordinator = getattr(getattr(self, "kv_cache_manager", None), "coordinator", None)
+        if coordinator is None:
+            return None
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+            MiniCPMO45DuplexWindowManager,
+        )
+        for mgr in getattr(coordinator, "single_type_managers", ()):
+            if isinstance(mgr, MiniCPMO45DuplexWindowManager):
+                return mgr
+        return None
+
+    def _maybe_reanchor_minicpmo45_stage0_window(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+    ) -> None:
+        info = getattr(update, "model_intermediate_buffer", None)
+        if not isinstance(info, dict):
+            return
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+        window = runtime_config.get("duplex_window_config")
+        if not isinstance(window, dict):
+            return
+        mode = window.get("sliding_window_mode", "off")
+        if mode not in {"basic", "context"}:
+            return
+
+        base_len = int(getattr(session, "num_computed_tokens", 0) or 0)
+        prefix_tokens = int(runtime_config.get("duplex_window_prefix_tokens", 96) or 96)
+        if mode == "basic":
+            high_watermark = int(window.get("basic_window_high_tokens", 8000) or 8000)
+            low_watermark = int(window.get("basic_window_low_tokens", 6000) or 6000)
+        else:
+            max_units = int(window.get("context_max_units", 24) or 24)
+            low_watermark = prefix_tokens + max_units * 12
+            high_watermark = low_watermark + 500
+
+        block_size = int(getattr(self.cache_config, "block_size", 16) or 16)
+        max_model_len = int(self.model_config.max_model_len)
+
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+            DuplexWindowGeometry,
+            plan_position_reanchor,
+        )
+        geometry = DuplexWindowGeometry(
+            prefix_tokens=prefix_tokens,
+            window_tokens=low_watermark,
+            block_size=block_size,
+            max_model_len=max_model_len,
+            high_watermark_tokens=high_watermark,
+        )
+
+        plan = plan_position_reanchor(
+            geometry,
+            computed_tokens=base_len,
+            pending_tokens=len(update.prompt_token_ids),
+        )
+        if plan is None:
+            return
+
+        duplex_mgr = self._find_duplex_window_manager()
+        if duplex_mgr is not None:
+            duplex_mgr.reanchor_block_table(session.request_id, plan)
+
+        session.num_computed_tokens -= plan.delta
+        duplex["stage0_reanchor"] = {
+            "delta": plan.delta,
+            "moved_from": plan.moved_from,
+            "sink_blocks": plan.sink_blocks,
+        }
 
     # Prefix of the stop_reason carried by the FinishReason.ERROR output, so the
     # serving side can map it to a stable error code.

@@ -461,7 +461,73 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        self._maybe_apply_stage0_reanchor()
         return deferred_state_corrections_fn
+
+    def _maybe_apply_stage0_reanchor(self) -> None:
+        """Apply in-place KV reanchor and rotation on worker before model forward."""
+        if not hasattr(self, "input_batch") or self.input_batch is None:
+            return
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        for req_idx, req_id in enumerate(req_ids):
+            info = self.model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
+            duplex = info.get("duplex")
+            if not isinstance(duplex, dict):
+                continue
+            reanchor = duplex.pop("stage0_reanchor", None)
+            if reanchor is None:
+                continue
+
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import PositionReanchor
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import rotate_cached_keys
+
+            plan = PositionReanchor(
+                delta=reanchor["delta"],
+                moved_from=reanchor["moved_from"],
+                sink_blocks=reanchor["sink_blocks"],
+            )
+
+            block_size = self.cache_config.block_size
+            gap_blocks = plan.delta // block_size
+            sink_blocks = plan.sink_blocks
+            bt_group = self.input_batch.block_table
+            compacted_block_ids = []
+            for bt in getattr(bt_group, "block_tables", [bt_group]):
+                total = int(bt.num_blocks_per_row[req_idx])
+                if sink_blocks + gap_blocks <= total:
+                    bt.block_table.np[req_idx, sink_blocks : total - gap_blocks] = (
+                        bt.block_table.np[req_idx, sink_blocks + gap_blocks : total]
+                    )
+                    bt.block_table.np[req_idx, total - gap_blocks : total] = 0
+                    bt.num_blocks_per_row[req_idx] -= gap_blocks
+                compacted_block_ids = list(bt.block_table.np[req_idx, : bt.num_blocks_per_row[req_idx]])
+
+            old_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+            self.input_batch.num_computed_tokens_cpu[req_idx] = max(0, old_computed - plan.delta)
+
+            positions = torch.arange(plan.moved_from, old_computed, dtype=torch.long, device=self.device)
+            if positions.numel() > 0 and hasattr(self, "kv_caches") and self.kv_caches:
+                inv_freq = getattr(self, "_duplex_inv_freq", None)
+                if inv_freq is None:
+                    head_dim = self.model_config.get_head_size()
+                    base = float(getattr(self.model_config.hf_config, "rope_theta", 1000000.0) or 1000000.0)
+                    inv_freq = 1.0 / (
+                        base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=self.device) / head_dim)
+                    )
+                    self._duplex_inv_freq = inv_freq
+
+                for kv_cache in self.kv_caches:
+                    k_pool = kv_cache[0] if kv_cache.dim() == 5 else kv_cache
+                    rotate_cached_keys(
+                        k_pool,
+                        block_ids=compacted_block_ids,
+                        positions=positions,
+                        plan=plan,
+                        inv_freq=inv_freq,
+                    )
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)

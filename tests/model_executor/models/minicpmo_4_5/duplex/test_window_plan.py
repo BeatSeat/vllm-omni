@@ -15,15 +15,41 @@ import cmath
 
 import pytest
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
-    DuplexWindowGeometry,
-    PositionReanchor,
-    align_up,
-    cdiv,
-    plan_position_reanchor,
-    reanchor_positions,
-    unit_starts,
-)
+try:
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+        DuplexWindowGeometry,
+        PositionReanchor,
+        align_up,
+        cdiv,
+        plan_position_reanchor,
+        reanchor_positions,
+        unit_starts,
+    )
+except (ImportError, ModuleNotFoundError):
+    import importlib.util
+    import pathlib
+    import sys
+
+    repo_root = pathlib.Path(__file__).resolve().parent
+    while repo_root.name and not (repo_root / "vllm_omni").is_dir():
+        repo_root = repo_root.parent
+
+    spec = importlib.util.spec_from_file_location(
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan",
+        repo_root / "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_plan.py",
+    )
+    assert spec is not None and spec.loader is not None
+    _wp = importlib.util.module_from_spec(spec)
+    sys.modules["vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan"] = _wp
+    spec.loader.exec_module(_wp)
+
+    DuplexWindowGeometry = _wp.DuplexWindowGeometry
+    PositionReanchor = _wp.PositionReanchor
+    align_up = _wp.align_up
+    cdiv = _wp.cdiv
+    plan_position_reanchor = _wp.plan_position_reanchor
+    reanchor_positions = _wp.reanchor_positions
+    unit_starts = _wp.unit_starts
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

@@ -97,6 +97,7 @@ Wiring, in the order the pieces get used
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
@@ -216,18 +217,23 @@ class MiniCPMO45DuplexWindowManager(ChunkWindowManager):
         if self.enable_caching:
             raise RuntimeError("duplex block-table compaction requires prefix caching to be disabled")
         spec = self.kv_cache_spec
-        if spec.chunk_size != self.block_size or plan.sink_blocks != spec.sink_chunks:
+        if spec.chunk_size != self.block_size:
             raise RuntimeError(
-                "duplex trim assumes chunk_size == block_size and sink_chunks == cdiv(prefix, block_size); "
-                f"got chunk_size={spec.chunk_size} block_size={self.block_size} "
-                f"sink_chunks={spec.sink_chunks} plan.sink_blocks={plan.sink_blocks}"
+                f"duplex trim assumes chunk_size == block_size; "
+                f"got chunk_size={spec.chunk_size} block_size={self.block_size}"
             )
         blocks = self.req_to_blocks.get(request_id)
         if blocks is None:
             return 0
         start = plan.sink_blocks
-        end = start + plan.delta // self.block_size
-        if end > len(blocks) or any(block == self._null_block for block in blocks[start:end]):
+        gap_blocks = plan.delta // self.block_size
+        end = start + gap_blocks
+        if (
+            start < 0
+            or gap_blocks <= 0
+            or end > len(blocks)
+            or any(block == self._null_block for block in blocks[start:end])
+        ):
             return 0
         self._remove_blocks_in_range(request_id, start, end)
         return self.compact_block_table(request_id)
@@ -433,3 +439,190 @@ def rotate_cached_keys(
     # the rows still being read.
     flat[slots] = rotate_keys(flat[slots], plan.delta, inv_freq)
     return int(slots.numel())
+
+
+class MiniCPMO45DuplexSchedulerHelper:
+    """Scheduler-side window planning and request compaction helper for MiniCPM-o 4.5 duplex."""
+
+    @classmethod
+    def find_duplex_window_manager(cls, scheduler: Any) -> MiniCPMO45DuplexWindowManager | None:
+        coordinator = getattr(getattr(scheduler, "kv_cache_manager", None), "coordinator", None)
+        if coordinator is None:
+            return None
+        for mgr in getattr(coordinator, "single_type_managers", ()):
+            if isinstance(mgr, MiniCPMO45DuplexWindowManager):
+                return mgr
+        return None
+
+    @classmethod
+    def maybe_reanchor_session(
+        cls,
+        scheduler: Any,
+        session: Any,
+        update: Any,
+    ) -> PositionReanchor | None:
+        """Evaluate watermark policy, compact KV block table and session tokens if needed."""
+        info = getattr(update, "model_intermediate_buffer", None)
+        if not isinstance(info, dict):
+            return None
+        duplex = info.get("duplex")
+        if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
+            return None
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+        window = runtime_config.get("duplex_window_config")
+        if not isinstance(window, dict):
+            return None
+        mode = window.get("sliding_window_mode", "off")
+        if mode not in {"basic", "context"}:
+            return None
+
+        base_len = int(getattr(session, "num_computed_tokens", 0) or 0)
+        prefix_tokens = int(runtime_config.get("duplex_window_prefix_tokens", 96) or 96)
+        if mode == "basic":
+            high_watermark = int(window.get("basic_window_high_tokens", 8000) or 8000)
+            low_watermark = int(window.get("basic_window_low_tokens", 6000) or 6000)
+        else:
+            max_units = int(window.get("context_max_units", 24) or 24)
+            low_watermark = prefix_tokens + max_units * 12
+            high_watermark = low_watermark + 500
+
+        block_size = int(getattr(scheduler.cache_config, "block_size", 16) or 16)
+        max_model_len = int(scheduler.model_config.max_model_len)
+
+        geometry = DuplexWindowGeometry(
+            prefix_tokens=prefix_tokens,
+            window_tokens=low_watermark,
+            block_size=block_size,
+            max_model_len=max_model_len,
+            high_watermark_tokens=high_watermark,
+        )
+
+        pending_tokens = len(getattr(update, "prompt_token_ids", []) or [])
+        plan = plan_position_reanchor(
+            geometry,
+            computed_tokens=base_len,
+            pending_tokens=pending_tokens,
+        )
+        if plan is None:
+            return None
+
+        duplex_mgr = cls.find_duplex_window_manager(scheduler)
+        if duplex_mgr is None:
+            return None
+
+        freed_tokens = duplex_mgr.reanchor_block_table(session.request_id, plan)
+        if freed_tokens == 0:
+            return None
+
+        old_computed = session.num_computed_tokens
+        sink_end = plan.sink_end
+        moved_from = plan.moved_from
+
+        # Compact session token sequences and counts consistently
+        if getattr(session, "prompt_token_ids", None) is not None and len(session.prompt_token_ids) >= moved_from:
+            session.prompt_token_ids = session.prompt_token_ids[:sink_end] + session.prompt_token_ids[moved_from:]
+            session.num_prompt_tokens = len(session.prompt_token_ids)
+
+        if getattr(session, "_all_token_ids", None) is not None and len(session._all_token_ids) >= moved_from:
+            session._all_token_ids = session._all_token_ids[:sink_end] + session._all_token_ids[moved_from:]
+
+        session.num_computed_tokens -= plan.delta
+
+        duplex["stage0_reanchor"] = {
+            "delta": plan.delta,
+            "moved_from": plan.moved_from,
+            "sink_blocks": plan.sink_blocks,
+            "old_computed_tokens": old_computed,
+        }
+        return plan
+
+
+class MiniCPMO45DuplexWorkerHelper:
+    """Worker-side KV cache rotation and position metadata helper for MiniCPM-o 4.5 duplex."""
+
+    @classmethod
+    def get_rope_inv_freq(cls, runner: Any) -> torch.Tensor:
+        inv_freq = getattr(runner, "_duplex_inv_freq", None)
+        if inv_freq is None:
+            head_dim = runner.model_config.get_head_size()
+            base = float(getattr(runner.model_config.hf_config, "rope_theta", 1000000.0) or 1000000.0)
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=runner.device) / head_dim)
+            )
+            runner._duplex_inv_freq = inv_freq
+        return inv_freq
+
+    @classmethod
+    def maybe_apply_reanchor(cls, runner: Any) -> None:
+        """Apply in-place KV reanchor and rotation on worker before model forward."""
+        if not hasattr(runner, "input_batch") or runner.input_batch is None:
+            return
+        num_reqs = runner.input_batch.num_reqs
+        req_ids = runner.input_batch.req_ids[:num_reqs]
+        for req_idx, req_id in enumerate(req_ids):
+            info = runner.model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
+            duplex = info.get("duplex")
+            if not isinstance(duplex, dict):
+                continue
+            reanchor = duplex.pop("stage0_reanchor", None)
+            if reanchor is None:
+                continue
+
+            plan = PositionReanchor(
+                delta=reanchor["delta"],
+                moved_from=reanchor["moved_from"],
+                sink_blocks=reanchor["sink_blocks"],
+            )
+
+            # Scheduler is authoritative for logical state (block_table and computed tokens).
+            # The parent runner's _update_states() already installed the post-compaction block IDs
+            # and decremented num_computed_tokens_cpu. We do NOT double-compact or double-decrement here.
+            old_computed = int(
+                reanchor.get(
+                    "old_computed_tokens",
+                    int(runner.input_batch.num_computed_tokens_cpu[req_idx]) + plan.delta,
+                )
+            )
+
+            req_state = runner.requests.get(req_id) if hasattr(runner, "requests") else None
+            if req_state is not None and getattr(req_state, "block_ids", None):
+                compacted_block_ids = list(req_state.block_ids)
+            else:
+                bt = runner.input_batch.block_table
+                bt_row = getattr(bt, "block_tables", [bt])[0]
+                num_blocks = int(bt_row.num_blocks_per_row[req_idx])
+                compacted_block_ids = list(bt_row.block_table.np[req_idx, :num_blocks])
+
+            mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
+            if mrope_pos is not None:
+                assert_uniform_position_shift(mrope_pos, plan.moved_from)
+                sink_tokens = plan.sink_blocks * runner.cache_config.block_size
+                if mrope_pos.shape[1] >= old_computed:
+                    req_state.mrope_positions = torch.cat(
+                        [
+                            mrope_pos[:, :sink_tokens],
+                            mrope_pos[:, plan.moved_from : old_computed] - plan.delta,
+                        ],
+                        dim=1,
+                    )
+                if getattr(req_state, "mrope_position_delta", None) is not None:
+                    req_state.mrope_position_delta = max(0, req_state.mrope_position_delta - plan.delta)
+
+            positions = torch.arange(plan.moved_from, old_computed, dtype=torch.long, device=runner.device)
+            if mrope_pos is None:
+                assert_uniform_position_shift(positions, plan.moved_from)
+
+            if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
+                inv_freq = cls.get_rope_inv_freq(runner)
+                for kv_cache in runner.kv_caches:
+                    k_pool = kv_cache[0] if getattr(kv_cache, "dim", lambda: 0)() == 5 else kv_cache
+                    rotate_cached_keys(
+                        k_pool,
+                        block_ids=compacted_block_ids,
+                        positions=positions,
+                        plan=plan,
+                        inv_freq=inv_freq,
+                    )

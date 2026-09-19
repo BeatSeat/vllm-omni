@@ -21,17 +21,111 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
-    DUPLEX_WINDOW_BLOCK_SIZE,
-    assert_uniform_position_shift,
-    duplex_window_geometry,
-    rotate_cached_keys,
-    rotate_keys,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
-    PositionReanchor,
-    plan_position_reanchor,
-)
+try:
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+        DUPLEX_WINDOW_BLOCK_SIZE,
+        MiniCPMO45DuplexSchedulerHelper,
+        MiniCPMO45DuplexWindowManager,
+        MiniCPMO45DuplexWorkerHelper,
+        assert_uniform_position_shift,
+        duplex_window_geometry,
+        rotate_cached_keys,
+        rotate_keys,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
+        PositionReanchor,
+        plan_position_reanchor,
+    )
+except (ImportError, ModuleNotFoundError):
+    import importlib.util
+    import pathlib
+    import sys
+    import types
+
+    def _make_pkg(name: str) -> types.ModuleType:
+        if name in sys.modules:
+            return sys.modules[name]
+        m = types.ModuleType(name)
+        m.__path__ = []  # type: ignore[attr-defined]
+        sys.modules[name] = m
+        return m
+
+    vllm = _make_pkg("vllm")
+    vllm.__version__ = "0.7.0"  # type: ignore[attr-defined]
+    vllm.__version_tuple__ = (0, 7, 0)  # type: ignore[attr-defined]
+    v1 = _make_pkg("vllm.v1")
+    spec_reg = _make_pkg("vllm.v1.kv_cache_spec_registry")
+    spec_reg.register_kv_cache_spec = lambda *a, **k: (lambda cls: cls)  # type: ignore[attr-defined]
+    kv_if = _make_pkg("vllm.v1.kv_cache_interface")
+
+    class MockSpec:
+        pass
+
+    kv_if.KVCacheSpec = MockSpec  # type: ignore[attr-defined]
+    kv_if.SlidingWindowSpec = MockSpec  # type: ignore[attr-defined]
+
+    vo = _make_pkg("vllm_omni")
+    vo_exp = _make_pkg("vllm_omni.experimental")
+    vo_ad = _make_pkg("vllm_omni.experimental.ar_diffusion")
+    vo_kc = _make_pkg("vllm_omni.experimental.ar_diffusion.kv_cache")
+    vo_pg = _make_pkg("vllm_omni.experimental.ar_diffusion.kv_cache.paged")
+
+    class MockChunkSpec:
+        pass
+
+    class MockChunkManager:
+        def __init__(self, *a, **k):
+            pass
+
+        def reanchor_block_table(self, *a, **k):
+            pass
+
+    vo_pg.ChunkWindowSpec = MockChunkSpec  # type: ignore[attr-defined]
+    vo_pg.ChunkWindowManager = MockChunkManager  # type: ignore[attr-defined]
+
+    def compute_slot_mapping(block_ids, positions, block_size):
+        p = positions.to(dtype=torch.long)
+        t = torch.tensor(block_ids, dtype=torch.long, device=p.device)
+        return t[torch.div(p, block_size, rounding_mode="floor")] * block_size + (p % block_size)
+
+    vo_pg.compute_slot_mapping = compute_slot_mapping  # type: ignore[attr-defined]
+
+    _make_pkg("vllm_omni.model_executor")
+    _make_pkg("vllm_omni.model_executor.models")
+    _make_pkg("vllm_omni.model_executor.models.minicpmo_4_5")
+    _make_pkg("vllm_omni.model_executor.models.minicpmo_4_5.duplex")
+
+    repo_root = pathlib.Path(__file__).resolve().parent
+    while repo_root.name and not (repo_root / "vllm_omni").is_dir():
+        repo_root = repo_root.parent
+
+    def _load_module(name: str, rel_path: str) -> types.ModuleType:
+        spec = importlib.util.spec_from_file_location(name, repo_root / rel_path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    _wp = _load_module(
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan",
+        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_plan.py",
+    )
+    _wk = _load_module(
+        "vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv",
+        "vllm_omni/model_executor/models/minicpmo_4_5/duplex/window_kv.py",
+    )
+
+    DUPLEX_WINDOW_BLOCK_SIZE = _wk.DUPLEX_WINDOW_BLOCK_SIZE
+    MiniCPMO45DuplexSchedulerHelper = _wk.MiniCPMO45DuplexSchedulerHelper
+    MiniCPMO45DuplexWindowManager = _wk.MiniCPMO45DuplexWindowManager
+    MiniCPMO45DuplexWorkerHelper = _wk.MiniCPMO45DuplexWorkerHelper
+    assert_uniform_position_shift = _wk.assert_uniform_position_shift
+    duplex_window_geometry = _wk.duplex_window_geometry
+    rotate_cached_keys = _wk.rotate_cached_keys
+    rotate_keys = _wk.rotate_keys
+    PositionReanchor = _wp.PositionReanchor
+    plan_position_reanchor = _wp.plan_position_reanchor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -311,18 +405,88 @@ def test_barge_in_abort_safety():
     assert len(free_blocks) == 100  # ALL blocks successfully returned, zero leak!
 
 
-def test_runner_stage0_reanchor_pipeline():
-    """Verify that Worker applies stage0_reanchor hook correctly."""
+def test_scheduler_worker_end_to_end_state_agreement():
+    """Verify production update path: append -> scheduler compaction -> worker state update -> agreement."""
     inv_freq = _get_inv_freq()
     num_blocks = 10
     k_pool = torch.randn(num_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float32)
     k_pool_orig = k_pool.clone()
 
-    # Initial block table for req-1: blocks [0, 1, 2, 3]
-    # sink=1 (block 0), gap=1 (block 1, delta=16), tail=[2, 3] (pos 32..64)
+    # Initial session prompt: 64 tokens, 4 blocks [0, 1, 2, 3]
+    # Prefix: 16 tokens (block 0), gap: 16 tokens (block 1, delta=16), tail: 32 tokens (blocks 2, 3)
+    prompt_ids = list(range(100, 164))
+    session = SimpleNamespace(
+        request_id="req-1",
+        prompt_token_ids=list(prompt_ids),
+        _all_token_ids=list(prompt_ids),
+        num_prompt_tokens=64,
+        num_computed_tokens=64,
+    )
+
+    class _MockDuplexManager(MiniCPMO45DuplexWindowManager):
+        def __init__(self):
+            self.blocks = [0, 1, 2, 3]
+
+        def reanchor_block_table(self, request_id: str, plan: PositionReanchor) -> int:
+            start = plan.sink_blocks
+            end = start + plan.delta // BLOCK_SIZE
+            del self.blocks[start:end]
+            return plan.delta
+
+    duplex_mgr = _MockDuplexManager()
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
+        model_config=SimpleNamespace(max_model_len=40960),
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=[duplex_mgr])),
+    )
+
+    # 1. Update arrives: 1 token append, triggering window trim
+    update = SimpleNamespace(
+        prompt_token_ids=[999],
+        model_intermediate_buffer={
+            "duplex": {
+                "data_plane": True,
+                "runtime_config": {
+                    "duplex_window_prefix_tokens": 16,
+                    "duplex_window_config": {
+                        "sliding_window_mode": "basic",
+                        "basic_window_high_tokens": 40,  # 16 + 40 = 56 trigger (< 64+1=65)
+                        "basic_window_low_tokens": 32,  # Target is 16 + 32 = 48
+                    },
+                },
+            }
+        },
+    )
+
+    plan = MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update)
+    assert plan is not None
+    assert plan.delta == 16
+    assert plan.moved_from == 32
+    assert plan.sink_blocks == 1
+
+    # Scheduler compacted session state:
+    # 64 tokens -> trimmed middle gap [16:32] -> 48 tokens surviving
+    assert len(session.prompt_token_ids) == 48
+    assert len(session._all_token_ids) == 48
+    assert session.prompt_token_ids == prompt_ids[:16] + prompt_ids[32:]
+    assert session._all_token_ids == prompt_ids[:16] + prompt_ids[32:]
+    assert session.num_computed_tokens == 48
+    assert session.num_prompt_tokens == 48
+    assert duplex_mgr.blocks == [0, 2, 3]
+
+    # Subsequent append from upstream _update_request_as_session adds the 1 pending token:
+    session.prompt_token_ids.extend(update.prompt_token_ids)
+    session._all_token_ids.extend(update.prompt_token_ids)
+    session.num_prompt_tokens = len(session.prompt_token_ids)
+    # Both token histories are now consistent with length 49!
+    assert len(session.prompt_token_ids) == 49
+    assert len(session._all_token_ids) == 49
+
+    # 2. Worker state update via production path:
+    # Scheduler provides post-compaction block IDs [0, 2, 3] and computed count 48
     table_np = np.zeros((2, 16), dtype=np.int32)
-    table_np[0, :4] = [0, 1, 2, 3]
-    num_blocks_per_row = np.array([4, 0], dtype=np.int32)
+    table_np[0, :3] = [0, 2, 3]
+    num_blocks_per_row = np.array([3, 0], dtype=np.int32)
 
     class _MockBlockTable:
         def __init__(self):
@@ -339,87 +503,104 @@ def test_runner_stage0_reanchor_pipeline():
             )
             self._duplex_inv_freq = inv_freq
             self.kv_caches = [k_pool]
+            self.requests = {
+                "req-1": SimpleNamespace(
+                    block_ids=[0, 2, 3],
+                    num_computed_tokens=48,
+                    mrope_positions=None,
+                )
+            }
             self.input_batch = SimpleNamespace(
                 num_reqs=1,
                 req_ids=["req-1"],
                 block_table=_MockBlockTable(),
-                num_computed_tokens_cpu=np.array([64], dtype=np.int32),
+                num_computed_tokens_cpu=np.array([48], dtype=np.int32),
             )
             self.model_intermediate_buffer = {
-                "req-1": {
-                    "duplex": {
-                        "stage0_reanchor": {
-                            "delta": 16,
-                            "moved_from": 32,
-                            "sink_blocks": 1,
-                        }
-                    }
-                }
+                "req-1": update.model_intermediate_buffer,
             }
 
-        def _maybe_apply_stage0_reanchor(self):
-            num_reqs = self.input_batch.num_reqs
-            req_ids = self.input_batch.req_ids[:num_reqs]
-            for req_idx, req_id in enumerate(req_ids):
-                info = self.model_intermediate_buffer.get(req_id)
-                if not isinstance(info, dict):
-                    continue
-                duplex = info.get("duplex")
-                if not isinstance(duplex, dict):
-                    continue
-                reanchor = duplex.pop("stage0_reanchor", None)
-                if reanchor is None:
-                    continue
-
-                plan = PositionReanchor(
-                    delta=reanchor["delta"],
-                    moved_from=reanchor["moved_from"],
-                    sink_blocks=reanchor["sink_blocks"],
-                )
-
-                block_size = self.cache_config.block_size
-                gap_blocks = plan.delta // block_size
-                sink_blocks = plan.sink_blocks
-                bt = self.input_batch.block_table
-                total = int(bt.num_blocks_per_row[req_idx])
-                if sink_blocks + gap_blocks <= total:
-                    bt.block_table.np[req_idx, sink_blocks : total - gap_blocks] = bt.block_table.np[
-                        req_idx, sink_blocks + gap_blocks : total
-                    ]
-                    bt.block_table.np[req_idx, total - gap_blocks : total] = 0
-                    bt.num_blocks_per_row[req_idx] -= gap_blocks
-                compacted_block_ids = list(bt.block_table.np[req_idx, : bt.num_blocks_per_row[req_idx]])
-
-                old_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
-                self.input_batch.num_computed_tokens_cpu[req_idx] = max(0, old_computed - plan.delta)
-
-                positions = torch.arange(plan.moved_from, old_computed, dtype=torch.long, device=self.device)
-                if positions.numel() > 0:
-                    for kv_cache in self.kv_caches:
-                        rotate_cached_keys(
-                            kv_cache,
-                            block_ids=compacted_block_ids,
-                            positions=positions,
-                            plan=plan,
-                            inv_freq=self._duplex_inv_freq,
-                        )
-
     runner = _MockRunner()
-    runner._maybe_apply_stage0_reanchor()
+    # Execute worker helper
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner)
 
-    # Verify block table is compacted to [0, 2, 3]
+    # 3. Assertions: Both sides strictly agree on computed counts and block IDs!
+    assert runner.input_batch.num_computed_tokens_cpu[0] == 48, "Worker must NOT decrement computed tokens twice!"
+    assert session.num_computed_tokens == runner.input_batch.num_computed_tokens_cpu[0] == 48
     bt = runner.input_batch.block_table
-    assert bt.num_blocks_per_row[0] == 3
+    assert bt.num_blocks_per_row[0] == 3, "Worker must NOT delete blocks twice!"
     assert list(bt.block_table.np[0, :3]) == [0, 2, 3]
-    # Verify computed tokens decremented from 64 to 48
-    assert runner.input_batch.num_computed_tokens_cpu[0] == 48
-    # Verify metadata consumed
-    assert "stage0_reanchor" not in runner.model_intermediate_buffer["req-1"]["duplex"]
-    # Verify sink block 0 is untouched, blocks 2 and 3 are rotated
+    assert duplex_mgr.blocks == list(bt.block_table.np[0, :3]) == [0, 2, 3]
+
+    # Verify KV cache rotation: sink block 0 untouched, blocks 2 and 3 rotated
     assert torch.equal(k_pool[0], k_pool_orig[0])
     for b in [2, 3]:
         expected = rotate_keys(k_pool_orig[b], 16, inv_freq)
         assert torch.allclose(k_pool[b], expected, atol=1e-6)
+
+
+def test_differing_prefix_lengths_dynamic_sink():
+    """Verify that differing instruction / reference audio prefix lengths work without spec mismatch."""
+    # Prefix length 112 tokens = 7 blocks (differs from standard 96 tokens = 6 blocks)
+    prefix_tokens = 112
+    sink_blocks = 7
+    blocks = [100 + i for i in range(12)]
+
+    class _MockSpec:
+        chunk_size = BLOCK_SIZE
+        sink_chunks = 6  # Static spec default is 6, while session has 7
+
+    manager = MiniCPMO45DuplexWindowManager.__new__(MiniCPMO45DuplexWindowManager)
+    manager.block_size = BLOCK_SIZE
+    manager.enable_caching = False
+    manager.kv_cache_spec = _MockSpec()
+    manager._null_block = -1
+    manager.req_to_blocks = {"req-dyn": list(blocks)}
+
+    def fake_remove(req_id, start, end):
+        del manager.req_to_blocks[req_id][start:end]
+
+    manager._remove_blocks_in_range = fake_remove
+    manager.compact_block_table = lambda req_id: 16
+
+    plan = PositionReanchor(delta=16, moved_from=prefix_tokens + 16, sink_blocks=sink_blocks)
+    freed = manager.reanchor_block_table("req-dyn", plan)
+    assert freed == 16
+    # Verified: sink blocks 0..6 (7 blocks) preserved, gap block 7 freed!
+    assert len(manager.req_to_blocks["req-dyn"]) == 11
+    assert manager.req_to_blocks["req-dyn"][:7] == blocks[:7]
+    assert manager.req_to_blocks["req-dyn"][7:] == blocks[8:]
+
+
+def test_non_duplex_regression():
+    """Verify that non-duplex requests or sliding_window_mode='off' are completely bypassed."""
+    session = SimpleNamespace(
+        request_id="req-non-duplex",
+        prompt_token_ids=[1, 2, 3],
+        _all_token_ids=[1, 2, 3],
+        num_prompt_tokens=3,
+        num_computed_tokens=3,
+    )
+    # Case 1: No duplex in buffer
+    update1 = SimpleNamespace(prompt_token_ids=[4], model_intermediate_buffer={})
+    scheduler = SimpleNamespace()
+    assert MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update1) is None
+    assert session.num_computed_tokens == 3
+
+    # Case 2: sliding_window_mode = 'off'
+    update2 = SimpleNamespace(
+        prompt_token_ids=[4],
+        model_intermediate_buffer={
+            "duplex": {
+                "data_plane": True,
+                "runtime_config": {
+                    "duplex_window_config": {"sliding_window_mode": "off"},
+                },
+            }
+        },
+    )
+    assert MiniCPMO45DuplexSchedulerHelper.maybe_reanchor_session(scheduler, session, update2) is None
+    assert session.num_computed_tokens == 3
 
 
 def test_assert_uniform_position_shift():
@@ -506,3 +687,15 @@ def test_scheduler_replace_streaming_prompt_bypasses_reanchor():
     assert session.released is True
     assert session.replaced is True
     assert len(reanchor_called) == 0, "Re-anchoring must not be called when replacing streaming prompt!"
+
+
+def test_slot_mapping_device_compatibility():
+    """Verify compute_slot_mapping creates table on positions device and does not error on CUDA/device tensor."""
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    pos = torch.tensor([0, 15, 16, 31, 32], dtype=torch.long, device=device)
+    block_ids = [10, 20, 30]
+    slots = compute_slot_mapping(block_ids, pos, block_size=16)
+    assert slots.device == device
+    assert slots.tolist() == [10 * 16 + 0, 10 * 16 + 15, 20 * 16 + 0, 20 * 16 + 15, 30 * 16 + 0]

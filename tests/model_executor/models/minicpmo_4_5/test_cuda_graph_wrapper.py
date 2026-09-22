@@ -1083,6 +1083,104 @@ def test_cfm_max_serial_batch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper._flush()
 
 
+def test_zero_padded_cnn_cache_vectorized() -> None:
+    depth, batch, cnn_channels, cnn_width = 2, 4, 8, 4
+    # 4D tensor test
+    cnn_cache_4d = torch.randn(depth, batch, cnn_channels, cnn_width)
+    expected_4d = cnn_cache_4d.clone()
+    pad_frames = 2
+    zero_from = max(0, cnn_width - pad_frames)
+    expected_4d[..., zero_from:] = 0.0
+
+    actual_4d = cnn_cache_4d.clone()
+    estimator = _WholeEulerDiT()
+    wrapper_module._zero_padded_cnn_cache(actual_4d, estimator, pad_frames)
+    torch.testing.assert_close(actual_4d, expected_4d)
+
+    # 5D tensor test (timesteps, depth, batch, channels, width)
+    timesteps = 10
+    cnn_cache_5d = torch.randn(timesteps, depth, batch, cnn_channels, cnn_width)
+    expected_5d = cnn_cache_5d.clone()
+    expected_5d[..., zero_from:] = 0.0
+
+    actual_5d = cnn_cache_5d.clone()
+    wrapper_module._zero_padded_cnn_cache(actual_5d, estimator, pad_frames)
+    torch.testing.assert_close(actual_5d, expected_5d)
+
+
+def test_fused_euler_step_eager_fallback() -> None:
+    torch.manual_seed(42)
+    B, C, T = 2, 8, 16
+    cur_x = torch.randn(B, C, T)
+    estimate = torch.randn(2 * B, C, T)
+    dt = 0.1
+    cfg = 0.7
+
+    cond, uncond = estimate.split(B, dim=0)
+    v = (1.0 + cfg) * cond - cfg * uncond
+    expected = cur_x + dt * v
+
+    actual = wrapper_module._fused_euler_step(cur_x.clone(), estimate, dt, cfg, B)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_execution_arena_buffer_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=4)
+
+    w = 10
+    x1 = torch.randn(1, 4, w, device="cuda")
+    mu1 = torch.randn(2, 4, w, device="cuda")
+    spk1 = torch.randn(2, 4, device="cuda")
+    cond1 = torch.randn(2, 4, w, device="cuda")
+
+    # First call captures shape 1 (offset=0)
+    res1 = wrapper.replay(
+        x=x1,
+        mu_cfg=mu1,
+        speakers_cfg=spk1,
+        cond_cfg=cond1,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert res1 is not None
+    assert wrapper._stats["captures"] == 1
+    assert len(wrapper.arena._shared_time_embeddings) == 1
+    assert len(wrapper.arena._shared_cnn_in) == 1
+    assert len(wrapper.arena._shared_cnn_out) == 1
+
+    shared_time_emb = wrapper.arena._shared_time_embeddings[1]
+    shared_cnn_in = wrapper.arena._shared_cnn_in[1]
+    shared_cnn_out = wrapper.arena._shared_cnn_out[1]
+
+    # Second call with cache (offset=10)
+    res2 = wrapper.replay(
+        x=x1,
+        mu_cfg=mu1,
+        speakers_cfg=spk1,
+        cond_cfg=cond1,
+        cnn_cache=res1[1],
+        att_cache=res1[2],
+    )
+    assert res2 is not None
+    assert wrapper._stats["captures"] == 2
+
+    # Verify that the shared buffers are the exact same tensor instances (no duplicate allocation)
+    assert wrapper.arena._shared_time_embeddings[1] is shared_time_emb
+    assert wrapper.arena._shared_cnn_in[1] is shared_cnn_in
+    assert wrapper.arena._shared_cnn_out[1] is shared_cnn_out
+
+    wrapper._flush()
+    assert len(wrapper.arena._shared_time_embeddings) == 0
+    assert len(wrapper.arena._shared_cnn_in) == 0
+    assert len(wrapper.arena._shared_cnn_out) == 0
+
+
 class _RealCausalDiTBlock(nn.Module):
     """Causal convolution and self-attention block for multi-chunk numerical verification."""
 

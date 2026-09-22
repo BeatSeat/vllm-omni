@@ -298,6 +298,7 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self._timeline_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
@@ -710,6 +711,15 @@ class BatchedToken2Wav(nn.Module):
 
         return estimator.final_layer(x, time_embedding).transpose(1, 2)
 
+    def _get_timeline(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device, dtype)
+        timeline = self._timeline_cache.get(key)
+        if timeline is None:
+            t = torch.linspace(0, 1, self.n_timesteps + 1, device=device, dtype=dtype)
+            timeline = (1 - torch.cos(t * 0.5 * torch.pi)).contiguous()
+            self._timeline_cache[key] = timeline
+        return timeline
+
     def _decode_cfm(
         self,
         mu: torch.Tensor,
@@ -773,14 +783,7 @@ class BatchedToken2Wav(nn.Module):
             # is what removes them; zeroing alone would not, since a zero row
             # still occupies part of the softmax denominator.
             x[:, :, mel_frames:] = 0.0
-        timeline = torch.linspace(
-            0,
-            1,
-            self.n_timesteps + 1,
-            device=mu.device,
-            dtype=mu.dtype,
-        )
-        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        timeline = self._get_timeline(mu.device, mu.dtype)
         time = timeline[0].expand(batch_size)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)

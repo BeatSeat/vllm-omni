@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
+from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper, WholeEulerCFMGraphWrapper
 
 logger = init_logger(__name__)
 
@@ -308,16 +308,27 @@ class BatchedToken2Wav(nn.Module):
                     self.hift_graph_wrapper.capture()
                 logger.info("HiFT CUDA Graph captured successfully")
         self._cfm_graph_wrapper: CFMGraphWrapper | None = None
+        self._whole_euler_graph_wrapper: WholeEulerCFMGraphWrapper | None = None
         cfm_graph_cfg = dict(cfm_graph_config or {})
         if bool(cfm_graph_cfg.get("enabled", False)):
             flow_parameter = next(self.flow.parameters(), None)
             if flow_parameter is not None and flow_parameter.device.type == "cuda":
                 estimator = self.flow.decoder.estimator
+                max_graphs = int(cfm_graph_cfg.get("max_graphs", 32))
+                if bool(cfm_graph_cfg.get("enable_whole_euler", True)):
+                    self._whole_euler_graph_wrapper = WholeEulerCFMGraphWrapper(
+                        estimator=estimator,
+                        n_timesteps=self.n_timesteps,
+                        inference_cfg_rate=getattr(self.flow.decoder, "inference_cfg_rate", 0.7),
+                        att_cache_dtype=self._estimator_att_cache_dtype,
+                        max_graphs=max_graphs,
+                    )
+                    logger.info("Whole-Euler CFM CUDA Graph enabled (max_graphs=%d)", max_graphs)
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
-                    max_graphs=int(cfm_graph_cfg.get("max_graphs", 32)),
+                    max_graphs=max_graphs,
                 )
-                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", int(cfm_graph_cfg.get("max_graphs", 32)))
+                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", max_graphs)
             else:
                 logger.info(
                     "CFM CUDA Graph is disabled on device type %s",
@@ -327,7 +338,9 @@ class BatchedToken2Wav(nn.Module):
         # chunk up to a multiple of this many frames so the graph cache key
         # space stays small (0 disables bucketing, e.g. when graphs are off).
         self._cfm_graph_bucket_frames = (
-            int(cfm_graph_cfg.get("bucket_frames", 0)) if self._cfm_graph_wrapper is not None else 0
+            int(cfm_graph_cfg.get("bucket_frames", 0))
+            if (self._cfm_graph_wrapper is not None or self._whole_euler_graph_wrapper is not None)
+            else 0
         )
         if self._cfm_graph_bucket_frames > 1:
             logger.info(
@@ -484,6 +497,8 @@ class BatchedToken2Wav(nn.Module):
         attn_mask: torch.Tensor | None = None,
         valid_lengths: list[int] | None = None,
         valid_frames: int | None = None,
+        att_out_buffer: Any = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
@@ -661,18 +676,22 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(mu.shape[0])
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
         mel_frames = int(mu.shape[2])
+        graphs_active = (
+            (
+                self._whole_euler_graph_wrapper is not None
+                and getattr(self._whole_euler_graph_wrapper, "enabled", True)
+            )
+            or (
+                self._cfm_graph_wrapper is not None
+                and getattr(self._cfm_graph_wrapper, "enabled", True)
+            )
+        ) if valid_lengths is None else False
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
             offset=offset,
             noise_capacity=int(decoder.rand_noise.shape[2]),
             bucket_frames=self._cfm_graph_bucket_frames,
-            disabled=(
-                valid_lengths is not None
-                or self._cfm_graph_wrapper is None
-                # `_disable` keeps the wrapper object alive, so check the flag
-                # too: padding under a disabled wrapper is pure overhead.
-                or not self._cfm_graph_wrapper.enabled
-            ),
+            disabled=(valid_lengths is not None or not graphs_active),
         )
         if pad_frames:
             # Replicate rather than zero: a repeated last frame is a closer
@@ -738,6 +757,26 @@ class BatchedToken2Wav(nn.Module):
                 device=mu.device,
             )
             attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
+
+        if (
+            valid_lengths is None
+            and self._whole_euler_graph_wrapper is not None
+            and getattr(self._whole_euler_graph_wrapper, "enabled", True)
+        ):
+            whole_euler_result = self._whole_euler_graph_wrapper.replay(
+                x=x,
+                mu_cfg=mu_cfg,
+                speakers_cfg=speakers_cfg,
+                cond_cfg=cond_cfg,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+                attn_mask=attn_mask,
+                mel_frames=mel_frames,
+                pad_frames=pad_frames,
+            )
+            if whole_euler_result is not None:
+                return whole_euler_result
+
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None

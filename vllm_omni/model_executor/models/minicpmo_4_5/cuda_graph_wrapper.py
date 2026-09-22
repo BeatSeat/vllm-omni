@@ -34,7 +34,7 @@ class HiFTGraphWrapper:
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
-        self.max_lazy_graphs = 8
+        self.max_lazy_graphs = 32
         self.lazy_graph_count = 0
 
     def derive_capture_bucket_size(self):
@@ -108,6 +108,14 @@ class HiFTGraphWrapper:
         target_b = next((b for b in sorted(self.capture_batch_sizes) if b >= batch_size), None)
 
         if target_b is None:
+            if 1 in self.capture_batch_sizes and batch_size > 1:
+                speeches = []
+                sources = []
+                for b in range(batch_size):
+                    sp, src = self.replay(speech_feat[b : b + 1], cache_source[b : b + 1])
+                    speeches.append(sp)
+                    sources.append(src)
+                return torch.cat(speeches, dim=0), torch.cat(sources, dim=0)
             logger.info("Falling back to eager HiFT inference for unsupported batch size %d", batch_size)
             return self.decode_fn(speech_feat, cache_source)
 
@@ -360,4 +368,444 @@ class CFMGraphWrapper:
             static_output.detach().clone(),
             static_inputs[4].detach().clone(),
             static_inputs[5].detach().clone(),
+        )
+
+
+def _zero_padded_cnn_cache(
+    cnn_cache: torch.Tensor,
+    estimator: torch.nn.Module,
+    pad_frames: int,
+) -> None:
+    """Clear the cache positions that come from padded frames, in place."""
+    for index, block in enumerate(estimator.blocks):
+        width = int(block.conv.block[1].causal_padding[0])
+        if width <= 0:
+            continue
+        zero_from = max(0, width - pad_frames)
+        if zero_from < width:
+            cnn_cache[index][..., zero_from:] = 0.0
+
+
+class WholeEulerCFMGraphWrapper:
+    """Per-shape CUDA graph capture/replay for the entire 10-step CFM Euler ODE solver.
+
+    Captures all 10 iterations of:
+    (time embedding -> in_proj -> DiT blocks -> final layer -> CFG combination -> Euler step)
+    into a single CUDA Graph replay.
+
+    Replaces 10 separate step-level graph replays and 30 Python clones per chunk
+    with a single graph replay, reducing CPU launch overhead and eliminating host-device
+    synchronization bubbles during high concurrency.
+    """
+
+    def __init__(
+        self,
+        estimator: torch.nn.Module,
+        *,
+        n_timesteps: int = 10,
+        inference_cfg_rate: float = 0.7,
+        att_cache_dtype: torch.dtype = torch.float32,
+        max_graphs: int = 32,
+    ) -> None:
+        self.estimator = estimator
+        self.n_timesteps = int(n_timesteps)
+        self.inference_cfg_rate = float(inference_cfg_rate)
+        self.att_cache_dtype = att_cache_dtype
+        self.max_graphs = int(max_graphs)
+        parameter = next(estimator.parameters(), None)
+        if parameter is not None:
+            self.device = parameter.device
+            self.dtype = parameter.dtype
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.dtype = torch.float32
+
+        self.enabled = self.max_graphs > 0 and self.device.type == "cuda"
+        self._cache: dict[tuple, tuple] = {}
+        self._unsupported: set[tuple] = set()
+        self._stats = {
+            "calls": 0,
+            "hits": 0,
+            "captures": 0,
+            "flushes": 0,
+            "eager": 0,
+        }
+
+        timeline = torch.linspace(
+            0,
+            1,
+            self.n_timesteps + 1,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        self.dt_steps = [self.timeline[i + 1] - self.timeline[i] for i in range(self.n_timesteps)]
+        self.time_steps = [self.timeline[i] for i in range(self.n_timesteps)]
+
+    def stats_snapshot(self) -> dict[str, int]:
+        """Bounded cumulative telemetry for the graph cache."""
+        return {**self._stats, "cache_size": len(self._cache)}
+
+    def _flush(self) -> None:
+        """Retire every captured graph at once."""
+        if not self._cache:
+            return
+        torch.accelerator.synchronize(self.device)
+        for entry in self._cache.values():
+            entry[4].reset()
+        self._cache.clear()
+        self._stats["flushes"] += 1
+        logger.info("Whole-Euler CFM graph cache flushed; stats=%s", self.stats_snapshot())
+
+    def _disable(self, reason: str, key: tuple) -> None:
+        logger.warning(
+            "Disabling Whole-Euler CFM CUDA graphs (%s) for shape=%s; using step/eager fallback",
+            reason,
+            key,
+            exc_info=True,
+        )
+        self.enabled = False
+        self._flush()
+
+    def _run_euler_loop(
+        self,
+        static_x: torch.Tensor,
+        static_mu_cfg: torch.Tensor,
+        static_speakers_cfg: torch.Tensor,
+        static_cond_cfg: torch.Tensor,
+        static_cnn_cache: torch.Tensor,
+        static_att_cache: torch.Tensor,
+        static_attn_mask: torch.Tensor | None,
+        out_cnn_cache: torch.Tensor,
+        out_att_cache: torch.Tensor,
+        static_time_embeddings: torch.Tensor,
+        *,
+        batch_size: int,
+        has_cnn_cache: bool,
+        has_att_cache: bool,
+    ) -> torch.Tensor:
+        cur_x = static_x
+        depth = len(self.estimator.blocks)
+        width = int(static_mu_cfg.shape[2])
+        speaker_features = static_speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
+
+        for step in range(self.n_timesteps):
+            dt = self.dt_steps[step]
+            time_embedding = static_time_embeddings[step]
+            x_cfg = torch.cat((cur_x, cur_x), dim=0)
+            estimator_input = torch.cat((x_cfg, static_mu_cfg, speaker_features, static_cond_cfg), dim=1)
+
+            step_cnn_out = out_cnn_cache[step]
+            step_att_out = out_att_cache[step]
+            old_cnn = static_cnn_cache[step] if has_cnn_cache else [None] * depth
+            old_att = static_att_cache[step] if has_att_cache else [None] * depth
+
+            estimate = self.estimator.blocks_forward_chunk(
+                estimator_input,
+                time_embedding,
+                static_attn_mask,
+                old_cnn,
+                old_att,
+                step_cnn_out,
+                step_att_out,
+            )
+
+            conditional, unconditional = estimate.split(batch_size, dim=0)
+            velocity = (1.0 + self.inference_cfg_rate) * conditional - self.inference_cfg_rate * unconditional
+            cur_x = cur_x + dt * velocity
+
+        return cur_x
+
+    def _capture(
+        self,
+        key: tuple,
+        *,
+        x: torch.Tensor,
+        mu_cfg: torch.Tensor,
+        speakers_cfg: torch.Tensor,
+        cond_cfg: torch.Tensor,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        attn_mask: torch.Tensor | None,
+        batch_size: int,
+        offset: int,
+        has_cnn_cache: bool,
+        has_att_cache: bool,
+        has_mask: bool,
+    ) -> tuple | None:
+        try:
+            static_x = x.detach().clone()
+            static_mu_cfg = mu_cfg.detach().clone()
+            static_speakers_cfg = speakers_cfg.detach().clone()
+            static_cond_cfg = cond_cfg.detach().clone()
+
+            blocks = self.estimator.blocks
+            depth = len(blocks)
+            block0 = blocks[0]
+            cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
+            cnn_width = int(block0.conv.block[1].causal_padding[0])
+            heads = int(block0.attn.num_heads)
+            att_width = int(block0.attn.head_dim * 2)
+            mel_width = int(mu_cfg.shape[2])
+
+            if has_cnn_cache and cnn_cache is not None:
+                static_cnn_cache = cnn_cache.detach().clone()
+            else:
+                static_cnn_cache = torch.zeros(
+                    self.n_timesteps, depth, 2 * batch_size, cnn_channels, cnn_width,
+                    device=self.device, dtype=self.dtype,
+                )
+
+            if has_att_cache and att_cache is not None and offset > 0:
+                static_att_cache = att_cache.detach().clone()
+            else:
+                static_att_cache = torch.zeros(
+                    self.n_timesteps, depth, 2 * batch_size, heads, 0, att_width,
+                    device=self.device, dtype=self.att_cache_dtype,
+                )
+
+            static_attn_mask = attn_mask.detach().clone() if (has_mask and attn_mask is not None) else None
+
+            out_cnn_cache = torch.empty(
+                self.n_timesteps, depth, 2 * batch_size, cnn_channels, cnn_width,
+                device=self.device, dtype=self.dtype,
+            )
+            out_att_cache = torch.empty(
+                self.n_timesteps, depth, 2 * batch_size, heads, offset + mel_width, att_width,
+                device=self.device, dtype=self.att_cache_dtype,
+            )
+            static_time_embeddings = torch.stack(
+                [
+                    self.estimator.t_embedder(self.time_steps[s].expand(2 * batch_size)).unsqueeze(1)
+                    for s in range(self.n_timesteps)
+                ],
+                dim=0,
+            )
+        except Exception:
+            logger.warning("Failed to allocate static buffers for Whole-Euler graph key: %s", key, exc_info=True)
+            self._unsupported.add(key)
+            return None
+
+        memory_before = _memory_snapshot(self.device)
+        try:
+            current_stream = torch.cuda.current_stream(self.device)
+            warmup_stream = torch.cuda.Stream(device=self.device)
+            warmup_stream.wait_stream(current_stream)
+            with torch.cuda.stream(warmup_stream), torch.no_grad():
+                for _ in range(3):
+                    _ = self._run_euler_loop(
+                        static_x,
+                        static_mu_cfg,
+                        static_speakers_cfg,
+                        static_cond_cfg,
+                        static_cnn_cache,
+                        static_att_cache,
+                        static_attn_mask,
+                        out_cnn_cache,
+                        out_att_cache,
+                        static_time_embeddings,
+                        batch_size=batch_size,
+                        has_cnn_cache=has_cnn_cache,
+                        has_att_cache=has_att_cache,
+                    )
+            current_stream.wait_stream(warmup_stream)
+
+            graph = CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                static_final_x = self._run_euler_loop(
+                    static_x,
+                    static_mu_cfg,
+                    static_speakers_cfg,
+                    static_cond_cfg,
+                    static_cnn_cache,
+                    static_att_cache,
+                    static_attn_mask,
+                    out_cnn_cache,
+                    out_att_cache,
+                    static_time_embeddings,
+                    batch_size=batch_size,
+                    has_cnn_cache=has_cnn_cache,
+                    has_att_cache=has_att_cache,
+                )
+        except Exception:
+            self._disable("capture failed", key)
+            return None
+
+        static_inputs = (
+            static_x,
+            static_mu_cfg,
+            static_speakers_cfg,
+            static_cond_cfg,
+            static_cnn_cache,
+            static_att_cache,
+            static_attn_mask,
+            static_time_embeddings,
+        )
+        self._stats["captures"] += 1
+        logger.info(
+            "Captured Whole-Euler CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)%s",
+            key,
+            len(self._cache) + 1,
+            self.max_graphs,
+            self.stats_snapshot(),
+            _format_memory_delta(memory_before, _memory_snapshot(self.device)),
+        )
+        return (static_inputs, static_final_x, out_cnn_cache, out_att_cache, graph)
+
+    def replay(
+        self,
+        *,
+        x: torch.Tensor,
+        mu_cfg: torch.Tensor,
+        speakers_cfg: torch.Tensor,
+        cond_cfg: torch.Tensor,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        attn_mask: torch.Tensor | None = None,
+        mel_frames: int | None = None,
+        pad_frames: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        self._stats["calls"] += 1
+
+        if not self.enabled or torch.cuda.is_current_stream_capturing() or x.device.type != "cuda":
+            return None
+
+        batch_size = int(x.shape[0])
+        mel_width = int(mu_cfg.shape[2])
+        if mel_frames is None:
+            mel_frames = mel_width - pad_frames
+
+        if batch_size > 1:
+            chunk_mels: list[torch.Tensor] = []
+            out_cnns: list[torch.Tensor] = []
+            out_atts: list[torch.Tensor] = []
+            for b in range(batch_size):
+                sub_x = x[b : b + 1]
+                sub_mu = torch.cat((mu_cfg[b : b + 1], mu_cfg[batch_size + b : batch_size + b + 1]), dim=0)
+                sub_spk = torch.cat((speakers_cfg[b : b + 1], speakers_cfg[batch_size + b : batch_size + b + 1]), dim=0)
+                sub_cond = torch.cat((cond_cfg[b : b + 1], cond_cfg[batch_size + b : batch_size + b + 1]), dim=0)
+                sub_cnn = (
+                    torch.cat((cnn_cache[:, :, b : b + 1], cnn_cache[:, :, batch_size + b : batch_size + b + 1]), dim=2)
+                    if cnn_cache is not None
+                    else None
+                )
+                sub_att = (
+                    torch.cat((att_cache[:, :, b : b + 1], att_cache[:, :, batch_size + b : batch_size + b + 1]), dim=2)
+                    if att_cache is not None
+                    else None
+                )
+                sub_mask = (
+                    torch.cat((attn_mask[b : b + 1], attn_mask[batch_size + b : batch_size + b + 1]), dim=0)
+                    if attn_mask is not None
+                    else None
+                )
+                sub_res = self.replay(
+                    x=sub_x,
+                    mu_cfg=sub_mu,
+                    speakers_cfg=sub_spk,
+                    cond_cfg=sub_cond,
+                    cnn_cache=sub_cnn,
+                    att_cache=sub_att,
+                    attn_mask=sub_mask,
+                    mel_frames=mel_frames,
+                    pad_frames=pad_frames,
+                )
+                if sub_res is None:
+                    return None
+                chunk_mels.append(sub_res[0])
+                out_cnns.append(sub_res[1])
+                out_atts.append(sub_res[2])
+
+            chunk_mel = torch.cat(chunk_mels, dim=0)
+            cond_cnns = torch.cat([c[:, :, 0:1] for c in out_cnns], dim=2)
+            uncond_cnns = torch.cat([c[:, :, 1:2] for c in out_cnns], dim=2)
+            out_cnn = torch.cat((cond_cnns, uncond_cnns), dim=2)
+
+            cond_atts = torch.cat([a[:, :, 0:1] for a in out_atts], dim=2)
+            uncond_atts = torch.cat([a[:, :, 1:2] for a in out_atts], dim=2)
+            out_att = torch.cat((cond_atts, uncond_atts), dim=2)
+            return chunk_mel, out_cnn, out_att
+        offset = int(att_cache.shape[4]) if att_cache is not None else 0
+        has_cnn_cache = cnn_cache is not None
+        has_att_cache = att_cache is not None
+        has_mask = attn_mask is not None
+
+        key = (
+            "whole_euler",
+            batch_size,
+            mel_width,
+            offset,
+            has_cnn_cache,
+            has_att_cache,
+            has_mask,
+            str(x.dtype),
+            str(x.device),
+        )
+
+        if key in self._unsupported:
+            return None
+
+        entry = self._cache.get(key)
+        if entry is None:
+            if len(self._cache) >= self.max_graphs:
+                self._flush()
+            entry = self._capture(
+                key,
+                x=x,
+                mu_cfg=mu_cfg,
+                speakers_cfg=speakers_cfg,
+                cond_cfg=cond_cfg,
+                cnn_cache=cnn_cache,
+                att_cache=att_cache,
+                attn_mask=attn_mask,
+                batch_size=batch_size,
+                offset=offset,
+                has_cnn_cache=has_cnn_cache,
+                has_att_cache=has_att_cache,
+                has_mask=has_mask,
+            )
+            if entry is None:
+                return None
+            self._cache[key] = entry
+        else:
+            self._stats["hits"] += 1
+
+        static_inputs, static_final_x, out_cnn_cache, out_att_cache, graph = entry
+        (
+            static_x,
+            static_mu_cfg,
+            static_speakers_cfg,
+            static_cond_cfg,
+            static_cnn_cache,
+            static_att_cache,
+            static_attn_mask,
+            _static_time_embeddings,
+        ) = static_inputs
+
+        static_x.copy_(x)
+        static_mu_cfg.copy_(mu_cfg)
+        static_speakers_cfg.copy_(speakers_cfg)
+        static_cond_cfg.copy_(cond_cfg)
+        if has_cnn_cache and cnn_cache is not None:
+            static_cnn_cache.copy_(cnn_cache)
+        elif not has_cnn_cache:
+            static_cnn_cache.zero_()
+        if has_att_cache and att_cache is not None and offset > 0:
+            static_att_cache.copy_(att_cache)
+        if has_mask and attn_mask is not None and static_attn_mask is not None:
+            static_attn_mask.copy_(attn_mask)
+
+        graph.replay()
+
+        out_cnn = out_cnn_cache.detach().clone()
+        out_att = out_att_cache.detach().clone()
+        if pad_frames > 0:
+            for s in range(self.n_timesteps):
+                _zero_padded_cnn_cache(out_cnn[s], self.estimator, pad_frames)
+            out_att[..., mel_frames : mel_frames + pad_frames, :] = 0.0
+
+        return (
+            static_final_x[:, :, :mel_frames].detach().clone(),
+            out_cnn,
+            out_att,
         )

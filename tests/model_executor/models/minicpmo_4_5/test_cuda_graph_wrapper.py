@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
+    WholeEulerCFMGraphWrapper,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -146,6 +147,20 @@ def test_lazy_capture_limit_falls_back_to_eager(monkeypatch: pytest.MonkeyPatch)
     wrapper._capture.assert_not_called()
     wrapper.decode_fn.assert_called_once_with(speech_feat, cache_source)
     assert result is wrapper.decode_fn.return_value
+
+
+def test_multibatch_serial_replay_with_batch1_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper = _fake_wrapper(monkeypatch)
+    # 3-batch input with only batch size 1 supported
+    speech_feat = torch.randn(3, 80, 7)
+    cache_source = torch.zeros(3, 1, 0)
+    speech, source = wrapper.replay(speech_feat, cache_source)
+
+    # Lazily captured once for shape (1, 7, 0)
+    wrapper._capture.assert_called_once_with(1, 7, 0)
+    assert speech.shape == (3, 1, 7)
+    assert source.shape == (3, 1, 7)
+    wrapper.decode_fn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -582,3 +597,389 @@ def test_cfm_none_cache_parity_between_graph_and_eager(
     torch.testing.assert_close(graph_result, eager_result, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(graph_cnn, eager_cnn_out, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(graph_att, eager_att_out, rtol=1e-4, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# WholeEulerCFMGraphWrapper tests
+# ---------------------------------------------------------------------------
+
+
+class _WholeEulerDiT(nn.Module):
+    """DiT module with t_embedder and buffer dimensions for Whole-Euler testing."""
+
+    def __init__(self, x_dim: int = 4, hidden: int = 8, depth: int = 2) -> None:
+        super().__init__()
+        self.x_dim = x_dim
+        self.in_proj = nn.Linear(x_dim * 4, hidden)
+        self.blocks = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(depth)])
+        self.final_layer = nn.Linear(hidden, x_dim)
+        for b in self.blocks:
+            b.conv = SimpleNamespace(
+                in_channels=4,
+                out_channels=4,
+                block=[None, SimpleNamespace(causal_padding=[2])],
+            )
+            b.attn = SimpleNamespace(num_heads=2, head_dim=4)
+
+    def t_embedder(self, t: torch.Tensor) -> torch.Tensor:
+        return t[:, None].expand(-1, 8)
+
+    def blocks_forward_chunk(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor | None,
+        cnn_cache: torch.Tensor | None = None,
+        att_cache: torch.Tensor | None = None,
+        cnn_cache_buffer: torch.Tensor | None = None,
+        att_cache_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert cnn_cache_buffer is not None
+        assert att_cache_buffer is not None
+        x = x.transpose(1, 2)
+        x = self.in_proj(x)
+        for b_idx in range(len(self.blocks)):
+            cnn_b = cnn_cache[b_idx] if cnn_cache is not None else None
+            if cnn_b is not None:
+                x[:, : cnn_b.shape[2], :] += cnn_b.transpose(1, 2)
+            att_b = att_cache[b_idx] if att_cache is not None else None
+            old_len = 0
+            if att_b is not None and att_b.shape[2] > 0:
+                old_len = att_b.shape[2]
+                x += att_b.sum(dim=(1, 2), keepdim=False).unsqueeze(1)
+                att_cache_buffer[b_idx][:, :, :old_len, :] = att_b
+            x = self.blocks[b_idx](x)
+            x = x + t
+            cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
+            dt = x.shape[1]
+            att_cache_buffer[b_idx][:, :, old_len : old_len + dt, :] = x.unsqueeze(1)
+        x = self.final_layer(x)
+        return x.transpose(1, 2)
+
+
+def _eager_solve_euler(
+    estimator: nn.Module,
+    x: torch.Tensor,
+    mu_cfg: torch.Tensor,
+    speakers_cfg: torch.Tensor,
+    cond_cfg: torch.Tensor,
+    cnn_cache: torch.Tensor | None,
+    att_cache: torch.Tensor | None,
+    attn_mask: torch.Tensor | None,
+    timeline: torch.Tensor,
+    *,
+    n_timesteps: int = 10,
+    inference_cfg_rate: float = 0.7,
+    mel_frames: int | None = None,
+    pad_frames: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cur_x = x.clone()
+    batch_size = int(x.shape[0])
+    width = int(mu_cfg.shape[2])
+    if mel_frames is None:
+        mel_frames = width - pad_frames
+    speaker_features = speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
+    if pad_frames > 0:
+        speaker_features = speaker_features.clone()
+        speaker_features[..., mel_frames:] = 0.0
+
+    depth = len(estimator.blocks)
+    block0 = estimator.blocks[0]
+    cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
+    cnn_width = int(block0.conv.block[1].causal_padding[0])
+    heads = int(block0.attn.num_heads)
+    att_width = int(block0.attn.head_dim * 2)
+    offset = int(att_cache.shape[4]) if att_cache is not None else 0
+
+    next_cnns = []
+    next_atts = []
+
+    for step in range(n_timesteps):
+        t_val = timeline[step].expand(2 * batch_size)
+        dt = timeline[step + 1] - timeline[step]
+        time_embedding = estimator.t_embedder(t_val).unsqueeze(1)
+        x_cfg = torch.cat((cur_x, cur_x), dim=0)
+        estimator_input = torch.cat((x_cfg, mu_cfg, speaker_features, cond_cfg), dim=1)
+
+        c_out = torch.empty(depth, 2 * batch_size, cnn_channels, cnn_width, device=x.device, dtype=x.dtype)
+        a_out = torch.empty(depth, 2 * batch_size, heads, offset + width, att_width, device=x.device, dtype=x.dtype)
+        old_c = cnn_cache[step] if cnn_cache is not None else [None] * depth
+        old_a = att_cache[step] if att_cache is not None else [None] * depth
+
+        est = estimator.blocks_forward_chunk(
+            estimator_input,
+            time_embedding,
+            attn_mask,
+            old_c,
+            old_a,
+            c_out,
+            a_out,
+        )
+
+        if pad_frames > 0:
+            wrapper_module._zero_padded_cnn_cache(c_out, estimator, pad_frames)
+            a_out[..., mel_frames : mel_frames + pad_frames, :] = 0.0
+
+        conditional, unconditional = est.split(batch_size, dim=0)
+        velocity = (1.0 + inference_cfg_rate) * conditional - inference_cfg_rate * unconditional
+        cur_x = cur_x + dt * velocity
+        if pad_frames > 0:
+            cur_x[..., mel_frames:] = 0.0
+
+        next_cnns.append(c_out)
+        next_atts.append(a_out)
+
+    return cur_x[:, :, :mel_frames], torch.stack(next_cnns), torch.stack(next_atts)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_graph_replay_matches_eager_for_uncached_and_cached_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=32)
+
+    batch_size = 2
+    chunk_size = 10
+    x = torch.randn(batch_size, 4, chunk_size, device="cuda")
+    mu = torch.randn(batch_size, 4, chunk_size, device="cuda")
+    speakers = torch.randn(batch_size, 4, device="cuda")
+    cond = torch.randn(batch_size, 4, chunk_size, device="cuda")
+
+    mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
+    speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
+    cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+
+    # 1. Uncached case
+    eager_x, eager_cnn, eager_att = _eager_solve_euler(
+        estimator, x, mu_cfg, speakers_cfg, cond_cfg, None, None, None, wrapper.timeline
+    )
+    graph_res = wrapper.replay(
+        x=x.clone(),
+        mu_cfg=mu_cfg.clone(),
+        speakers_cfg=speakers_cfg.clone(),
+        cond_cfg=cond_cfg.clone(),
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=None,
+    )
+    assert graph_res is not None
+    graph_x, graph_cnn, graph_att = graph_res
+
+    torch.testing.assert_close(graph_x, eager_x, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_cnn, eager_cnn, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_att, eager_att, rtol=1e-4, atol=1e-5)
+
+    # 2. Cached case (carry forward previous chunk outputs)
+    x2 = torch.randn(batch_size, 4, chunk_size, device="cuda")
+    eager_x2, eager_cnn2, eager_att2 = _eager_solve_euler(
+        estimator, x2, mu_cfg, speakers_cfg, cond_cfg, eager_cnn, eager_att, None, wrapper.timeline
+    )
+    graph_res2 = wrapper.replay(
+        x=x2.clone(),
+        mu_cfg=mu_cfg.clone(),
+        speakers_cfg=speakers_cfg.clone(),
+        cond_cfg=cond_cfg.clone(),
+        cnn_cache=graph_cnn,
+        att_cache=graph_att,
+        attn_mask=None,
+    )
+    assert graph_res2 is not None
+    graph_x2, graph_cnn2, graph_att2 = graph_res2
+
+    torch.testing.assert_close(graph_x2, eager_x2, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_cnn2, eager_cnn2, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_att2, eager_att2, rtol=1e-4, atol=1e-5)
+
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_graph_with_padding_matches_eager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(42)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=16)
+
+    batch_size = 2
+    mel_frames = 8
+    pad_frames = 2
+    chunk_size = mel_frames + pad_frames
+
+    x = torch.randn(batch_size, 4, chunk_size, device="cuda")
+    x[:, :, mel_frames:] = 0.0
+    mu = torch.randn(batch_size, 4, chunk_size, device="cuda")
+    speakers = torch.randn(batch_size, 4, device="cuda")
+    cond = torch.randn(batch_size, 4, chunk_size, device="cuda")
+
+    mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
+    speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
+    cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+
+    attn_mask = torch.ones(2 * batch_size, chunk_size, chunk_size, dtype=torch.bool, device="cuda")
+    attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
+
+    eager_x, eager_cnn, eager_att = _eager_solve_euler(
+        estimator,
+        x,
+        mu_cfg,
+        speakers_cfg,
+        cond_cfg,
+        None,
+        None,
+        attn_mask,
+        wrapper.timeline,
+        mel_frames=mel_frames,
+        pad_frames=pad_frames,
+    )
+
+    graph_res = wrapper.replay(
+        x=x.clone(),
+        mu_cfg=mu_cfg.clone(),
+        speakers_cfg=speakers_cfg.clone(),
+        cond_cfg=cond_cfg.clone(),
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=attn_mask.clone(),
+        mel_frames=mel_frames,
+        pad_frames=pad_frames,
+    )
+    assert graph_res is not None
+    graph_x, graph_cnn, graph_att = graph_res
+
+    assert graph_x.shape[2] == mel_frames
+    assert eager_x.shape[2] == mel_frames
+    torch.testing.assert_close(graph_x, eager_x, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_cnn, eager_cnn, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_att, eager_att, rtol=1e-4, atol=1e-5)
+
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_cache_flushes_whole_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=2)
+
+    def _call(w: int) -> None:
+        x = torch.randn(1, 4, w, device="cuda")
+        mu_cfg = torch.randn(2, 4, w, device="cuda")
+        spk_cfg = torch.randn(2, 4, device="cuda")
+        cond_cfg = torch.randn(2, 4, w, device="cuda")
+        wrapper.replay(
+            x=x,
+            mu_cfg=mu_cfg,
+            speakers_cfg=spk_cfg,
+            cond_cfg=cond_cfg,
+            cnn_cache=None,
+            att_cache=None,
+        )
+
+    _call(10)
+    assert len(wrapper._cache) == 1
+    assert wrapper._stats["captures"] == 1
+
+    # Same shape hits
+    _call(10)
+    assert wrapper._stats["hits"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_multibatch_serial_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=4)
+
+    batch_size = 2
+    w = 8
+    x = torch.randn(batch_size, 4, w, device="cuda")
+    mu_cfg = torch.randn(2 * batch_size, 4, w, device="cuda")
+    spk_cfg = torch.randn(2 * batch_size, 4, device="cuda")
+    cond_cfg = torch.randn(2 * batch_size, 4, w, device="cuda")
+
+    out_mel, out_cnn, out_att = wrapper.replay(
+        x=x,
+        mu_cfg=mu_cfg,
+        speakers_cfg=spk_cfg,
+        cond_cfg=cond_cfg,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert out_mel.shape == (batch_size, 4, w)
+    assert out_cnn.shape[2] == 2 * batch_size
+    assert out_att.shape[2] == 2 * batch_size
+    assert len(wrapper._cache) == 1
+    for key in wrapper._cache:
+        assert key[1] == 1
+
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_same_bucket_different_padding_hits_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=4)
+
+    batch_size = 1
+    mel_width = 16
+
+    # Call 1: mel_frames=12, pad_frames=4 -> captures graph 1
+    x1 = torch.randn(batch_size, 4, mel_width, device="cuda")
+    mu1 = torch.randn(2 * batch_size, 4, mel_width, device="cuda")
+    spk1 = torch.randn(2 * batch_size, 4, device="cuda")
+    cond1 = torch.randn(2 * batch_size, 4, mel_width, device="cuda")
+    mask1 = torch.ones(2 * batch_size, mel_width, mel_width, dtype=torch.bool, device="cuda")
+    mask1[:, :, 12:] = False
+
+    res1 = wrapper.replay(
+        x=x1, mu_cfg=mu1, speakers_cfg=spk1, cond_cfg=cond1,
+        cnn_cache=None, att_cache=None, attn_mask=mask1,
+        mel_frames=12, pad_frames=4,
+    )
+    assert res1 is not None
+    assert res1[0].shape[-1] == 12
+    assert wrapper._stats["captures"] == 1
+    assert wrapper._stats["hits"] == 0
+
+    # Call 2: mel_frames=10, pad_frames=6 (different unpadded length, same bucket mel_width)
+    x2 = torch.randn(batch_size, 4, mel_width, device="cuda")
+    mu2 = torch.randn(2 * batch_size, 4, mel_width, device="cuda")
+    spk2 = torch.randn(2 * batch_size, 4, device="cuda")
+    cond2 = torch.randn(2 * batch_size, 4, mel_width, device="cuda")
+    mask2 = torch.ones(2 * batch_size, mel_width, mel_width, dtype=torch.bool, device="cuda")
+    mask2[:, :, 10:] = False
+
+    res2 = wrapper.replay(
+        x=x2, mu_cfg=mu2, speakers_cfg=spk2, cond_cfg=cond2,
+        cnn_cache=None, att_cache=None, attn_mask=mask2,
+        mel_frames=10, pad_frames=6,
+    )
+    assert res2 is not None
+    assert res2[0].shape[-1] == 10
+    # Must be a cache hit!
+    assert wrapper._stats["captures"] == 1
+    assert wrapper._stats["hits"] == 1
+    assert len(wrapper._cache) == 1
+
+    wrapper._flush()

@@ -722,7 +722,7 @@ class WholeEulerCFMGraphWrapper:
             dtype=self.dtype,
         )
         self.timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
-        self.dt_steps = [self.timeline[i + 1] - self.timeline[i] for i in range(self.n_timesteps)]
+        self.dt_steps = [float((self.timeline[i + 1] - self.timeline[i]).item()) for i in range(self.n_timesteps)]
         self.time_steps = [self.timeline[i] for i in range(self.n_timesteps)]
         self.arena = WholeEulerExecutionArena(
             estimator=self.estimator,
@@ -782,7 +782,7 @@ class WholeEulerCFMGraphWrapper:
         speaker_features = static_speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
 
         for step in range(self.n_timesteps):
-            dt = float(self.dt_steps[step])
+            dt = self.dt_steps[step]
             time_embedding = static_time_embeddings[step]
             x_cfg = torch.cat((cur_x, cur_x), dim=0)
             estimator_input = torch.cat((x_cfg, static_mu_cfg, speaker_features, static_cond_cfg), dim=1)

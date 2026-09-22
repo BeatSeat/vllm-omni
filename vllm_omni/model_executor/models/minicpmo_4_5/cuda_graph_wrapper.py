@@ -10,6 +10,76 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _fused_euler_step_kernel(
+        x_ptr,
+        estimate_ptr,
+        dt,
+        cfg_rate,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        x = tl.load(x_ptr + offsets, mask=mask)
+        cond = tl.load(estimate_ptr + offsets, mask=mask)
+        uncond = tl.load(estimate_ptr + n_elements + offsets, mask=mask)
+
+        v = (1.0 + cfg_rate) * cond - cfg_rate * uncond
+        new_x = x + dt * v
+
+        tl.store(x_ptr + offsets, new_x.to(x.dtype), mask=mask)
+
+
+def _fused_euler_step(
+    cur_x: torch.Tensor,
+    estimate: torch.Tensor,
+    dt: float,
+    inference_cfg_rate: float,
+    batch_size: int,
+) -> torch.Tensor:
+    """In-place Euler ODE update: cur_x = cur_x + dt * ((1+cfg)*cond - cfg*uncond).
+
+    Uses Triton kernel when available on CUDA for a single fused launch without DRAM roundtrips.
+    Falls back to standard PyTorch ops when Triton is unavailable or tensors are non-contiguous.
+    """
+    if (
+        _HAS_TRITON
+        and cur_x.is_cuda
+        and cur_x.is_contiguous()
+        and estimate.is_contiguous()
+    ):
+        n_elements = cur_x.numel()
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        _fused_euler_step_kernel[grid](
+            cur_x,
+            estimate,
+            float(dt),
+            float(inference_cfg_rate),
+            n_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return cur_x
+
+    conditional, unconditional = estimate.split(batch_size, dim=0)
+    velocity = (1.0 + inference_cfg_rate) * conditional - inference_cfg_rate * unconditional
+    return cur_x + dt * velocity
+
+
 
 class HiFTGraphWrapper:
     max_serial_batch: int = 4
@@ -398,13 +468,198 @@ def _zero_padded_cnn_cache(
     pad_frames: int,
 ) -> None:
     """Clear the cache positions that come from padded frames, in place."""
-    for index, block in enumerate(estimator.blocks):
-        width = int(block.conv.block[1].causal_padding[0])
-        if width <= 0:
-            continue
-        zero_from = max(0, width - pad_frames)
-        if zero_from < width:
-            cnn_cache[index][..., zero_from:] = 0.0
+    if pad_frames <= 0:
+        return
+    width = cnn_cache.shape[-1]
+    if width <= 0:
+        return
+    zero_from = max(0, width - pad_frames)
+    if zero_from < width:
+        cnn_cache[..., zero_from:] = 0.0
+
+
+class WholeEulerExecutionArena:
+    """Decoupled memory arena managing static staging buffers for Whole-Euler CFM.
+
+    Shared static buffers (time embeddings, cnn input/output cache, speakers) are
+    allocated once per CFM execution lane rather than duplicated across every CUDA Graph
+    cache entry. Variable-shape staging buffers (x, mu, cond, att_cache) are reused
+    across graph entries sharing matching dimensions.
+    """
+
+    def __init__(
+        self,
+        estimator: torch.nn.Module,
+        *,
+        n_timesteps: int = 10,
+        device: torch.device,
+        dtype: torch.dtype,
+        att_cache_dtype: torch.dtype = torch.float32,
+        time_steps: list[torch.Tensor] | None = None,
+    ) -> None:
+        self.estimator = estimator
+        self.n_timesteps = int(n_timesteps)
+        self.device = device
+        self.dtype = dtype
+        self.att_cache_dtype = att_cache_dtype
+        self.time_steps = list(time_steps) if time_steps is not None else []
+
+        blocks = estimator.blocks
+        self.depth = len(blocks)
+        block0 = blocks[0]
+        self.cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
+        self.cnn_width = int(block0.conv.block[1].causal_padding[0])
+        self.heads = int(block0.attn.num_heads)
+        self.att_width = int(block0.attn.head_dim * 2)
+
+        # Shared static staging buffers (allocated once per lane, shared across shapes)
+        self._shared_time_embeddings: dict[int, torch.Tensor] = {}
+        self._shared_cnn_in: dict[int, torch.Tensor] = {}
+        self._shared_cnn_out: dict[int, torch.Tensor] = {}
+        self._shared_speakers: dict[tuple[int, int], torch.Tensor] = {}
+
+        # Shape-keyed variable staging buffers (reused when dimensions match)
+        self._x_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._mu_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._cond_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._att_cache_in: dict[tuple[int, int], torch.Tensor] = {}
+        self._att_cache_out: dict[tuple[int, int], torch.Tensor] = {}
+        self._mask_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
+
+    def get_time_embeddings(self, batch_size: int) -> torch.Tensor:
+        t_emb = self._shared_time_embeddings.get(batch_size)
+        if t_emb is None:
+            t_emb = torch.stack(
+                [
+                    self.estimator.t_embedder(self.time_steps[s].expand(2 * batch_size)).unsqueeze(1)
+                    for s in range(self.n_timesteps)
+                ],
+                dim=0,
+            )
+            self._shared_time_embeddings[batch_size] = t_emb
+        return t_emb
+
+    def get_cnn_cache_in(self, batch_size: int) -> torch.Tensor:
+        buf = self._shared_cnn_in.get(batch_size)
+        if buf is None:
+            buf = torch.zeros(
+                self.n_timesteps,
+                self.depth,
+                2 * batch_size,
+                self.cnn_channels,
+                self.cnn_width,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self._shared_cnn_in[batch_size] = buf
+        return buf
+
+    def get_cnn_cache_out(self, batch_size: int) -> torch.Tensor:
+        buf = self._shared_cnn_out.get(batch_size)
+        if buf is None:
+            buf = torch.empty(
+                self.n_timesteps,
+                self.depth,
+                2 * batch_size,
+                self.cnn_channels,
+                self.cnn_width,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self._shared_cnn_out[batch_size] = buf
+        return buf
+
+    def get_speakers_staging(self, batch_size: int, spk_dim: int) -> torch.Tensor:
+        key = (batch_size, spk_dim)
+        buf = self._shared_speakers.get(key)
+        if buf is None:
+            buf = torch.zeros(2 * batch_size, spk_dim, device=self.device, dtype=self.dtype)
+            self._shared_speakers[key] = buf
+        return buf
+
+    def get_x_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
+        key = (batch_size, channels, mel_width)
+        buf = self._x_buffers.get(key)
+        if buf is None:
+            buf = torch.zeros(batch_size, channels, mel_width, device=self.device, dtype=self.dtype)
+            self._x_buffers[key] = buf
+        return buf
+
+    def get_mu_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
+        key = (batch_size, channels, mel_width)
+        buf = self._mu_buffers.get(key)
+        if buf is None:
+            buf = torch.zeros(2 * batch_size, channels, mel_width, device=self.device, dtype=self.dtype)
+            self._mu_buffers[key] = buf
+        return buf
+
+    def get_cond_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
+        key = (batch_size, channels, mel_width)
+        buf = self._cond_buffers.get(key)
+        if buf is None:
+            buf = torch.zeros(2 * batch_size, channels, mel_width, device=self.device, dtype=self.dtype)
+            self._cond_buffers[key] = buf
+        return buf
+
+    def get_att_cache_in(self, batch_size: int, offset: int) -> torch.Tensor:
+        key = (batch_size, offset)
+        buf = self._att_cache_in.get(key)
+        if buf is None:
+            buf = torch.zeros(
+                self.n_timesteps,
+                self.depth,
+                2 * batch_size,
+                self.heads,
+                offset,
+                self.att_width,
+                device=self.device,
+                dtype=self.att_cache_dtype,
+            )
+            self._att_cache_in[key] = buf
+        return buf
+
+    def get_att_cache_out(self, batch_size: int, total_len: int) -> torch.Tensor:
+        key = (batch_size, total_len)
+        buf = self._att_cache_out.get(key)
+        if buf is None:
+            buf = torch.empty(
+                self.n_timesteps,
+                self.depth,
+                2 * batch_size,
+                self.heads,
+                total_len,
+                self.att_width,
+                device=self.device,
+                dtype=self.att_cache_dtype,
+            )
+            self._att_cache_out[key] = buf
+        return buf
+
+    def get_mask_staging(self, batch_size: int, mel_width: int, total_len: int) -> torch.Tensor:
+        key = (batch_size, mel_width, total_len)
+        buf = self._mask_buffers.get(key)
+        if buf is None:
+            buf = torch.ones(
+                2 * batch_size,
+                mel_width,
+                total_len,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self._mask_buffers[key] = buf
+        return buf
+
+    def clear(self) -> None:
+        self._shared_time_embeddings.clear()
+        self._shared_cnn_in.clear()
+        self._shared_cnn_out.clear()
+        self._shared_speakers.clear()
+        self._x_buffers.clear()
+        self._mu_buffers.clear()
+        self._cond_buffers.clear()
+        self._att_cache_in.clear()
+        self._att_cache_out.clear()
+        self._mask_buffers.clear()
 
 
 class WholeEulerCFMGraphWrapper:
@@ -469,6 +724,14 @@ class WholeEulerCFMGraphWrapper:
         self.timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
         self.dt_steps = [self.timeline[i + 1] - self.timeline[i] for i in range(self.n_timesteps)]
         self.time_steps = [self.timeline[i] for i in range(self.n_timesteps)]
+        self.arena = WholeEulerExecutionArena(
+            estimator=self.estimator,
+            n_timesteps=self.n_timesteps,
+            device=self.device,
+            dtype=self.dtype,
+            att_cache_dtype=self.att_cache_dtype,
+            time_steps=self.time_steps,
+        )
 
     def stats_snapshot(self) -> dict[str, int]:
         """Bounded cumulative telemetry for the graph cache."""
@@ -482,6 +745,7 @@ class WholeEulerCFMGraphWrapper:
         for entry in self._cache.values():
             entry[4].reset()
         self._cache.clear()
+        self.arena.clear()
         self._stats["flushes"] += 1
         logger.info("Whole-Euler CFM graph cache flushed; stats=%s", self.stats_snapshot())
 
@@ -518,7 +782,7 @@ class WholeEulerCFMGraphWrapper:
         speaker_features = static_speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
 
         for step in range(self.n_timesteps):
-            dt = self.dt_steps[step]
+            dt = float(self.dt_steps[step])
             time_embedding = static_time_embeddings[step]
             x_cfg = torch.cat((cur_x, cur_x), dim=0)
             estimator_input = torch.cat((x_cfg, static_mu_cfg, speaker_features, static_cond_cfg), dim=1)
@@ -538,9 +802,7 @@ class WholeEulerCFMGraphWrapper:
                 step_att_out,
             )
 
-            conditional, unconditional = estimate.split(batch_size, dim=0)
-            velocity = (1.0 + self.inference_cfg_rate) * conditional - self.inference_cfg_rate * unconditional
-            cur_x = cur_x + dt * velocity
+            cur_x = _fused_euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
         return cur_x
 
@@ -562,75 +824,43 @@ class WholeEulerCFMGraphWrapper:
         has_mask: bool,
     ) -> tuple | None:
         try:
-            static_x = x.detach().clone()
-            static_mu_cfg = mu_cfg.detach().clone()
-            static_speakers_cfg = speakers_cfg.detach().clone()
-            static_cond_cfg = cond_cfg.detach().clone()
-
-            blocks = self.estimator.blocks
-            depth = len(blocks)
-            block0 = blocks[0]
-            cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
-            cnn_width = int(block0.conv.block[1].causal_padding[0])
-            heads = int(block0.attn.num_heads)
-            att_width = int(block0.attn.head_dim * 2)
+            channels = int(x.shape[1])
             mel_width = int(mu_cfg.shape[2])
+            spk_dim = int(speakers_cfg.shape[1])
 
+            static_x = self.arena.get_x_staging(batch_size, channels, mel_width)
+            static_mu_cfg = self.arena.get_mu_staging(batch_size, channels, mel_width)
+            static_speakers_cfg = self.arena.get_speakers_staging(batch_size, spk_dim)
+            static_cond_cfg = self.arena.get_cond_staging(batch_size, channels, mel_width)
+
+            static_cnn_cache = self.arena.get_cnn_cache_in(batch_size)
+            static_att_cache = self.arena.get_att_cache_in(
+                batch_size, offset if (has_att_cache and offset > 0) else 0
+            )
+            static_attn_mask = (
+                self.arena.get_mask_staging(batch_size, mel_width, offset + mel_width)
+                if (has_mask and attn_mask is not None)
+                else None
+            )
+
+            out_cnn_cache = self.arena.get_cnn_cache_out(batch_size)
+            out_att_cache = self.arena.get_att_cache_out(batch_size, offset + mel_width)
+            static_time_embeddings = self.arena.get_time_embeddings(batch_size)
+
+            static_x.copy_(x)
+            static_mu_cfg.copy_(mu_cfg)
+            static_speakers_cfg.copy_(speakers_cfg)
+            static_cond_cfg.copy_(cond_cfg)
             if has_cnn_cache and cnn_cache is not None:
-                static_cnn_cache = cnn_cache.detach().clone()
+                static_cnn_cache.copy_(cnn_cache)
             else:
-                static_cnn_cache = torch.zeros(
-                    self.n_timesteps,
-                    depth,
-                    2 * batch_size,
-                    cnn_channels,
-                    cnn_width,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-
+                static_cnn_cache.zero_()
             if has_att_cache and att_cache is not None and offset > 0:
-                static_att_cache = att_cache.detach().clone()
+                static_att_cache.copy_(att_cache)
             else:
-                static_att_cache = torch.zeros(
-                    self.n_timesteps,
-                    depth,
-                    2 * batch_size,
-                    heads,
-                    0,
-                    att_width,
-                    device=self.device,
-                    dtype=self.att_cache_dtype,
-                )
-
-            static_attn_mask = attn_mask.detach().clone() if (has_mask and attn_mask is not None) else None
-
-            out_cnn_cache = torch.empty(
-                self.n_timesteps,
-                depth,
-                2 * batch_size,
-                cnn_channels,
-                cnn_width,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            out_att_cache = torch.empty(
-                self.n_timesteps,
-                depth,
-                2 * batch_size,
-                heads,
-                offset + mel_width,
-                att_width,
-                device=self.device,
-                dtype=self.att_cache_dtype,
-            )
-            static_time_embeddings = torch.stack(
-                [
-                    self.estimator.t_embedder(self.time_steps[s].expand(2 * batch_size)).unsqueeze(1)
-                    for s in range(self.n_timesteps)
-                ],
-                dim=0,
-            )
+                static_att_cache.zero_()
+            if static_attn_mask is not None and attn_mask is not None:
+                static_attn_mask.copy_(attn_mask)
         except Exception:
             logger.warning("Failed to allocate static buffers for Whole-Euler graph key: %s", key, exc_info=True)
             self._unsupported.add(key)
@@ -643,6 +873,7 @@ class WholeEulerCFMGraphWrapper:
             warmup_stream.wait_stream(current_stream)
             with torch.cuda.stream(warmup_stream), torch.no_grad():
                 for _ in range(3):
+                    static_x.copy_(x)
                     _ = self._run_euler_loop(
                         static_x,
                         static_mu_cfg,
@@ -660,6 +891,7 @@ class WholeEulerCFMGraphWrapper:
                     )
             current_stream.wait_stream(warmup_stream)
 
+            static_x.copy_(x)
             graph = CUDAGraph()
             with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_final_x = self._run_euler_loop(
@@ -853,8 +1085,7 @@ class WholeEulerCFMGraphWrapper:
         out_cnn = out_cnn_cache.detach().clone()
         out_att = out_att_cache.detach().clone()
         if pad_frames > 0:
-            for s in range(self.n_timesteps):
-                _zero_padded_cnn_cache(out_cnn[s], self.estimator, pad_frames)
+            _zero_padded_cnn_cache(out_cnn, self.estimator, pad_frames)
             out_att[..., mel_frames : mel_frames + pad_frames, :] = 0.0
 
         return (

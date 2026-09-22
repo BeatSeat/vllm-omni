@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -298,11 +299,22 @@ class BatchedToken2Wav(nn.Module):
                         "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
                     )
                 capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
-                logger.info("Enabling HiFT CUDA Graph with batch sizes %s", capture_batch_sizes)
+                max_serial_batch = int(
+                    graph_config.get(
+                        "max_serial_batch",
+                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"),
+                    )
+                )
+                logger.info(
+                    "Enabling HiFT CUDA Graph with batch sizes %s (max_serial_batch=%d)",
+                    capture_batch_sizes,
+                    max_serial_batch,
+                )
                 self.hift_graph_wrapper = HiFTGraphWrapper(
                     token2wav=token2wav,
                     connector_config=dict(connector_config),
                     capture_batch_sizes=capture_batch_sizes,
+                    max_serial_batch=max_serial_batch,
                 )
                 with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
                     self.hift_graph_wrapper.capture()
@@ -315,6 +327,12 @@ class BatchedToken2Wav(nn.Module):
             if flow_parameter is not None and flow_parameter.device.type == "cuda":
                 estimator = self.flow.decoder.estimator
                 max_graphs = int(cfm_graph_cfg.get("max_graphs", 32))
+                max_serial_batch = int(
+                    cfm_graph_cfg.get(
+                        "max_serial_batch",
+                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"),
+                    )
+                )
                 if bool(cfm_graph_cfg.get("enable_whole_euler", True)):
                     self._whole_euler_graph_wrapper = WholeEulerCFMGraphWrapper(
                         estimator=estimator,
@@ -322,13 +340,23 @@ class BatchedToken2Wav(nn.Module):
                         inference_cfg_rate=getattr(self.flow.decoder, "inference_cfg_rate", 0.7),
                         att_cache_dtype=self._estimator_att_cache_dtype,
                         max_graphs=max_graphs,
+                        max_serial_batch=max_serial_batch,
                     )
-                    logger.info("Whole-Euler CFM CUDA Graph enabled (max_graphs=%d)", max_graphs)
+                    logger.info(
+                        "Whole-Euler CFM CUDA Graph enabled (max_graphs=%d, max_serial_batch=%d)",
+                        max_graphs,
+                        max_serial_batch,
+                    )
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
                     max_graphs=max_graphs,
+                    max_serial_batch=max_serial_batch,
                 )
-                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", max_graphs)
+                logger.info(
+                    "CFM CUDA Graph enabled (max_graphs=%d, max_serial_batch=%d)",
+                    max_graphs,
+                    max_serial_batch,
+                )
             else:
                 logger.info(
                     "CFM CUDA Graph is disabled on device type %s",

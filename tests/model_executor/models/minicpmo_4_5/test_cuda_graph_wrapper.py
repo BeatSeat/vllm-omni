@@ -109,6 +109,7 @@ def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     wrapper.static_cache_source_outputs = {}
     wrapper.lazy_graph_count = 0
     wrapper.max_lazy_graphs = 1
+    wrapper.max_serial_batch = 8
     wrapper.decode_fn = Mock(return_value=(torch.tensor([[99.0]]), torch.tensor([[[98.0]]])))
     wrapper.finalize_fn = lambda magnitude, phase: magnitude + phase
 
@@ -330,6 +331,7 @@ def _cfm_mock_wrapper(monkeypatch: pytest.MonkeyPatch, *, max_graphs: int = 1) -
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(CFMGraphWrapper)
     wrapper.max_graphs = max_graphs
+    wrapper.max_serial_batch = 8
     wrapper.enabled = True
     wrapper.graph_fn = Mock(return_value=torch.tensor([42.0]))
     wrapper.device = torch.device("cuda")
@@ -983,3 +985,87 @@ def test_whole_euler_same_bucket_different_padding_hits_cache(monkeypatch: pytes
     assert len(wrapper._cache) == 1
 
     wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_max_serial_batch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    # Configure threshold = 2
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=4,
+        max_serial_batch=2,
+    )
+
+    w = 8
+    # Batch = 2 <= max_serial_batch: uses CUDA graph serial replay
+    x_small = torch.randn(2, 4, w, device="cuda")
+    mu_small = torch.randn(4, 4, w, device="cuda")
+    spk_small = torch.randn(4, 4, device="cuda")
+    cond_small = torch.randn(4, 4, w, device="cuda")
+
+    res_small = wrapper.replay(
+        x=x_small,
+        mu_cfg=mu_small,
+        speakers_cfg=spk_small,
+        cond_cfg=cond_small,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert res_small is not None
+    assert wrapper._stats["captures"] == 1
+
+    # Batch = 4 > max_serial_batch: returns None to fall back to batched eager
+    x_large = torch.randn(4, 4, w, device="cuda")
+    mu_large = torch.randn(8, 4, w, device="cuda")
+    spk_large = torch.randn(8, 4, device="cuda")
+    cond_large = torch.randn(8, 4, w, device="cuda")
+
+    res_large = wrapper.replay(
+        x=x_large,
+        mu_cfg=mu_large,
+        speakers_cfg=spk_large,
+        cond_cfg=cond_large,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert res_large is None
+    # No new graph captures triggered for large batch
+    assert wrapper._stats["captures"] == 1
+
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_cfm_max_serial_batch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _MiniDiT().eval().cuda()
+    # Configure threshold = 2
+    wrapper = CFMGraphWrapper(
+        graph_fn=estimator.blocks_forward_chunk,
+        max_graphs=4,
+        max_serial_batch=2,
+    )
+
+    # Batch = 2 (inputs batch = 2 * 2 = 4) <= max_serial_batch: captures/replays graph
+    inputs_small = _cfm_inputs(batch_size=4, chunk_size=8, old_att_len=0)
+    wrapper.replay(*inputs_small)
+    assert wrapper._stats["captures"] == 1
+    assert wrapper._stats["eager"] == 0
+
+    # Batch = 4 (inputs batch = 2 * 4 = 8) > max_serial_batch: falls back to eager
+    inputs_large = _cfm_inputs(batch_size=8, chunk_size=8, old_att_len=0)
+    wrapper.replay(*inputs_large)
+    assert wrapper._stats["captures"] == 1  # no new capture
+    assert wrapper._stats["eager"] == 1     # executed eagerly
+
+    wrapper._flush()
+

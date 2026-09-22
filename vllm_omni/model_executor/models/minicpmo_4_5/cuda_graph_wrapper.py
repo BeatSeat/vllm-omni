@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
+
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
@@ -10,7 +12,9 @@ logger = init_logger(__name__)
 
 
 class HiFTGraphWrapper:
-    def __init__(self, token2wav, connector_config, capture_batch_sizes):
+    max_serial_batch: int = 8
+
+    def __init__(self, token2wav, connector_config, capture_batch_sizes, max_serial_batch: int | None = None):
         self.decode_fn = token2wav.hift.inference
         self.graph_fn = token2wav.hift._inference_pre_istft
         self.finalize_fn = token2wav.hift._finalize_decode
@@ -34,8 +38,12 @@ class HiFTGraphWrapper:
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
-        self.max_lazy_graphs = 32
+        self.max_lazy_graphs = 8
         self.lazy_graph_count = 0
+        if max_serial_batch is None:
+            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"))
+        else:
+            self.max_serial_batch = int(max_serial_batch)
 
     def derive_capture_bucket_size(self):
         chunk_mel_frames = (
@@ -108,7 +116,7 @@ class HiFTGraphWrapper:
         target_b = next((b for b in sorted(self.capture_batch_sizes) if b >= batch_size), None)
 
         if target_b is None:
-            if 1 in self.capture_batch_sizes and batch_size > 1:
+            if 1 in self.capture_batch_sizes and 1 < batch_size <= self.max_serial_batch:
                 speeches = []
                 sources = []
                 for b in range(batch_size):
@@ -212,11 +220,14 @@ class CFMGraphWrapper:
     streaming cache corruption.
     """
 
+    max_serial_batch: int = 8
+
     def __init__(
         self,
         graph_fn,
         *,
         max_graphs: int = 32,
+        max_serial_batch: int | None = None,
     ) -> None:
         self.graph_fn = graph_fn
         self.max_graphs = int(max_graphs)
@@ -235,6 +246,10 @@ class CFMGraphWrapper:
             "flushes": 0,
             "eager": 0,
         }
+        if max_serial_batch is None:
+            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"))
+        else:
+            self.max_serial_batch = int(max_serial_batch)
 
     def stats_snapshot(self) -> dict[str, int]:
         """Bounded cumulative telemetry for the graph cache."""
@@ -341,7 +356,13 @@ class CFMGraphWrapper:
         inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out, attn_mask)
         self._stats["calls"] += 1
 
-        if not self.enabled or torch.cuda.is_current_stream_capturing() or estimator_input.device.type != "cuda":
+        batch_size = estimator_input.shape[0] // 2
+        if (
+            not self.enabled
+            or torch.cuda.is_current_stream_capturing()
+            or estimator_input.device.type != "cuda"
+            or batch_size > self.max_serial_batch
+        ):
             return self._eager(inputs)
 
         key = ("estimator_step",) + tuple(_tensor_signature(v) for v in inputs)
@@ -398,6 +419,8 @@ class WholeEulerCFMGraphWrapper:
     synchronization bubbles during high concurrency.
     """
 
+    max_serial_batch: int = 8
+
     def __init__(
         self,
         estimator: torch.nn.Module,
@@ -406,12 +429,17 @@ class WholeEulerCFMGraphWrapper:
         inference_cfg_rate: float = 0.7,
         att_cache_dtype: torch.dtype = torch.float32,
         max_graphs: int = 32,
+        max_serial_batch: int | None = None,
     ) -> None:
         self.estimator = estimator
         self.n_timesteps = int(n_timesteps)
         self.inference_cfg_rate = float(inference_cfg_rate)
         self.att_cache_dtype = att_cache_dtype
         self.max_graphs = int(max_graphs)
+        if max_serial_batch is None:
+            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"))
+        else:
+            self.max_serial_batch = int(max_serial_batch)
         parameter = next(estimator.parameters(), None)
         if parameter is not None:
             self.device = parameter.device
@@ -674,6 +702,9 @@ class WholeEulerCFMGraphWrapper:
         mel_width = int(mu_cfg.shape[2])
         if mel_frames is None:
             mel_frames = mel_width - pad_frames
+
+        if batch_size > self.max_serial_batch:
+            return None
 
         if batch_size > 1:
             chunk_mels: list[torch.Tensor] = []

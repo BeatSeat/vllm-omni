@@ -316,7 +316,7 @@ class BatchedToken2Wav(nn.Module):
                 max_serial_batch = int(
                     graph_config.get(
                         "max_serial_batch",
-                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"),
+                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
                     )
                 )
                 logger.info(
@@ -344,7 +344,7 @@ class BatchedToken2Wav(nn.Module):
                 max_serial_batch = int(
                     cfm_graph_cfg.get(
                         "max_serial_batch",
-                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"),
+                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
                     )
                 )
                 if bool(cfm_graph_cfg.get("enable_whole_euler", True)) and self._trt_stepper is None:

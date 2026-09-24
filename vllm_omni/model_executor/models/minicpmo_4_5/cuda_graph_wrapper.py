@@ -12,7 +12,7 @@ logger = init_logger(__name__)
 
 
 class HiFTGraphWrapper:
-    max_serial_batch: int = 8
+    max_serial_batch: int = 4
 
     def __init__(self, token2wav, connector_config, capture_batch_sizes, max_serial_batch: int | None = None):
         self.decode_fn = token2wav.hift.inference
@@ -41,7 +41,7 @@ class HiFTGraphWrapper:
         self.max_lazy_graphs = 8
         self.lazy_graph_count = 0
         if max_serial_batch is None:
-            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"))
+            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
         else:
             self.max_serial_batch = int(max_serial_batch)
 
@@ -220,7 +220,7 @@ class CFMGraphWrapper:
     streaming cache corruption.
     """
 
-    max_serial_batch: int = 8
+    max_serial_batch: int = 4
 
     def __init__(
         self,
@@ -247,7 +247,7 @@ class CFMGraphWrapper:
             "eager": 0,
         }
         if max_serial_batch is None:
-            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"))
+            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
         else:
             self.max_serial_batch = int(max_serial_batch)
 
@@ -419,7 +419,7 @@ class WholeEulerCFMGraphWrapper:
     synchronization bubbles during high concurrency.
     """
 
-    max_serial_batch: int = 8
+    max_serial_batch: int = 4
 
     def __init__(
         self,
@@ -437,7 +437,7 @@ class WholeEulerCFMGraphWrapper:
         self.att_cache_dtype = att_cache_dtype
         self.max_graphs = int(max_graphs)
         if max_serial_batch is None:
-            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"))
+            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
         else:
             self.max_serial_batch = int(max_serial_batch)
         parameter = next(estimator.parameters(), None)

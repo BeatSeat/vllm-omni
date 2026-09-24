@@ -66,7 +66,7 @@ def _od_config() -> OmniDiffusionConfig:
 
 def test_build_mammoth_config_uses_shared_transformer_projection() -> None:
     config = _build_mammoth_config(_od_config())
-    assert config.gen_dit_config.hidden_size == 8
+    assert config.gen_dit_config["hidden_size"] == 8
 
 
 def test_build_mammoth_config_rejects_empty_shared_projection() -> None:
@@ -358,7 +358,9 @@ class _FakeVae(nn.Module):
     def decode(self, latents, return_dict=False):
         assert return_dict is False
         self.last_decode_dtype = latents.dtype
-        return (torch.zeros(1, 3, 32, 48, dtype=latents.dtype),)
+        b = latents.shape[0]
+        base = latents[:, :1, :1, :1]
+        return (torch.zeros(b, 3, 32, 48, dtype=latents.dtype) + base,)
 
 
 class _FakeScheduler:
@@ -582,14 +584,14 @@ def test_forward_transitions_request_scoped_cache_dit_across_requests(request: p
 
 
 def test_pre_process_registers_batch_compatibility_key() -> None:
-    pre_process = get_mammoth_moda2_pre_process_func(None)
+    pre_process = get_mammoth_moda2_pre_process_func(_od_config())
     req = _batch().requests[0]
     pre_process(req)
     assert req.batch_compatibility_key == ("mammoth_moda2_dit", 32, 48, 7)
 
 
 def test_pre_process_rejects_missing_ar_conditions() -> None:
-    pre_process = get_mammoth_moda2_pre_process_func(None)
+    pre_process = get_mammoth_moda2_pre_process_func(_od_config())
     req = _batch(request_id="req-bad-ar", prompt={"prompt": "test"}).requests[0]
     with pytest.raises(ValueError, match="Missing additional_information AR conditions.*req-bad-ar"):
         pre_process(req)
@@ -605,7 +607,7 @@ def test_pre_process_rejects_missing_ar_conditions() -> None:
     ],
 )
 def test_pre_process_rejects_invalid_dimensions(height, width, message) -> None:
-    pre_process = get_mammoth_moda2_pre_process_func(None)
+    pre_process = get_mammoth_moda2_pre_process_func(_od_config())
     batch = _batch(request_id="req-dim")
     batch.prompts[0].update(height=height, width=width)
     with pytest.raises(ValueError, match=message):
@@ -613,7 +615,7 @@ def test_pre_process_rejects_invalid_dimensions(height, width, message) -> None:
 
 
 def test_pre_process_rejects_non_positive_steps() -> None:
-    pre_process = get_mammoth_moda2_pre_process_func(None)
+    pre_process = get_mammoth_moda2_pre_process_func(_od_config())
     req = _batch(
         request_id="req-zero-steps",
         sampling=OmniDiffusionSamplingParams(num_inference_steps=0),
@@ -623,7 +625,7 @@ def test_pre_process_rejects_non_positive_steps() -> None:
 
 
 def test_pre_process_allows_dummy_run() -> None:
-    pre_process = get_mammoth_moda2_pre_process_func(None)
+    pre_process = get_mammoth_moda2_pre_process_func(_od_config())
     req = _batch(
         request_id="dummy_req_id",
         prompt={"prompt": "dummy run"},
@@ -739,6 +741,10 @@ def test_refiner_output_length_preserved_when_input_len_differs_from_queries() -
     pipeline.gen_transformer = _FakeTransformer()
 
     class _MockRefiner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+
         def forward(self, features, mask=None):
             b, _, d = features.shape
             return torch.zeros(b, 8, d, device=features.device, dtype=features.dtype)
@@ -783,11 +789,12 @@ def test_refiner_output_length_preserved_when_input_len_differs_from_queries() -
 
 def test_nested_image_embedder_compacts_unequal_text_lengths() -> None:
     from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
-        MammothModa2DiTModel,
+        Transformer2DModel,
     )
 
-    model = object.__new__(MammothModa2DiTModel)
-    model.config = SimpleNamespace(patch_size=2)
+    model = object.__new__(Transformer2DModel)
+    nn.Module.__init__(model)
+    object.__setattr__(model, "_internal_dict", SimpleNamespace(patch_size=2))
 
     dim = 8
     batch_size = 2
@@ -855,7 +862,7 @@ def test_nested_image_embedder_compacts_unequal_text_lengths() -> None:
 
 
 def test_pre_process_rejects_missing_visual_tokens_and_multi_output() -> None:
-    pre_process = get_mammoth_moda2_pre_process_func(None)
+    pre_process = get_mammoth_moda2_pre_process_func(_od_config())
 
     multi_out = _batch(
         request_id="req-multi",
@@ -934,3 +941,82 @@ def test_cfg_precomputation_uses_cpu_booleans_without_device_sync() -> None:
         pipeline.forward(DiffusionRequestBatch([req1, req2]))
 
     assert len(tensor_any_called) == 0
+
+
+def test_dummy_request_splits_valid_ar_conditions_without_error() -> None:
+    """Startup warmup dummy run must split into valid non-empty AR conditions."""
+    pipeline = _pipeline_shell()
+    batch = _batch(
+        request_id="dummy_req_id",
+        prompt={"prompt": "dummy run"},
+        sampling=OmniDiffusionSamplingParams(height=512, width=512, seed=1, guidance_scale=0.0, num_inference_steps=2),
+    )
+    parsed = pipeline._parse_request(batch)
+    text_cond, image_cond = pipeline._split_request_conditions(parsed)
+    assert text_cond.shape == (1, pipeline._llm_hidden_size)
+    assert image_cond.shape == (1, pipeline._llm_hidden_size)
+
+
+@pytest.mark.parametrize(
+    ("llm_cfg_patch", "expected_threshold"),
+    [
+        # Parent-level llm_config threshold
+        ({"gen_vocab_start_index": 200}, 200),
+        # Nested text_config threshold
+        ({"text_config": {"model_type": "mammothmoda2_qwen2_5_vl_text", "gen_vocab_start_index": 350}}, 350),
+        # Default-derived threshold (fallback to vocab_size / 152064)
+        ({}, 152064),
+    ],
+)
+def test_admission_and_inference_threshold_resolution_matches(llm_cfg_patch: dict, expected_threshold: int) -> None:
+    """Verify identical threshold resolution for parent-level, nested, and default configs."""
+    raw = _raw_config()
+    raw["llm_config"] = {"model_type": "mammothmoda2_qwen2_5_vl", **llm_cfg_patch}
+    od_cfg = OmniDiffusionConfig(
+        model="/models/MammothModa2-Preview",
+        model_class_name="MammothModa2DiTPipeline",
+        tf_model_config=TransformerConfig.from_dict(raw),
+    )
+    # 1. Check admission preprocessor resolution
+    pre_process = get_mammoth_moda2_pre_process_func(od_cfg)
+
+    # Token just below threshold -> rejected
+    below_prompt = {
+        "prompt": "",
+        "additional_information": {
+            "full_hidden_states": torch.zeros(2, 8),
+            "full_token_ids": [10, expected_threshold - 1],
+            "answer_start_index": 1,
+        },
+    }
+    below_req = _batch(request_id="req-below", prompt=below_prompt).requests[0]
+    with pytest.raises(ValueError, match="no visual-token hidden states.*req-below"):
+        pre_process(below_req)
+
+    # Token at or above threshold -> accepted
+    at_prompt = {
+        "prompt": "",
+        "additional_information": {
+            "full_hidden_states": torch.zeros(2, 8),
+            "full_token_ids": [10, expected_threshold],
+            "answer_start_index": 1,
+        },
+    }
+    at_req = _batch(request_id="req-at", prompt=at_prompt).requests[0]
+    pre_process(at_req)
+    assert at_req.batch_compatibility_key is not None
+
+    # 2. Check inference pipeline model config resolution
+    pipeline = _pipeline_shell()
+    pipeline.config = _build_mammoth_config(od_cfg)
+
+    # Token below threshold rejected by pipeline
+    parsed_below = pipeline._parse_request(_batch(request_id="req-inf-below", prompt=below_prompt))
+    with pytest.raises(ValueError, match="no visual-token hidden states.*req-inf-below"):
+        pipeline._split_request_conditions(parsed_below)
+
+    # Token at threshold accepted by pipeline
+    parsed_at = pipeline._parse_request(_batch(request_id="req-inf-at", prompt=at_prompt))
+    text_cond, image_cond = pipeline._split_request_conditions(parsed_at)
+    assert text_cond.shape == (1, 8)
+    assert image_cond.shape == (1, 8)

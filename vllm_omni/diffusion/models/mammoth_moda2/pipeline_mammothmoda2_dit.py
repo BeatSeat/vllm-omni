@@ -196,9 +196,39 @@ def _resolve_request_sampling_and_dims(
     return height, width, text_guidance_scale, (cfg_start, cfg_end), num_inference_steps
 
 
+def _resolve_gen_vocab_start_index(od_config: OmniDiffusionConfig | None) -> int:
+    """Resolve the visual token threshold through the normalized model configuration."""
+    if od_config is not None and getattr(od_config, "tf_model_config", None) is not None:
+        try:
+            cfg = _build_mammoth_config(od_config)
+            llm_cfg = getattr(cfg, "llm_config", None)
+            if llm_cfg is not None:
+                val = getattr(llm_cfg, "gen_vocab_start_index", None)
+                if val is not None:
+                    return int(val)
+                text_cfg = getattr(llm_cfg, "text_config", None)
+                if text_cfg is not None and getattr(text_cfg, "gen_vocab_start_index", None) is not None:
+                    return int(text_cfg.gen_vocab_start_index)
+        except Exception:
+            pass
+
+        # Fallback inspection of raw dictionary if _build_mammoth_config fails (e.g. mock test objects)
+        raw_cfg = od_config.tf_model_config.to_dict()
+        if isinstance(raw_cfg, dict):
+            llm_cfg = raw_cfg.get("llm_config")
+            if isinstance(llm_cfg, dict):
+                text_cfg = llm_cfg.get("text_config")
+                if isinstance(text_cfg, dict) and text_cfg.get("gen_vocab_start_index") is not None:
+                    return int(text_cfg["gen_vocab_start_index"])
+                if llm_cfg.get("gen_vocab_start_index") is not None:
+                    return int(llm_cfg["gen_vocab_start_index"])
+    return 152064
+
+
 def _validate_request_for_admission(
     request: OmniDiffusionRequest,
     od_config: OmniDiffusionConfig | None = None,
+    gen_vocab_start_index: int | None = None,
 ) -> tuple[int, int, int]:
     """Validate request at admission time to fail-fast before entering scheduler queue.
 
@@ -235,12 +265,8 @@ def _validate_request_for_admission(
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"Invalid full_token_ids for request {request_id}") from exc
 
-        gen_vocab_start_index = 152064
-        if od_config is not None and getattr(od_config, "tf_model_config", None):
-            raw_cfg = od_config.tf_model_config.to_dict()
-            text_cfg = raw_cfg.get("llm_config", {}).get("text_config", {})
-            if isinstance(text_cfg, dict) and "gen_vocab_start_index" in text_cfg:
-                gen_vocab_start_index = int(text_cfg["gen_vocab_start_index"])
+        if gen_vocab_start_index is None:
+            gen_vocab_start_index = _resolve_gen_vocab_start_index(od_config)
         answer_tokens = int_tokens[answer_start_index:]
         if not any(token_id >= gen_vocab_start_index for token_id in answer_tokens):
             raise ValueError(
@@ -252,7 +278,7 @@ def _validate_request_for_admission(
     return height, width, num_inference_steps
 
 
-def get_mammoth_moda2_pre_process_func(od_config: OmniDiffusionConfig):
+def get_mammoth_moda2_pre_process_func(od_config: OmniDiffusionConfig | None = None):
     """Admission preprocessor: fail-fast per-request validation and grouping.
 
     Validates AR conditions, dimensions, and sampling knobs at admission so
@@ -260,9 +286,12 @@ def get_mammoth_moda2_pre_process_func(od_config: OmniDiffusionConfig):
     entering the scheduler queue. Admitted requests are assigned a
     batch_compatibility_key based on output geometry and inference steps.
     """
+    gen_vocab_start_index = _resolve_gen_vocab_start_index(od_config)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        height, width, num_inference_steps = _validate_request_for_admission(request, od_config=od_config)
+        height, width, num_inference_steps = _validate_request_for_admission(
+            request, od_config=od_config, gen_vocab_start_index=gen_vocab_start_index
+        )
         request.batch_compatibility_key = (
             "mammoth_moda2_dit",
             height,
@@ -468,9 +497,18 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             )
         info = prompt.get("additional_information")
         if request.is_dummy_run():
-            full_hidden_states = torch.empty((0, self._llm_hidden_size), dtype=torch.float32)
-            full_token_ids = []
-            answer_start_index = 0
+            gen_start = 152064
+            if hasattr(self, "config") and hasattr(self.config, "llm_config") and self.config.llm_config is not None:
+                val = getattr(self.config.llm_config, "gen_vocab_start_index", None)
+                if val is not None:
+                    gen_start = val
+                else:
+                    text_cfg = getattr(self.config.llm_config, "text_config", None)
+                    if text_cfg is not None and getattr(text_cfg, "gen_vocab_start_index", None) is not None:
+                        gen_start = text_cfg.gen_vocab_start_index
+            full_hidden_states = torch.zeros((2, self._llm_hidden_size), dtype=torch.float32)
+            full_token_ids = [0, int(gen_start)]
+            answer_start_index = 1
         else:
             if not isinstance(info, dict):
                 raise ValueError(f"Missing additional_information AR conditions for request {request_id}")
@@ -534,7 +572,11 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         caller no longer needs to pass them. Mirrors the masking the bespoke
         MammothModa2 example performed via ar2dit.
         """
-        gen_vocab_start_index = int(self.config.llm_config.gen_vocab_start_index)
+        gen_vocab_start_index = getattr(self.config.llm_config, "gen_vocab_start_index", None)
+        if gen_vocab_start_index is None:
+            text_cfg = getattr(self.config.llm_config, "text_config", None)
+            gen_vocab_start_index = getattr(text_cfg, "gen_vocab_start_index", 152064)
+        gen_vocab_start_index = int(gen_vocab_start_index)
         cached_visual_ids = getattr(self, "_cached_visual_ids_tensor", None)
         if cached_visual_ids is None:
             cached_visual_ids = torch.tensor(

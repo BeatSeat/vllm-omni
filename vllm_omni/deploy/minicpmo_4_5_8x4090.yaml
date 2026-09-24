@@ -38,6 +38,8 @@ connectors:
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
+      enable_whole_euler: true
+      max_serial_batch: 4
       cfm_max_graphs: 32
       cfm_graph_bucket_frames: 16
 

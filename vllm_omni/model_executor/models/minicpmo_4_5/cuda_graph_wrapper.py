@@ -692,7 +692,10 @@ class WholeEulerCFMGraphWrapper:
             self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
         else:
             self.max_serial_batch = int(max_serial_batch)
-        self.micro_batch_size = int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
+        if micro_batch_size is not None:
+            self.micro_batch_size = int(micro_batch_size)
+        else:
+            self.micro_batch_size = int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
         if max_graph_batch is None:
             if max_serial_batch is not None and max_serial_batch < self.micro_batch_size:
                 self.max_graph_batch = int(max_serial_batch)

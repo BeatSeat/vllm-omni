@@ -276,12 +276,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             enable_whole_euler = os.getenv("VLLM_OMNI_ENABLE_WHOLE_EULER", "1") not in ("0", "false", "False")
         else:
             enable_whole_euler = bool(enable_whole_euler_raw)
+        max_graph_batch_raw = extra.get("max_graph_batch")
+        max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
+        micro_batch_size_raw = extra.get("micro_batch_size")
+        micro_batch_size = int(micro_batch_size_raw) if micro_batch_size_raw is not None else None
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "enable_whole_euler": enable_whole_euler,
             "max_serial_batch": max_serial_batch,
+            "max_graph_batch": max_graph_batch,
+            "micro_batch_size": micro_batch_size,
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:

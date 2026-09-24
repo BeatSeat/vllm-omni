@@ -232,7 +232,7 @@ def test_hierarchical_graph_parity(device: torch.device):
         estimator=estimator,
         n_timesteps=10,
         max_graphs=16,
-        max_graph_batch=8,
+        max_graph_batch=16,
         micro_batch_size=4,
     )
 
@@ -269,6 +269,23 @@ def test_hierarchical_graph_parity(device: torch.device):
     print(f"Batch=8 (2x B=4 Micro-batches) : max abs diff = {diff8:.6e} (Pass: {diff8 < 1e-4})")
     assert diff8 < 1e-4
 
+    # Test B=16 (partitions into [4, 4, 4, 4])
+    b16 = 16
+    x16 = torch.randn(b16, 4, w, device=device)
+    mu16 = torch.randn(2 * b16, 4, w, device=device)
+    spk16 = torch.randn(2 * b16, 4, device=device)
+    cond16 = torch.randn(2 * b16, 4, w, device=device)
+
+    ref_mel16, ref_cnn16, ref_att16 = eager_solve_euler_ref(
+        estimator, x16, mu16, spk16, cond16, None, None, None, timeline
+    )
+    res_mel16, res_cnn16, res_att16 = wrapper.replay(
+        x=x16, mu_cfg=mu16, speakers_cfg=spk16, cond_cfg=cond16, cnn_cache=None, att_cache=None
+    )
+    diff16 = torch.max(torch.abs(ref_mel16 - res_mel16)).item()
+    print(f"Batch=16 (4x B=4 Micro-batches): max abs diff = {diff16:.6e} (Pass: {diff16 < 1e-4})")
+    assert diff16 < 1e-4
+
     # Test B=5 (partitions into [4, 1])
     b5 = 5
     x5 = torch.randn(b5, 4, w, device=device)
@@ -285,14 +302,14 @@ def test_hierarchical_graph_parity(device: torch.device):
     assert diff5 < 1e-4
 
     # Verify B > max_graph_batch returns None
-    b9 = 9
-    x9 = torch.randn(b9, 4, w, device=device)
-    mu9 = torch.randn(2 * b9, 4, w, device=device)
-    spk9 = torch.randn(2 * b9, 4, device=device)
-    cond9 = torch.randn(2 * b9, 4, w, device=device)
-    res9 = wrapper.replay(x=x9, mu_cfg=mu9, speakers_cfg=spk9, cond_cfg=cond9, cnn_cache=None, att_cache=None)
-    assert res9 is None
-    print("Batch=9 (> max_graph_batch=8)  : Correctly returns None (falls back to fused eager)")
+    b17 = 17
+    x17 = torch.randn(b17, 4, w, device=device)
+    mu17 = torch.randn(2 * b17, 4, w, device=device)
+    spk17 = torch.randn(2 * b17, 4, device=device)
+    cond17 = torch.randn(2 * b17, 4, w, device=device)
+    res17 = wrapper.replay(x=x17, mu_cfg=mu17, speakers_cfg=spk17, cond_cfg=cond17, cnn_cache=None, att_cache=None)
+    assert res17 is None
+    print("Batch=17 (> max_graph_batch=16): Correctly returns None (falls back to fused eager)")
 
     wrapper._flush()
 
@@ -397,12 +414,12 @@ def benchmark_batched_eager_vs_graph(device: torch.device):
         estimator=estimator,
         n_timesteps=10,
         max_graphs=16,
-        max_graph_batch=8,
+        max_graph_batch=16,
         micro_batch_size=4,
     )
     timeline = wrapper.timeline
 
-    for B in [1, 4, 8]:
+    for B in [1, 4, 8, 12, 16]:
         xB = torch.randn(B, 80, w, device=device)
         muB = torch.randn(2 * B, 80, w, device=device)
         spkB = torch.randn(2 * B, 80, device=device)

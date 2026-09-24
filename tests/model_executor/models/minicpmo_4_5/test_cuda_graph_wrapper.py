@@ -1010,7 +1010,46 @@ def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.Monke
     assert 4 in cached_batches
     assert 1 in cached_batches
 
+    # 4. B=16 partitions into [4, 4, 4, 4] with max_graph_batch=16
+    wrapper_16 = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=8, max_graph_batch=16)
+    batch_size = 16
+    x16 = torch.randn(batch_size, 4, w, device="cuda")
+    mu16 = torch.randn(2 * batch_size, 4, w, device="cuda")
+    spk16 = torch.randn(2 * batch_size, 4, device="cuda")
+    cond16 = torch.randn(2 * batch_size, 4, w, device="cuda")
+
+    out_mel16, out_cnn16, out_att16 = wrapper_16.replay(
+        x=x16,
+        mu_cfg=mu16,
+        speakers_cfg=spk16,
+        cond_cfg=cond16,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert out_mel16 is not None
+    assert out_mel16.shape == (16, 4, w)
+    assert out_cnn16.shape[2] == 32
+    assert out_att16.shape[2] == 32
+
+    # B > 16 returns None (eager fallback)
+    x17 = torch.randn(17, 4, w, device="cuda")
+    mu17 = torch.randn(34, 4, w, device="cuda")
+    spk17 = torch.randn(34, 4, device="cuda")
+    cond17 = torch.randn(34, 4, w, device="cuda")
+    assert (
+        wrapper_16.replay(
+            x=x17,
+            mu_cfg=mu17,
+            speakers_cfg=spk17,
+            cond_cfg=cond17,
+            cnn_cache=None,
+            att_cache=None,
+        )
+        is None
+    )
+
     wrapper._flush()
+    wrapper_16._flush()
 
 
 def test_batched_eager_fused_euler_parity() -> None:

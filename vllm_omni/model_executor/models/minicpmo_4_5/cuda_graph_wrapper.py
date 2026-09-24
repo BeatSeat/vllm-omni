@@ -580,27 +580,49 @@ class WholeEulerCFMGraphWrapper:
                 static_cnn_cache = cnn_cache.detach().clone()
             else:
                 static_cnn_cache = torch.zeros(
-                    self.n_timesteps, depth, 2 * batch_size, cnn_channels, cnn_width,
-                    device=self.device, dtype=self.dtype,
+                    self.n_timesteps,
+                    depth,
+                    2 * batch_size,
+                    cnn_channels,
+                    cnn_width,
+                    device=self.device,
+                    dtype=self.dtype,
                 )
 
             if has_att_cache and att_cache is not None and offset > 0:
                 static_att_cache = att_cache.detach().clone()
             else:
                 static_att_cache = torch.zeros(
-                    self.n_timesteps, depth, 2 * batch_size, heads, 0, att_width,
-                    device=self.device, dtype=self.att_cache_dtype,
+                    self.n_timesteps,
+                    depth,
+                    2 * batch_size,
+                    heads,
+                    0,
+                    att_width,
+                    device=self.device,
+                    dtype=self.att_cache_dtype,
                 )
 
             static_attn_mask = attn_mask.detach().clone() if (has_mask and attn_mask is not None) else None
 
             out_cnn_cache = torch.empty(
-                self.n_timesteps, depth, 2 * batch_size, cnn_channels, cnn_width,
-                device=self.device, dtype=self.dtype,
+                self.n_timesteps,
+                depth,
+                2 * batch_size,
+                cnn_channels,
+                cnn_width,
+                device=self.device,
+                dtype=self.dtype,
             )
             out_att_cache = torch.empty(
-                self.n_timesteps, depth, 2 * batch_size, heads, offset + mel_width, att_width,
-                device=self.device, dtype=self.att_cache_dtype,
+                self.n_timesteps,
+                depth,
+                2 * batch_size,
+                heads,
+                offset + mel_width,
+                att_width,
+                device=self.device,
+                dtype=self.att_cache_dtype,
             )
             static_time_embeddings = torch.stack(
                 [

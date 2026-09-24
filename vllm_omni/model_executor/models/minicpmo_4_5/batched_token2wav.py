@@ -333,7 +333,7 @@ class BatchedToken2Wav(nn.Module):
                         os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "8"),
                     )
                 )
-                if bool(cfm_graph_cfg.get("enable_whole_euler", True)):
+                if bool(cfm_graph_cfg.get("enable_whole_euler", True)) and self._trt_stepper is None:
                     self._whole_euler_graph_wrapper = WholeEulerCFMGraphWrapper(
                         estimator=estimator,
                         n_timesteps=self.n_timesteps,
@@ -347,6 +347,8 @@ class BatchedToken2Wav(nn.Module):
                         max_graphs,
                         max_serial_batch,
                     )
+                elif self._trt_stepper is not None and bool(cfm_graph_cfg.get("enable_whole_euler", True)):
+                    logger.info("Whole-Euler CFM CUDA Graph disabled because TensorRT stepper is configured")
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
                     max_graphs=max_graphs,
@@ -706,14 +708,20 @@ class BatchedToken2Wav(nn.Module):
         mel_frames = int(mu.shape[2])
         graphs_active = (
             (
-                self._whole_euler_graph_wrapper is not None
-                and getattr(self._whole_euler_graph_wrapper, "enabled", True)
+                (
+                    self._whole_euler_graph_wrapper is not None
+                    and getattr(self._whole_euler_graph_wrapper, "enabled", True)
+                    and self._trt_stepper is None
+                )
+                or (
+                    self._cfm_graph_wrapper is not None
+                    and getattr(self._cfm_graph_wrapper, "enabled", True)
+                    and self._trt_stepper is None
+                )
             )
-            or (
-                self._cfm_graph_wrapper is not None
-                and getattr(self._cfm_graph_wrapper, "enabled", True)
-            )
-        ) if valid_lengths is None else False
+            if valid_lengths is None
+            else False
+        )
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
             offset=offset,
@@ -788,6 +796,7 @@ class BatchedToken2Wav(nn.Module):
 
         if (
             valid_lengths is None
+            and self._trt_stepper is None
             and self._whole_euler_graph_wrapper is not None
             and getattr(self._whole_euler_graph_wrapper, "enabled", True)
         ):

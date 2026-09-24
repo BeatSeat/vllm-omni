@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
@@ -955,9 +956,15 @@ def test_whole_euler_same_bucket_different_padding_hits_cache(monkeypatch: pytes
     mask1[:, :, 12:] = False
 
     res1 = wrapper.replay(
-        x=x1, mu_cfg=mu1, speakers_cfg=spk1, cond_cfg=cond1,
-        cnn_cache=None, att_cache=None, attn_mask=mask1,
-        mel_frames=12, pad_frames=4,
+        x=x1,
+        mu_cfg=mu1,
+        speakers_cfg=spk1,
+        cond_cfg=cond1,
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=mask1,
+        mel_frames=12,
+        pad_frames=4,
     )
     assert res1 is not None
     assert res1[0].shape[-1] == 12
@@ -973,9 +980,15 @@ def test_whole_euler_same_bucket_different_padding_hits_cache(monkeypatch: pytes
     mask2[:, :, 10:] = False
 
     res2 = wrapper.replay(
-        x=x2, mu_cfg=mu2, speakers_cfg=spk2, cond_cfg=cond2,
-        cnn_cache=None, att_cache=None, attn_mask=mask2,
-        mel_frames=10, pad_frames=6,
+        x=x2,
+        mu_cfg=mu2,
+        speakers_cfg=spk2,
+        cond_cfg=cond2,
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=mask2,
+        mel_frames=10,
+        pad_frames=6,
     )
     assert res2 is not None
     assert res2[0].shape[-1] == 10
@@ -1065,7 +1078,374 @@ def test_cfm_max_serial_batch_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     inputs_large = _cfm_inputs(batch_size=8, chunk_size=8, old_att_len=0)
     wrapper.replay(*inputs_large)
     assert wrapper._stats["captures"] == 1  # no new capture
-    assert wrapper._stats["eager"] == 1     # executed eagerly
+    assert wrapper._stats["eager"] == 1  # executed eagerly
 
     wrapper._flush()
 
+
+class _RealCausalDiTBlock(nn.Module):
+    """Causal convolution and self-attention block for multi-chunk numerical verification."""
+
+    def __init__(self, channels: int = 4, hidden: int = 8, causal_padding: int = 2, num_heads: int = 2) -> None:
+        super().__init__()
+        self.causal_padding = causal_padding
+        self.num_heads = num_heads
+        self.head_dim = hidden // num_heads
+        self.conv1d = nn.Conv1d(hidden, hidden, kernel_size=causal_padding + 1, padding=0)
+        self.q_proj = nn.Linear(hidden, hidden)
+        self.k_proj = nn.Linear(hidden, hidden)
+        self.v_proj = nn.Linear(hidden, hidden)
+        self.out_proj = nn.Linear(hidden, hidden)
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.conv = SimpleNamespace(
+            in_channels=channels,
+            out_channels=channels,
+            block=[None, SimpleNamespace(causal_padding=[causal_padding])],
+        )
+        self.attn = SimpleNamespace(num_heads=num_heads, head_dim=self.head_dim)
+
+    def forward_chunk(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        cnn_buf: torch.Tensor,
+        att_buf: torch.Tensor,
+    ) -> torch.Tensor:
+        B, C, T = x.shape
+        # 1. Causal Conv1D
+        if cnn_cache is not None and cnn_cache.shape[-1] > 0:
+            conv_in = torch.cat([cnn_cache, x], dim=-1)
+        else:
+            conv_in = F.pad(x, (self.causal_padding, 0))
+        cnn_buf.copy_(conv_in[..., -self.causal_padding :])
+        h_conv = self.conv1d(conv_in)
+
+        # 2. Multi-head self-attention with attn_mask
+        x_time = x.transpose(1, 2)
+        Q = self.q_proj(x_time).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(x_time).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(x_time).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if att_cache is not None and att_cache.shape[2] > 0:
+            past_k = att_cache[..., : self.head_dim]
+            past_v = att_cache[..., self.head_dim :]
+            K_all = torch.cat([past_k, K], dim=2)
+            V_all = torch.cat([past_v, V], dim=2)
+        else:
+            K_all = K
+            V_all = V
+
+        att_buf.copy_(torch.cat([K_all, V_all], dim=-1))
+
+        scores = torch.matmul(Q, K_all.transpose(-2, -1)) / (self.head_dim**0.5)
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(1), -1e4)
+        probs = F.softmax(scores, dim=-1)
+        h_attn = torch.matmul(probs, V_all).transpose(1, 2).contiguous().view(B, T, C).transpose(1, 2)
+        h_attn = self.out_proj(h_attn.transpose(1, 2)).transpose(1, 2)
+
+        x = x + self.norm1((x + h_attn).transpose(1, 2)).transpose(1, 2)
+        x = x + self.norm2((x + h_conv).transpose(1, 2)).transpose(1, 2)
+        return x
+
+
+class _RealAttentionCausalConvDiT(nn.Module):
+    """Estimator with real attention consuming attn_mask and causal convolutions for cross-chunk parity testing."""
+
+    def __init__(self, x_dim: int = 4, hidden: int = 8, depth: int = 2, causal_pad: int = 2) -> None:
+        super().__init__()
+        self.x_dim = x_dim
+        self.in_proj = nn.Linear(x_dim * 4, hidden)
+        self.blocks = nn.ModuleList(
+            [_RealCausalDiTBlock(channels=x_dim, hidden=hidden, causal_padding=causal_pad) for _ in range(depth)]
+        )
+        self.final_layer = nn.Linear(hidden, x_dim)
+
+    def t_embedder(self, t: torch.Tensor) -> torch.Tensor:
+        return t[:, None].expand(-1, 8)
+
+    def blocks_forward_chunk(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor | None,
+        cnn_cache: torch.Tensor | None = None,
+        att_cache: torch.Tensor | None = None,
+        cnn_cache_buffer: torch.Tensor | None = None,
+        att_cache_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert cnn_cache_buffer is not None and att_cache_buffer is not None
+        x = self.in_proj(x.transpose(1, 2)).transpose(1, 2)
+        t_feat = t.transpose(1, 2)
+        for b_idx, block in enumerate(self.blocks):
+            cnn_b = cnn_cache[b_idx] if cnn_cache is not None else None
+            att_b = att_cache[b_idx] if att_cache is not None else None
+            x = block.forward_chunk(x, mask, cnn_b, att_b, cnn_cache_buffer[b_idx], att_cache_buffer[b_idx])
+            x = x + t_feat
+        x = self.final_layer(x.transpose(1, 2)).transpose(1, 2)
+        return x
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_real_attention_causal_conv_parity_across_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(42)
+    dit = _RealAttentionCausalConvDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=dit, n_timesteps=10, max_graphs=4)
+
+    B = 1
+    W = 16
+
+    # Call 1 (bucket=16, mel_frames=12, pad_frames=4, offset=0)
+    x1 = torch.randn(B, 4, W, device="cuda")
+    mu1 = torch.randn(2 * B, 4, W, device="cuda")
+    spk1 = torch.randn(2 * B, 4, device="cuda")
+    cond1 = torch.randn(2 * B, 4, W, device="cuda")
+    mask1 = torch.ones(2 * B, W, W, dtype=torch.bool, device="cuda")
+    mask1[:, :, 12:] = False
+
+    g_x1, g_cnn1, g_att1 = wrapper.replay(
+        x=x1,
+        mu_cfg=mu1,
+        speakers_cfg=spk1,
+        cond_cfg=cond1,
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=mask1,
+        mel_frames=12,
+        pad_frames=4,
+    )
+    e_x1, e_cnn1, e_att1 = _eager_solve_euler(
+        dit,
+        x1,
+        mu1,
+        spk1,
+        cond1,
+        None,
+        None,
+        mask1,
+        wrapper.timeline,
+        mel_frames=12,
+        pad_frames=4,
+    )
+
+    torch.testing.assert_close(g_x1, e_x1, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_cnn1, e_cnn1, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_att1[..., :12, :], e_att1[..., :12, :], rtol=1e-5, atol=1e-5)
+
+    # Chunk 2 consuming Chunk 1 caches (offset=12, mel_frames=16, pad_frames=0)
+    x1_c2 = torch.randn(B, 4, W, device="cuda")
+    mu1_c2 = torch.randn(2 * B, 4, W, device="cuda")
+    spk1_c2 = torch.randn(2 * B, 4, device="cuda")
+    cond1_c2 = torch.randn(2 * B, 4, W, device="cuda")
+    mask1_c2 = torch.ones(2 * B, W, W + 12, dtype=torch.bool, device="cuda")
+
+    g_x1_c2, g_cnn1_c2, g_att1_c2 = wrapper.replay(
+        x=x1_c2,
+        mu_cfg=mu1_c2,
+        speakers_cfg=spk1_c2,
+        cond_cfg=cond1_c2,
+        cnn_cache=g_cnn1,
+        att_cache=g_att1[..., :12, :],
+        attn_mask=mask1_c2,
+        mel_frames=16,
+        pad_frames=0,
+    )
+    e_x1_c2, e_cnn1_c2, e_att1_c2 = _eager_solve_euler(
+        dit,
+        x1_c2,
+        mu1_c2,
+        spk1_c2,
+        cond1_c2,
+        e_cnn1,
+        e_att1[..., :12, :],
+        mask1_c2,
+        wrapper.timeline,
+        mel_frames=16,
+        pad_frames=0,
+    )
+
+    torch.testing.assert_close(g_x1_c2, e_x1_c2, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_cnn1_c2, e_cnn1_c2, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_att1_c2, e_att1_c2, rtol=1e-5, atol=1e-5)
+
+    # Call 2 on same bucket (bucket=16, mel_frames=15, pad_frames=1, offset=0)
+    x2 = torch.randn(B, 4, W, device="cuda")
+    mu2 = torch.randn(2 * B, 4, W, device="cuda")
+    spk2 = torch.randn(2 * B, 4, device="cuda")
+    cond2 = torch.randn(2 * B, 4, W, device="cuda")
+    mask2 = torch.ones(2 * B, W, W, dtype=torch.bool, device="cuda")
+    mask2[:, :, 15:] = False
+
+    g_x2, g_cnn2, g_att2 = wrapper.replay(
+        x=x2,
+        mu_cfg=mu2,
+        speakers_cfg=spk2,
+        cond_cfg=cond2,
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=mask2,
+        mel_frames=15,
+        pad_frames=1,
+    )
+    e_x2, e_cnn2, e_att2 = _eager_solve_euler(
+        dit,
+        x2,
+        mu2,
+        spk2,
+        cond2,
+        None,
+        None,
+        mask2,
+        wrapper.timeline,
+        mel_frames=15,
+        pad_frames=1,
+    )
+
+    torch.testing.assert_close(g_x2, e_x2, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_cnn2, e_cnn2, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_att2[..., :15, :], e_att2[..., :15, :], rtol=1e-5, atol=1e-5)
+
+    # Subsequent chunk consuming Call 2 caches (offset=15, mel_frames=16, pad_frames=0)
+    mask2_c2 = torch.ones(2 * B, W, W + 15, dtype=torch.bool, device="cuda")
+    g_x2_c2, g_cnn2_c2, g_att2_c2 = wrapper.replay(
+        x=x1_c2,
+        mu_cfg=mu1_c2,
+        speakers_cfg=spk1_c2,
+        cond_cfg=cond1_c2,
+        cnn_cache=g_cnn2,
+        att_cache=g_att2[..., :15, :],
+        attn_mask=mask2_c2,
+        mel_frames=16,
+        pad_frames=0,
+    )
+    e_x2_c2, e_cnn2_c2, e_att2_c2 = _eager_solve_euler(
+        dit,
+        x1_c2,
+        mu1_c2,
+        spk1_c2,
+        cond1_c2,
+        e_cnn2,
+        e_att2[..., :15, :],
+        mask2_c2,
+        wrapper.timeline,
+        mel_frames=16,
+        pad_frames=0,
+    )
+    torch.testing.assert_close(g_x2_c2, e_x2_c2, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_cnn2_c2, e_cnn2_c2, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(g_att2_c2, e_att2_c2, rtol=1e-5, atol=1e-5)
+
+    # Cache hit check: Call 2 must hit the graph captured in Call 1
+    assert wrapper._stats["hits"] >= 1
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+        BatchedToken2Wav,
+    )
+
+    mock_stepper = Mock()
+    mock_stepper.step.side_effect = lambda x, mu, t, spks, cond, cnn_cache, att_cache: (
+        x,
+        torch.zeros(2, x.shape[0], 4, 2, device=x.device),
+        torch.zeros(2, x.shape[0], 2, x.shape[2], 4, device=x.device),
+    )
+
+    class _MockDecoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.estimator = _WholeEulerDiT().eval().cuda()
+            self.inference_cfg_rate = 0.7
+            self.register_buffer("rand_noise", torch.zeros(1, 4, 100, device="cuda"), persistent=False)
+
+    class _MockFlow(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.decoder = _MockDecoder()
+            self.spk_embed_affine_layer = nn.Identity()
+
+    class _MockToken2Wav:
+        def __init__(self) -> None:
+            self.flow = _MockFlow()
+            self.hift = nn.Module()
+            self.float16 = False
+            self.n_timesteps = 10
+            self.mel_cache_len = 1
+            self.source_cache_len = 2
+            self.speech_window = torch.hamming_window(4, periodic=False)
+
+    # Both TRT stepper and enable_cfm_graph (with enable_whole_euler=True) configured
+    adapter = BatchedToken2Wav(
+        _MockToken2Wav(),
+        trt_stepper=mock_stepper,
+        cfm_graph_config={"enabled": True, "enable_whole_euler": True, "bucket_frames": 16},
+    )
+
+    # 1. Whole-Euler graph wrapper must not be initialized
+    assert adapter._whole_euler_graph_wrapper is None
+
+    # 2. Replay/decode must route to TRT stepper rather than Whole-Euler
+    mu = torch.randn(1, 4, 16, device="cuda")
+    spk = torch.randn(1, 4, device="cuda")
+    cond = torch.randn(1, 4, 16, device="cuda")
+    adapter._decode_cfm(
+        mu=mu,
+        speakers=spk,
+        cond=cond,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert mock_stepper.step.called
+    assert mock_stepper.step.call_count == adapter.n_timesteps
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_disabled_via_serving_config() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+        BatchedToken2Wav,
+    )
+
+    class _MockDecoder(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.estimator = _WholeEulerDiT().eval().cuda()
+            self.inference_cfg_rate = 0.7
+            self.register_buffer("rand_noise", torch.zeros(1, 4, 100, device="cuda"), persistent=False)
+
+    class _MockFlow(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.decoder = _MockDecoder()
+            self.spk_embed_affine_layer = nn.Identity()
+
+    class _MockToken2Wav:
+        def __init__(self) -> None:
+            self.flow = _MockFlow()
+            self.hift = nn.Module()
+            self.float16 = False
+            self.n_timesteps = 10
+            self.mel_cache_len = 1
+            self.source_cache_len = 2
+            self.speech_window = torch.hamming_window(4, periodic=False)
+
+    adapter_disabled = BatchedToken2Wav(
+        _MockToken2Wav(),
+        cfm_graph_config={"enabled": True, "enable_whole_euler": False},
+    )
+    assert adapter_disabled._whole_euler_graph_wrapper is None
+    assert adapter_disabled._cfm_graph_wrapper is not None
+
+    adapter_enabled = BatchedToken2Wav(
+        _MockToken2Wav(),
+        cfm_graph_config={"enabled": True, "enable_whole_euler": True},
+    )
+    assert adapter_enabled._whole_euler_graph_wrapper is not None
+    assert adapter_enabled._cfm_graph_wrapper is not None

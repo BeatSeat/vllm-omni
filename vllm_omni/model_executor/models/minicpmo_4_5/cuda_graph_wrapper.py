@@ -13,6 +13,7 @@ logger = init_logger(__name__)
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON = True
 except ImportError:
     triton = None
@@ -28,10 +29,10 @@ if _HAS_TRITON:
         dt,
         cfg_rate,
         n_elements,
-        BLOCK_SIZE: tl.constexpr,
+        block_size: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        offsets = pid * block_size + tl.arange(0, block_size)
         mask = offsets < n_elements
 
         x = tl.load(x_ptr + offsets, mask=mask)
@@ -56,29 +57,23 @@ def _fused_euler_step(
     Uses Triton kernel when available on CUDA for a single fused launch without DRAM roundtrips.
     Falls back to standard PyTorch ops when Triton is unavailable or tensors are non-contiguous.
     """
-    if (
-        _HAS_TRITON
-        and cur_x.is_cuda
-        and cur_x.is_contiguous()
-        and estimate.is_contiguous()
-    ):
+    if _HAS_TRITON and cur_x.is_cuda and cur_x.is_contiguous() and estimate.is_contiguous():
         n_elements = cur_x.numel()
-        BLOCK_SIZE = 1024
-        grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+        block_size = 1024
+        grid = (triton.cdiv(n_elements, block_size),)
         _fused_euler_step_kernel[grid](
             cur_x,
             estimate,
             float(dt),
             float(inference_cfg_rate),
             n_elements,
-            BLOCK_SIZE=BLOCK_SIZE,
+            block_size=block_size,
         )
         return cur_x
 
     conditional, unconditional = estimate.split(batch_size, dim=0)
     velocity = (1.0 + inference_cfg_rate) * conditional - inference_cfg_rate * unconditional
     return cur_x + dt * velocity
-
 
 
 class HiFTGraphWrapper:
@@ -685,6 +680,8 @@ class WholeEulerCFMGraphWrapper:
         att_cache_dtype: torch.dtype = torch.float32,
         max_graphs: int = 32,
         max_serial_batch: int | None = None,
+        max_graph_batch: int | None = None,
+        micro_batch_size: int = 4,
     ) -> None:
         self.estimator = estimator
         self.n_timesteps = int(n_timesteps)
@@ -695,6 +692,14 @@ class WholeEulerCFMGraphWrapper:
             self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
         else:
             self.max_serial_batch = int(max_serial_batch)
+        self.micro_batch_size = int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
+        if max_graph_batch is None:
+            if max_serial_batch is not None and max_serial_batch < self.micro_batch_size:
+                self.max_graph_batch = int(max_serial_batch)
+            else:
+                self.max_graph_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_BATCH", "8"))
+        else:
+            self.max_graph_batch = int(max_graph_batch)
         parameter = next(estimator.parameters(), None)
         if parameter is not None:
             self.device = parameter.device
@@ -834,9 +839,7 @@ class WholeEulerCFMGraphWrapper:
             static_cond_cfg = self.arena.get_cond_staging(batch_size, channels, mel_width)
 
             static_cnn_cache = self.arena.get_cnn_cache_in(batch_size)
-            static_att_cache = self.arena.get_att_cache_in(
-                batch_size, offset if (has_att_cache and offset > 0) else 0
-            )
+            static_att_cache = self.arena.get_att_cache_in(batch_size, offset if (has_att_cache and offset > 0) else 0)
             static_attn_mask = (
                 self.arena.get_mask_staging(batch_size, mel_width, offset + mel_width)
                 if (has_mask and attn_mask is not None)
@@ -957,30 +960,56 @@ class WholeEulerCFMGraphWrapper:
         if mel_frames is None:
             mel_frames = mel_width - pad_frames
 
-        if batch_size > self.max_serial_batch:
+        if batch_size > self.max_graph_batch:
             return None
 
-        if batch_size > 1:
+        native_batch_sizes = (1, self.micro_batch_size)
+        if batch_size not in native_batch_sizes:
+            chunk_sizes: list[int] = []
+            rem = batch_size
+            while rem >= self.micro_batch_size:
+                chunk_sizes.append(self.micro_batch_size)
+                rem -= self.micro_batch_size
+            while rem > 0:
+                chunk_sizes.append(1)
+                rem -= 1
+
+            if len(chunk_sizes) > self.max_serial_batch:
+                return None
+
             chunk_mels: list[torch.Tensor] = []
             out_cnns: list[torch.Tensor] = []
             out_atts: list[torch.Tensor] = []
-            for b in range(batch_size):
-                sub_x = x[b : b + 1]
-                sub_mu = torch.cat((mu_cfg[b : b + 1], mu_cfg[batch_size + b : batch_size + b + 1]), dim=0)
-                sub_spk = torch.cat((speakers_cfg[b : b + 1], speakers_cfg[batch_size + b : batch_size + b + 1]), dim=0)
-                sub_cond = torch.cat((cond_cfg[b : b + 1], cond_cfg[batch_size + b : batch_size + b + 1]), dim=0)
+            start = 0
+            for k in chunk_sizes:
+                end = start + k
+                sub_x = x[start:end]
+                sub_mu = torch.cat((mu_cfg[start:end], mu_cfg[batch_size + start : batch_size + end]), dim=0)
+                sub_spk = torch.cat(
+                    (speakers_cfg[start:end], speakers_cfg[batch_size + start : batch_size + end]), dim=0
+                )
+                sub_cond = torch.cat((cond_cfg[start:end], cond_cfg[batch_size + start : batch_size + end]), dim=0)
                 sub_cnn = (
-                    torch.cat((cnn_cache[:, :, b : b + 1], cnn_cache[:, :, batch_size + b : batch_size + b + 1]), dim=2)
+                    torch.cat(
+                        (cnn_cache[:, :, start:end], cnn_cache[:, :, batch_size + start : batch_size + end]),
+                        dim=2,
+                    )
                     if cnn_cache is not None
                     else None
                 )
                 sub_att = (
-                    torch.cat((att_cache[:, :, b : b + 1], att_cache[:, :, batch_size + b : batch_size + b + 1]), dim=2)
+                    torch.cat(
+                        (att_cache[:, :, start:end], att_cache[:, :, batch_size + start : batch_size + end]),
+                        dim=2,
+                    )
                     if att_cache is not None
                     else None
                 )
                 sub_mask = (
-                    torch.cat((attn_mask[b : b + 1], attn_mask[batch_size + b : batch_size + b + 1]), dim=0)
+                    torch.cat(
+                        (attn_mask[start:end], attn_mask[batch_size + start : batch_size + end]),
+                        dim=0,
+                    )
                     if attn_mask is not None
                     else None
                 )
@@ -1000,14 +1029,15 @@ class WholeEulerCFMGraphWrapper:
                 chunk_mels.append(sub_res[0])
                 out_cnns.append(sub_res[1])
                 out_atts.append(sub_res[2])
+                start = end
 
             chunk_mel = torch.cat(chunk_mels, dim=0)
-            cond_cnns = torch.cat([c[:, :, 0:1] for c in out_cnns], dim=2)
-            uncond_cnns = torch.cat([c[:, :, 1:2] for c in out_cnns], dim=2)
+            cond_cnns = torch.cat([c[:, :, 0:k] for c, k in zip(out_cnns, chunk_sizes)], dim=2)
+            uncond_cnns = torch.cat([c[:, :, k : 2 * k] for c, k in zip(out_cnns, chunk_sizes)], dim=2)
             out_cnn = torch.cat((cond_cnns, uncond_cnns), dim=2)
 
-            cond_atts = torch.cat([a[:, :, 0:1] for a in out_atts], dim=2)
-            uncond_atts = torch.cat([a[:, :, 1:2] for a in out_atts], dim=2)
+            cond_atts = torch.cat([a[:, :, 0:k] for a, k in zip(out_atts, chunk_sizes)], dim=2)
+            uncond_atts = torch.cat([a[:, :, k : 2 * k] for a, k in zip(out_atts, chunk_sizes)], dim=2)
             out_att = torch.cat((cond_atts, uncond_atts), dim=2)
             return chunk_mel, out_cnn, out_att
         offset = int(att_cache.shape[4]) if att_cache is not None else 0

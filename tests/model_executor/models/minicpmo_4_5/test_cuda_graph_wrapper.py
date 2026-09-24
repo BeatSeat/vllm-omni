@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
+    _fused_euler_step,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -933,6 +934,107 @@ def test_whole_euler_multibatch_serial_replay(monkeypatch: pytest.MonkeyPatch) -
         assert key[1] == 1
 
     wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=8, max_graph_batch=8)
+
+    w = 8
+    # 1. Native B=4 capture
+    batch_size = 4
+    x4 = torch.randn(batch_size, 4, w, device="cuda")
+    mu4 = torch.randn(2 * batch_size, 4, w, device="cuda")
+    spk4 = torch.randn(2 * batch_size, 4, device="cuda")
+    cond4 = torch.randn(2 * batch_size, 4, w, device="cuda")
+
+    out_mel4, out_cnn4, out_att4 = wrapper.replay(
+        x=x4,
+        mu_cfg=mu4,
+        speakers_cfg=spk4,
+        cond_cfg=cond4,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert out_mel4 is not None
+    assert out_mel4.shape == (4, 4, w)
+    assert out_cnn4.shape[2] == 8
+    assert out_att4.shape[2] == 8
+    assert any(key[1] == 4 for key in wrapper._cache)
+
+    # 2. B=8 partitions into [4, 4], reusing the native B=4 graph
+    batch_size = 8
+    x8 = torch.randn(batch_size, 4, w, device="cuda")
+    mu8 = torch.randn(2 * batch_size, 4, w, device="cuda")
+    spk8 = torch.randn(2 * batch_size, 4, device="cuda")
+    cond8 = torch.randn(2 * batch_size, 4, w, device="cuda")
+
+    out_mel8, out_cnn8, out_att8 = wrapper.replay(
+        x=x8,
+        mu_cfg=mu8,
+        speakers_cfg=spk8,
+        cond_cfg=cond8,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert out_mel8 is not None
+    assert out_mel8.shape == (8, 4, w)
+    assert out_cnn8.shape[2] == 16
+    assert out_att8.shape[2] == 16
+
+    # 3. B=5 partitions into [4, 1], capturing B=1 graph as well
+    batch_size = 5
+    x5 = torch.randn(batch_size, 4, w, device="cuda")
+    mu5 = torch.randn(2 * batch_size, 4, w, device="cuda")
+    spk5 = torch.randn(2 * batch_size, 4, device="cuda")
+    cond5 = torch.randn(2 * batch_size, 4, w, device="cuda")
+
+    out_mel5, out_cnn5, out_att5 = wrapper.replay(
+        x=x5,
+        mu_cfg=mu5,
+        speakers_cfg=spk5,
+        cond_cfg=cond5,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert out_mel5 is not None
+    assert out_mel5.shape == (5, 4, w)
+    assert out_cnn5.shape[2] == 10
+    assert out_att5.shape[2] == 10
+    cached_batches = {key[1] for key in wrapper._cache}
+    assert 4 in cached_batches
+    assert 1 in cached_batches
+
+    wrapper._flush()
+
+
+def test_batched_eager_fused_euler_parity() -> None:
+    torch.manual_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = 4
+    channels = 80
+    mel_frames = 14
+    inference_cfg_rate = 0.7
+    dt = 0.05
+
+    cur_x = torch.randn(batch_size, channels, mel_frames, device=device)
+    estimate = torch.randn(2 * batch_size, channels, mel_frames, device=device)
+
+    ref_x = cur_x.clone()
+    cond, uncond = estimate.split(batch_size, dim=0)
+    velocity = (1.0 + inference_cfg_rate) * cond - inference_cfg_rate * uncond
+    expected_x = ref_x + dt * velocity
+
+    test_x = cur_x.clone()
+    result_x = _fused_euler_step(test_x, estimate, dt, inference_cfg_rate, batch_size)
+
+    max_diff = torch.max(torch.abs(expected_x - result_x)).item()
+    assert max_diff < 1e-5, f"Fused Euler max difference {max_diff} exceeds 1e-5"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")

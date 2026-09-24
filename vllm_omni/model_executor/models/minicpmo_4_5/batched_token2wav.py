@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper, WholeEulerCFMGraphWrapper
+from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper, WholeEulerCFMGraphWrapper, _fused_euler_step
 
 logger = init_logger(__name__)
 
@@ -106,29 +106,26 @@ def _zero_padded_cnn_cache(
 ) -> None:
     """Clear the cache positions that come from padded frames, in place.
 
-    Each block's CNN cache holds the tail of its convolution output
-    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
-    so when the padding sits at the chunk tail those positions are
-    padding-derived and would otherwise become the next chunk's left context.
-    Padding is at most ``pad_frames`` wide, so only the trailing positions that
-    can come from it are cleared; the valid part of the window is kept.
+    Vectorized across all DiT blocks in a single slice operation to eliminate
+    per-block Python loops and separate kernel launches.
     """
-    blocks = estimator.blocks
-    if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
+    if pad_frames <= 0:
+        return
+    if isinstance(cnn_cache, torch.Tensor):
         width = int(cnn_cache.shape[-1])
-        if width > 0 and all(int(block.conv.block[1].causal_padding[0]) == width for block in blocks):
-            # _estimator_buffers packs equal-width blocks into one tensor.
-            # Clear their shared tail with one write instead of one per block.
-            cnn_cache[..., max(0, width - pad_frames) :] = 0.0
-            return
-
-    for index, block in enumerate(estimator.blocks):
-        width = int(block.conv.block[1].causal_padding[0])
         if width <= 0:
-            continue
-        zero_from = max(0, width - pad_frames)
-        if zero_from < width:
-            cnn_cache[index][..., zero_from:] = 0.0
+            return
+        cnn_cache[..., max(0, width - pad_frames) :] = 0.0
+        return
+    blocks = getattr(estimator, "blocks", None)
+    if blocks is not None and len(blocks) == len(cnn_cache):
+        for index, block in enumerate(blocks):
+            width = int(block.conv.block[1].causal_padding[0])
+            if width <= 0:
+                continue
+            zero_from = max(0, width - pad_frames)
+            if zero_from < width:
+                cnn_cache[index][..., zero_from:] = 0.0
 
 
 def plan_token2wav_encode_slices(
@@ -552,6 +549,7 @@ class BatchedToken2Wav(nn.Module):
         valid_lengths: list[int] | None = None,
         valid_frames: int | None = None,
         att_out_buffer: Any = None,
+        time_embedding: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._trt_stepper is not None and valid_lengths is None:
@@ -565,7 +563,8 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=att_cache,
             )
             return out.to(mu.dtype), new_cnn, new_att
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        if time_embedding is None:
+            time_embedding = estimator.t_embedder(time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         if valid_frames is not None and valid_frames < width:
@@ -844,6 +843,9 @@ class BatchedToken2Wav(nn.Module):
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
         dt = timeline[1] - timeline[0]
+        time_embeddings = [
+            estimator.t_embedder(timeline[s].expand(2 * batch_size)).unsqueeze(1) for s in range(self.n_timesteps)
+        ]
         with _token2wav_sdpa_context(mu.device):
             for step in range(self.n_timesteps):
                 old_cnn = cnn_cache[step] if cnn_cache is not None else None
@@ -860,13 +862,13 @@ class BatchedToken2Wav(nn.Module):
                     attn_mask=attn_mask,
                     valid_lengths=valid_lengths,
                     valid_frames=mel_frames if pad_frames else None,
+                    time_embedding=time_embeddings[step],
                 )
                 if pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
-                conditional, unconditional = estimate.split(batch_size, dim=0)
-                velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-                x = x + dt * velocity
-                _zero_padded_frames(x, mel_frames if pad_frames else None)
+                x = _fused_euler_step(x, estimate, float(dt), decoder.inference_cfg_rate, batch_size)
+                if pad_frames:
+                    _zero_padded_frames(x, mel_frames)
                 time = time + dt
                 if step + 1 < self.n_timesteps:
                     dt = timeline[step + 2] - time[0]

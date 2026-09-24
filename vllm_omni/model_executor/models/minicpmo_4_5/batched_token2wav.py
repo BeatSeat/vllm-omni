@@ -345,6 +345,14 @@ class BatchedToken2Wav(nn.Module):
                         os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
                     )
                 )
+                max_graph_batch_cfg = cfm_graph_cfg.get("max_graph_batch")
+                max_graph_batch = int(max_graph_batch_cfg) if max_graph_batch_cfg is not None else None
+                micro_batch_size_cfg = cfm_graph_cfg.get("micro_batch_size")
+                micro_batch_size = (
+                    int(micro_batch_size_cfg)
+                    if micro_batch_size_cfg is not None
+                    else int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
+                )
                 if bool(cfm_graph_cfg.get("enable_whole_euler", True)) and self._trt_stepper is None:
                     self._whole_euler_graph_wrapper = WholeEulerCFMGraphWrapper(
                         estimator=estimator,
@@ -353,11 +361,16 @@ class BatchedToken2Wav(nn.Module):
                         att_cache_dtype=self._estimator_att_cache_dtype,
                         max_graphs=max_graphs,
                         max_serial_batch=max_serial_batch,
+                        max_graph_batch=max_graph_batch,
+                        micro_batch_size=micro_batch_size,
                     )
                     logger.info(
-                        "Whole-Euler CFM CUDA Graph enabled (max_graphs=%d, max_serial_batch=%d)",
+                        "Whole-Euler CFM CUDA Graph enabled "
+                        "(max_graphs=%d, max_serial_batch=%d, max_graph_batch=%s, micro_batch_size=%d)",
                         max_graphs,
                         max_serial_batch,
+                        str(max_graph_batch),
+                        micro_batch_size,
                     )
                 elif self._trt_stepper is not None and bool(cfm_graph_cfg.get("enable_whole_euler", True)):
                     logger.info("Whole-Euler CFM CUDA Graph disabled because TensorRT stepper is configured")

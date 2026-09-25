@@ -58,10 +58,9 @@ content arrives as worker-side ``inputs_embeds``: the hashes would be identical
 across sessions while the KV behind them is not. ``OmniTensorPrefixCache`` has
 the same exposure through its block/slot mirroring, and it and async output
 materialization are mutually exclusive anyway.
-*Block size 16.* FlashAttention, FlashInfer and Triton all require
-``block_size == 16`` for a sliding window (``AGENTS.md``), and upstream lets the
-kernel choose a sliding-window layer's block size rather than taking
-``--block-size``. The conversion below reads that size back off the spec the
+*Block size.* On CUDA, kernels typically use ``block_size == 16`` for a sliding window,
+while Ascend NPU uses 128. The window geometry and compaction algorithms support any
+positive block size. The conversion below reads that size back off the spec the
 parent produced, so the kernel's choice -- not this module's -- is the one the
 chunk arithmetic uses.
 
@@ -89,9 +88,9 @@ Wiring, in the order the pieces get used
    :func:`rotate_cached_keys` per layer, and shift the request's positions,
    ``mrope_positions`` and ``mrope_position_delta`` in the same step so the next
    forward reads the compacted layout.
-4. Deploy config: ``enable_prefix_caching`` stays false, ``block_size`` is 16,
-   and the window's watermarks come from the model's duplex policy rather than
-   from a scheduler constant.
+4. Deploy config: ``enable_prefix_caching`` stays false, ``block_size`` matches
+   the engine's cache configuration, and the window's watermarks come from
+   the model's duplex policy rather than from a scheduler constant.
 """
 
 from __future__ import annotations
@@ -115,8 +114,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
     plan_position_reanchor,
 )
 
-#: FlashAttention, FlashInfer and Triton all reject other page sizes for a
-#: sliding-window group.
+#: Default block size for sliding window on CUDA. Hardware like Ascend NPU may
+#: use larger page sizes (e.g. 128).
 DUPLEX_WINDOW_BLOCK_SIZE = 16
 
 
@@ -166,12 +165,15 @@ def validate_duplex_window_install(
     KV-cache profile, so a wrong deploy config fails at startup rather than
     leaving a session that grows without bound.
     """
-    if cache_config.enable_prefix_caching:
+    if getattr(cache_config, "enable_prefix_caching", False):
         raise ValueError("MiniCPM-o 4.5 duplex KV window requires enable_prefix_caching=False")
-    if geometry.block_size != DUPLEX_WINDOW_BLOCK_SIZE:
+    if geometry.block_size <= 0:
+        raise ValueError(f"duplex KV window needs positive block_size, got {geometry.block_size}")
+    configured_block_size = getattr(cache_config, "block_size", None)
+    if configured_block_size is not None and geometry.block_size != configured_block_size:
         raise ValueError(
-            f"duplex KV window needs block_size={DUPLEX_WINDOW_BLOCK_SIZE} "
-            f"(sliding-window pages are fixed there), got {geometry.block_size}"
+            f"duplex KV window geometry block_size ({geometry.block_size}) "
+            f"does not match cache_config.block_size ({configured_block_size})"
         )
     needed = geometry.prefix_tokens + geometry.trigger_tokens + geometry.sample_room
     if needed > model_config.max_model_len:

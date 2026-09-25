@@ -43,6 +43,7 @@ try:
         duplex_window_geometry,
         rotate_cached_keys,
         rotate_keys,
+        validate_duplex_window_install,
     )
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
         PositionReanchor,
@@ -183,6 +184,7 @@ except (ImportError, ModuleNotFoundError):
     duplex_window_geometry = _wk.duplex_window_geometry
     rotate_cached_keys = _wk.rotate_cached_keys
     rotate_keys = _wk.rotate_keys
+    validate_duplex_window_install = _wk.validate_duplex_window_install
     PositionReanchor = _wp.PositionReanchor
     plan_position_reanchor = _wp.plan_position_reanchor
     MiniCPMO45Stage0DuplexRuntime = _stage0.MiniCPMO45Stage0DuplexRuntime
@@ -1323,3 +1325,43 @@ def test_watermark_interval_high_to_high_plus_prefix():
     assert plan.delta > 0
     # Post-trim length must be bounded by low_watermark
     assert 8034 - plan.delta <= low_watermark
+
+
+def test_validate_duplex_window_install_block_sizes():
+    """Verify validate_duplex_window_install supports arbitrary block sizes (including NPU 128)."""
+    # Standard CUDA block_size=16
+    cache_config_cuda = SimpleNamespace(enable_prefix_caching=False, block_size=16)
+    model_config = SimpleNamespace(max_model_len=40960)
+    geometry_16 = duplex_window_geometry(
+        prefix_tokens=96,
+        window_tokens=6000,
+        block_size=16,
+        max_model_len=40960,
+        high_watermark_tokens=8000,
+    )
+    validate_duplex_window_install(cache_config_cuda, model_config, geometry_16)
+
+    # Ascend NPU block_size=128
+    cache_config_npu = SimpleNamespace(enable_prefix_caching=False, block_size=128)
+    geometry_128 = duplex_window_geometry(
+        prefix_tokens=96,
+        window_tokens=6000,
+        block_size=128,
+        max_model_len=40960,
+        high_watermark_tokens=8000,
+    )
+    validate_duplex_window_install(cache_config_npu, model_config, geometry_128)
+
+    # Rejects mismatched block size between geometry and cache_config
+    with pytest.raises(ValueError, match="does not match"):
+        validate_duplex_window_install(cache_config_npu, model_config, geometry_16)
+
+    # Rejects prefix caching
+    cache_config_pc = SimpleNamespace(enable_prefix_caching=True, block_size=128)
+    with pytest.raises(ValueError, match="enable_prefix_caching=False"):
+        validate_duplex_window_install(cache_config_pc, model_config, geometry_128)
+
+    # Rejects when window does not fit max_model_len
+    model_config_small = SimpleNamespace(max_model_len=2048)
+    with pytest.raises(ValueError, match="does not fit max_model_len"):
+        validate_duplex_window_install(cache_config_npu, model_config_small, geometry_128)

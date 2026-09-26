@@ -927,17 +927,20 @@ def test_whole_euler_cache_flushes_whole_generation(
         att_cache=None,
     )
     assert res10 is not None
-    eager_x10 = _eager_solve_euler(
+    eager_x10, _, _ = _eager_solve_euler(
         estimator,
         x10.clone(),
         mu10.clone(),
         spk10.clone(),
         cond10.clone(),
+        None,
+        None,
+        None,
         wrapper.timeline,
         mel_frames=10,
         pad_frames=0,
     )
-    torch.testing.assert_close(res10[0], eager_x10[0], rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(res10[0], eager_x10, rtol=1e-4, atol=1e-5)
     wrapper._flush()
 
 

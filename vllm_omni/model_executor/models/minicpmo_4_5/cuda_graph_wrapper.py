@@ -980,37 +980,29 @@ class WholeEulerCFMGraphWrapper:
 
             channels = int(x.shape[1])
             chunk_mel = torch.empty((batch_size, channels, mel_frames), device=x.device, dtype=x.dtype)
-            out_cnn = (
-                torch.empty(
-                    (
-                        self.n_timesteps,
-                        self.arena.depth,
-                        2 * batch_size,
-                        self.arena.cnn_channels,
-                        self.arena.cnn_width,
-                    ),
-                    device=x.device,
-                    dtype=self.dtype,
-                )
-                if cnn_cache is not None
-                else None
+            out_cnn = torch.empty(
+                (
+                    self.n_timesteps,
+                    self.arena.depth,
+                    2 * batch_size,
+                    self.arena.cnn_channels,
+                    self.arena.cnn_width,
+                ),
+                device=x.device,
+                dtype=self.dtype,
             )
             total_len = (int(att_cache.shape[4]) if att_cache is not None else 0) + mel_width
-            out_att = (
-                torch.empty(
-                    (
-                        self.n_timesteps,
-                        self.arena.depth,
-                        2 * batch_size,
-                        self.arena.heads,
-                        total_len,
-                        self.arena.att_width,
-                    ),
-                    device=x.device,
-                    dtype=self.att_cache_dtype,
-                )
-                if att_cache is not None
-                else None
+            out_att = torch.empty(
+                (
+                    self.n_timesteps,
+                    self.arena.depth,
+                    2 * batch_size,
+                    self.arena.heads,
+                    total_len,
+                    self.arena.att_width,
+                ),
+                device=x.device,
+                dtype=self.att_cache_dtype,
             )
 
             start = 0
@@ -1060,10 +1052,10 @@ class WholeEulerCFMGraphWrapper:
                 if sub_res is None:
                     return None
                 chunk_mel[start:end].copy_(sub_res[0])
-                if out_cnn is not None and sub_res[1] is not None:
+                if sub_res[1] is not None:
                     out_cnn[:, :, start:end].copy_(sub_res[1][:, :, :k])
                     out_cnn[:, :, batch_size + start : batch_size + end].copy_(sub_res[1][:, :, k : 2 * k])
-                if out_att is not None and sub_res[2] is not None:
+                if sub_res[2] is not None:
                     out_att[:, :, start:end].copy_(sub_res[2][:, :, :k])
                     out_att[:, :, batch_size + start : batch_size + end].copy_(sub_res[2][:, :, k : 2 * k])
                 start = end

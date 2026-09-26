@@ -421,13 +421,7 @@ class CFMGraphWrapper:
         inputs = (estimator_input, time_emb, cnn_cache, att_cache, cnn_out, att_out, attn_mask)
         self._stats["calls"] += 1
 
-        batch_size = estimator_input.shape[0] // 2
-        if (
-            not self.enabled
-            or torch.cuda.is_current_stream_capturing()
-            or estimator_input.device.type != "cuda"
-            or batch_size > self.max_serial_batch
-        ):
+        if not self.enabled or torch.cuda.is_current_stream_capturing() or estimator_input.device.type != "cuda":
             return self._eager(inputs)
 
         key = ("estimator_step",) + tuple(_tensor_signature(v) for v in inputs)
@@ -747,15 +741,14 @@ class WholeEulerCFMGraphWrapper:
 
     def _flush(self) -> None:
         """Retire every captured graph at once."""
-        if not self._cache:
-            return
         torch.accelerator.synchronize(self.device)
-        for entry in self._cache.values():
-            entry[4].reset()
-        self._cache.clear()
+        if self._cache:
+            for entry in self._cache.values():
+                entry[4].reset()
+            self._cache.clear()
+            self._stats["flushes"] += 1
+            logger.info("Whole-Euler CFM graph cache flushed; stats=%s", self.stats_snapshot())
         self.arena.clear()
-        self._stats["flushes"] += 1
-        logger.info("Whole-Euler CFM graph cache flushed; stats=%s", self.stats_snapshot())
 
     def _disable(self, reason: str, key: tuple) -> None:
         logger.warning(
@@ -977,12 +970,49 @@ class WholeEulerCFMGraphWrapper:
                 chunk_sizes.append(1)
                 rem -= 1
 
-            if len(chunk_sizes) > self.max_serial_batch:
+            max_allowed_chunks = max(
+                self.max_serial_batch,
+                (self.max_graph_batch + self.micro_batch_size - 1) // self.micro_batch_size
+                + (self.micro_batch_size - 1),
+            )
+            if len(chunk_sizes) > max_allowed_chunks:
                 return None
 
-            chunk_mels: list[torch.Tensor] = []
-            out_cnns: list[torch.Tensor] = []
-            out_atts: list[torch.Tensor] = []
+            channels = int(x.shape[1])
+            chunk_mel = torch.empty((batch_size, channels, mel_frames), device=x.device, dtype=x.dtype)
+            out_cnn = (
+                torch.empty(
+                    (
+                        self.n_timesteps,
+                        self.arena.depth,
+                        2 * batch_size,
+                        self.arena.cnn_channels,
+                        self.arena.cnn_width,
+                    ),
+                    device=x.device,
+                    dtype=self.dtype,
+                )
+                if cnn_cache is not None
+                else None
+            )
+            total_len = (int(att_cache.shape[4]) if att_cache is not None else 0) + mel_width
+            out_att = (
+                torch.empty(
+                    (
+                        self.n_timesteps,
+                        self.arena.depth,
+                        2 * batch_size,
+                        self.arena.heads,
+                        total_len,
+                        self.arena.att_width,
+                    ),
+                    device=x.device,
+                    dtype=self.att_cache_dtype,
+                )
+                if att_cache is not None
+                else None
+            )
+
             start = 0
             for k in chunk_sizes:
                 end = start + k
@@ -1029,19 +1059,15 @@ class WholeEulerCFMGraphWrapper:
                 )
                 if sub_res is None:
                     return None
-                chunk_mels.append(sub_res[0])
-                out_cnns.append(sub_res[1])
-                out_atts.append(sub_res[2])
+                chunk_mel[start:end].copy_(sub_res[0])
+                if out_cnn is not None and sub_res[1] is not None:
+                    out_cnn[:, :, start:end].copy_(sub_res[1][:, :, :k])
+                    out_cnn[:, :, batch_size + start : batch_size + end].copy_(sub_res[1][:, :, k : 2 * k])
+                if out_att is not None and sub_res[2] is not None:
+                    out_att[:, :, start:end].copy_(sub_res[2][:, :, :k])
+                    out_att[:, :, batch_size + start : batch_size + end].copy_(sub_res[2][:, :, k : 2 * k])
                 start = end
 
-            chunk_mel = torch.cat(chunk_mels, dim=0)
-            cond_cnns = torch.cat([c[:, :, 0:k] for c, k in zip(out_cnns, chunk_sizes)], dim=2)
-            uncond_cnns = torch.cat([c[:, :, k : 2 * k] for c, k in zip(out_cnns, chunk_sizes)], dim=2)
-            out_cnn = torch.cat((cond_cnns, uncond_cnns), dim=2)
-
-            cond_atts = torch.cat([a[:, :, 0:k] for a, k in zip(out_atts, chunk_sizes)], dim=2)
-            uncond_atts = torch.cat([a[:, :, k : 2 * k] for a, k in zip(out_atts, chunk_sizes)], dim=2)
-            out_att = torch.cat((cond_atts, uncond_atts), dim=2)
             return chunk_mel, out_cnn, out_att
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
         has_cnn_cache = cnn_cache is not None

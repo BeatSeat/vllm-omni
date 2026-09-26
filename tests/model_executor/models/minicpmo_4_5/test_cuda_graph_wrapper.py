@@ -872,19 +872,18 @@ def test_whole_euler_graph_with_padding_matches_eager(
 def test_whole_euler_cache_flushes_whole_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pool = torch.cuda.graph_pool_handle()
-    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
 
     torch.manual_seed(0)
     estimator = _WholeEulerDiT().eval().cuda()
     wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=2)
 
-    def _call(w: int) -> None:
+    def _call(w: int):
         x = torch.randn(1, 4, w, device="cuda")
         mu_cfg = torch.randn(2, 4, w, device="cuda")
         spk_cfg = torch.randn(2, 4, device="cuda")
         cond_cfg = torch.randn(2, 4, w, device="cuda")
-        wrapper.replay(
+        return wrapper.replay(
             x=x,
             mu_cfg=mu_cfg,
             speakers_cfg=spk_cfg,
@@ -900,6 +899,83 @@ def test_whole_euler_cache_flushes_whole_generation(
     # Same shape hits
     _call(10)
     assert wrapper._stats["hits"] == 1
+
+    # Second distinct shape fills cache to max_graphs=2
+    _call(12)
+    assert len(wrapper._cache) == 2
+    assert wrapper._stats["captures"] == 2
+    assert wrapper._stats["flushes"] == 0
+
+    # Third distinct shape exceeds max_graphs and triggers whole-generation flush
+    _call(14)
+    assert wrapper._stats["flushes"] == 1
+    assert len(wrapper._cache) == 1
+    assert wrapper._stats["captures"] == 3
+
+    # Replay evicted shape 10 and assert numerical match with eager
+    torch.manual_seed(42)
+    x10 = torch.randn(1, 4, 10, device="cuda")
+    mu10 = torch.randn(2, 4, 10, device="cuda")
+    spk10 = torch.randn(2, 4, device="cuda")
+    cond10 = torch.randn(2, 4, 10, device="cuda")
+    res10 = wrapper.replay(
+        x=x10.clone(),
+        mu_cfg=mu10.clone(),
+        speakers_cfg=spk10.clone(),
+        cond_cfg=cond10.clone(),
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert res10 is not None
+    eager_x10 = _eager_solve_euler(
+        estimator,
+        x10.clone(),
+        mu10.clone(),
+        spk10.clone(),
+        cond10.clone(),
+        wrapper.timeline,
+        mel_frames=10,
+        pad_frames=0,
+    )
+    torch.testing.assert_close(res10[0], eager_x10[0], rtol=1e-4, atol=1e-5)
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_arena_cleaned_when_first_capture_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=2)
+
+    # Force failure during capture
+    def mock_fail(*args, **kwargs):
+        raise RuntimeError("Simulated first capture failure")
+
+    monkeypatch.setattr(wrapper, "_run_euler_loop", mock_fail)
+
+    x = torch.randn(1, 4, 10, device="cuda")
+    mu_cfg = torch.randn(2, 4, 10, device="cuda")
+    spk_cfg = torch.randn(2, 4, device="cuda")
+    cond_cfg = torch.randn(2, 4, 10, device="cuda")
+
+    res = wrapper.replay(
+        x=x,
+        mu_cfg=mu_cfg,
+        speakers_cfg=spk_cfg,
+        cond_cfg=cond_cfg,
+        cnn_cache=None,
+        att_cache=None,
+    )
+    assert res is None
+    assert wrapper.enabled is False
+    assert len(wrapper._cache) == 0
+    # Arena must be cleared even when cache has zero entries
+    assert len(wrapper.arena._shared_cnn_in) == 0
+    assert len(wrapper.arena._x_buffers) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")

@@ -106,21 +106,38 @@ def _zero_padded_cnn_cache(
 ) -> None:
     """Clear the cache positions that come from padded frames, in place.
 
-    Vectorized across all DiT blocks in a single slice operation to eliminate
-    per-block Python loops and separate kernel launches.
+    Each block's CNN cache holds the tail of its convolution output
+    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
+    so when the padding sits at the chunk tail those positions are
+    padding-derived and would otherwise become the next chunk's left context.
+    Padding is at most ``pad_frames`` wide, so only the trailing positions that
+    can come from it are cleared; the valid part of the window is kept.
     """
-    if pad_frames <= 0:
-        return
-    if isinstance(cnn_cache, torch.Tensor):
-        width = int(cnn_cache.shape[-1])
-        if width <= 0:
-            return
-        cnn_cache[..., max(0, width - pad_frames) :] = 0.0
-        return
     blocks = getattr(estimator, "blocks", None)
-    if blocks is not None and len(blocks) == len(cnn_cache):
+    if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
+        width = int(cnn_cache.shape[-1])
+        if width > 0 and all(
+            hasattr(block, "conv")
+            and hasattr(block.conv, "block")
+            and len(block.conv.block) > 1
+            and hasattr(block.conv.block[1], "causal_padding")
+            and int(block.conv.block[1].causal_padding[0]) == width
+            for block in blocks
+        ):
+            # _estimator_buffers packs equal-width blocks into one tensor.
+            # Clear their shared tail with one write instead of one per block.
+            cnn_cache[..., max(0, width - pad_frames) :] = 0.0
+            return
+
+    if blocks is not None:
         for index, block in enumerate(blocks):
-            width = int(block.conv.block[1].causal_padding[0])
+            if index >= len(cnn_cache):
+                break
+            conv = getattr(block, "conv", None)
+            conv_block = getattr(conv, "block", None) if conv is not None else None
+            if conv_block is None or len(conv_block) <= 1 or not hasattr(conv_block[1], "causal_padding"):
+                continue
+            width = int(conv_block[1].causal_padding[0])
             if width <= 0:
                 continue
             zero_from = max(0, width - pad_frames)
@@ -561,9 +578,7 @@ class BatchedToken2Wav(nn.Module):
         attn_mask: torch.Tensor | None = None,
         valid_lengths: list[int] | None = None,
         valid_frames: int | None = None,
-        att_out_buffer: Any = None,
         time_embedding: torch.Tensor | None = None,
-        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
@@ -796,7 +811,6 @@ class BatchedToken2Wav(nn.Module):
             # still occupies part of the softmax denominator.
             x[:, :, mel_frames:] = 0.0
         timeline = self._get_timeline(mu.device, mu.dtype)
-        time = timeline[0].expand(batch_size)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
@@ -855,7 +869,7 @@ class BatchedToken2Wav(nn.Module):
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
-        dt = timeline[1] - timeline[0]
+        dt_floats = [float((timeline[s + 1] - timeline[s]).item()) for s in range(self.n_timesteps)]
         time_embeddings = [
             estimator.t_embedder(timeline[s].expand(2 * batch_size)).unsqueeze(1) for s in range(self.n_timesteps)
         ]
@@ -863,11 +877,12 @@ class BatchedToken2Wav(nn.Module):
             for step in range(self.n_timesteps):
                 old_cnn = cnn_cache[step] if cnn_cache is not None else None
                 old_att = att_cache[step] if att_cache is not None else None
+                step_time = timeline[step].expand(2 * batch_size)
                 estimate, step_cnn, step_att = self._estimator_step(
                     estimator,
                     x=torch.cat((x, x), dim=0),
                     mu=mu_cfg,
-                    time=torch.cat((time, time), dim=0),
+                    time=step_time,
                     speakers=speakers_cfg,
                     cond=cond_cfg,
                     cnn_cache=old_cnn,
@@ -879,12 +894,9 @@ class BatchedToken2Wav(nn.Module):
                 )
                 if pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
-                x = _fused_euler_step(x, estimate, float(dt), decoder.inference_cfg_rate, batch_size)
+                x = _fused_euler_step(x, estimate, dt_floats[step], decoder.inference_cfg_rate, batch_size)
                 if pad_frames:
                     _zero_padded_frames(x, mel_frames)
-                time = time + dt
-                if step + 1 < self.n_timesteps:
-                    dt = timeline[step + 2] - time[0]
                 next_cnn.append(step_cnn)
                 if valid_lengths is not None:
                     if ragged_att_cache is None:

@@ -285,16 +285,24 @@ class MiniCPMO45Code2Wav(nn.Module):
             enable_whole_euler = bool(enable_whole_euler_raw)
         max_graph_batch_raw = extra.get("max_graph_batch")
         max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
-        micro_batch_size_raw = extra.get("micro_batch_size")
-        micro_batch_size = int(micro_batch_size_raw) if micro_batch_size_raw is not None else None
+        micro_batch_size_raw = extra.get("micro_batch_size", os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE"))
+        if micro_batch_size_raw is not None:
+            micro_batch_size = int(micro_batch_size_raw)
+        else:
+            # The Whole-Euler arena reserves one attention cache per micro-batch
+            # row, so size it for the most requests this stage ever batches.
+            max_num_seqs = getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", None)
+            micro_batch_size = min(int(max_num_seqs), max_graph_batch or 16) if max_num_seqs else None
         self._cfm_graph_config = {
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
+            "capture_frames": extra.get("cfm_graph_capture_frames"),
             "enable_whole_euler": enable_whole_euler,
             "max_serial_batch": max_serial_batch,
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
+            "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:

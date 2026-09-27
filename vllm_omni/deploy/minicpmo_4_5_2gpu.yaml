@@ -32,14 +32,18 @@ connectors:
       enable_hift_graph: true
       enable_cfm_graph: true
       enable_whole_euler: true
-      # Hierarchical micro-batch CUDA graph scheduling:
-      # B in [1, 3] replays serial B=1; B in [4, 16] micro-batches into native B=4 chunks;
-      # B > 16 falls back to fused Batched Eager mode.
-      micro_batch_size: 4
+      # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
+      # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
+      # share one attention-cache arena of that many requests (~0.55 GiB each
+      # in fp32). Larger batches replay micro-batches; B > max_graph_batch runs
+      # eager.
       max_graph_batch: 16
       max_serial_batch: 4
       cfm_max_graphs: 32
-      cfm_graph_bucket_frames: 16
+      # The capture width defaults to the steady chunk's mel width
+      # (2 x codec_chunk_frames): steady chunks run unpadded and shorter ones
+      # share its graph under a mask, so no #7416 frame padding is needed.
+      cfm_graph_bucket_frames: 0
 
 stages:
   - stage_id: 0

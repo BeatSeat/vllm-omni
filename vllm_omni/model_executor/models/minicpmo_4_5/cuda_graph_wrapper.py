@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
+import torch.nn.functional as F
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -251,6 +254,151 @@ def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] 
     )
 
 
+def _align_up(n: int, bucket: int) -> int:
+    if n <= 0 or bucket <= 1:
+        return max(0, n)
+    return ((n + bucket - 1) // bucket) * bucket
+
+
+def _capture_query_width(mel_width: int, bucket: int) -> int:
+    """Snap the query axis onto the Whole-Euler capture grid.
+
+    ``_cfm_pad_frames`` already aligns onto ``bucket_frames=16``, which is why
+    12+4 and 10+6 share a graph (``test_whole_euler_same_bucket_different_padding_hits_cache``)
+    but 16/32/48/64 stay distinct (``test_varied_chunk_lengths_collapse_onto_few_widths``).
+    The capture bucket reuses that same pad-and-mask scheme from #7416 so those
+    decode widths collapse onto one CUDA graph; first-chunk widths above the
+    bucket (e.g. 304) align up separately so streaming replay stays on the
+    small decode graph.
+    """
+    if bucket <= 1:
+        return int(mel_width)
+    if mel_width <= bucket:
+        return int(bucket)
+    return _align_up(int(mel_width), int(bucket))
+
+
+def _pad_query_for_capture(
+    x: torch.Tensor,
+    mu_cfg: torch.Tensor,
+    cond_cfg: torch.Tensor,
+    query_cap: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad query tensors to ``query_cap`` the same way ``_decode_cfm`` pads to 16.
+
+    ``mu``/``cond`` replicate the last frame (closer continuation than silence);
+    ``x`` is zeroed on the pad so the Euler state does not integrate noise there.
+    """
+    extra = int(query_cap) - int(mu_cfg.shape[2])
+    if extra <= 0:
+        return x, mu_cfg, cond_cfg
+    return (
+        F.pad(x, (0, extra)),
+        F.pad(mu_cfg, (0, extra), mode="replicate"),
+        F.pad(cond_cfg, (0, extra), mode="replicate"),
+    )
+
+
+def _build_capture_mask(
+    *,
+    attn_mask: torch.Tensor | None,
+    batch_size: int,
+    query_cap: int,
+    offset: int,
+    mel_width: int,
+    mel_frames: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Always-on attention mask in the capture layout, so presence-of-mask is not a graph key.
+
+    The DiT puts the current chunk ahead of its cache (stepaudio2
+    ``Attention.forward_chunk``: ``torch.cat([k, k_cache], dim=2)``). The
+    caller's keys are therefore ``[current(mel_width) | cache(offset)]`` while
+    the captured graph sees ``[current(query_cap) | cache(offset)]``: the cache
+    block moves to ``query_cap`` and the capture padding in between is never
+    attended. A missing caller mask means "attend to the valid prefix".
+
+    Capture-padding query rows reuse the first row's keys. Their output is
+    dropped, but an all-False row makes SDPA emit NaN there, and a NaN value in
+    a masked key still poisons real rows through ``0 * NaN`` in ``P @ V``.
+    """
+    query_cap = int(query_cap)
+    offset = int(offset)
+    mel_width = int(mel_width)
+    mask = torch.zeros(
+        2 * int(batch_size),
+        query_cap,
+        query_cap + offset,
+        dtype=torch.bool,
+        device=device,
+    )
+    if attn_mask is not None:
+        mask[:, :mel_width, :mel_width] = attn_mask[:, :mel_width, :mel_width]
+        if offset > 0:
+            mask[:, :mel_width, query_cap:] = attn_mask[:, :mel_width, mel_width : mel_width + offset]
+    else:
+        mask[:, :mel_width, : int(mel_frames)] = True
+        if offset > 0:
+            mask[:, :mel_width, query_cap:] = True
+    if query_cap > mel_width:
+        mask[:, mel_width:] = mask[:, :1]
+    return mask
+
+
+def _att_keep_ranges(total: int, keep: tuple[int, int] | None) -> list[tuple[int, int]]:
+    """``(start, length)`` frame ranges of a new estimator cache that survive the streaming trim.
+
+    Mirrors stepaudio2 ``Token2wav.stream``: once the cache outgrows
+    ``prompt_len + 100`` frames it keeps the first ``prompt_len`` and the last
+    100. ``keep`` is ``(prompt_len, 100)``; ``None`` keeps everything.
+    """
+    total = int(total)
+    if keep is not None:
+        prefix, suffix = int(keep[0]), int(keep[1])
+        if total > prefix + suffix:
+            return [(0, prefix), (total - suffix, suffix)]
+    return [(0, total)]
+
+
+def _whole_euler_att_segments(
+    *,
+    mel_width: int,
+    query_cap: int,
+    offset: int,
+    keep: tuple[int, int] | None,
+) -> list[tuple[int, int]]:
+    """Frame segments of a Whole-Euler cache output, in caller layout and trimmed.
+
+    The graph writes ``[current(query_cap) | cache(offset)]`` (current chunk
+    first, see ``_build_capture_mask``); callers expect
+    ``[current(mel_width) | cache(offset)]``. The segments skip the capture
+    padding in between, then apply ``keep`` (``_att_keep_ranges``).
+    """
+    segments: list[tuple[int, int]] = []
+    for start, length in _att_keep_ranges(mel_width + offset, keep):
+        end = start + length
+        if start < mel_width:
+            segments.append((start, min(end, mel_width) - start))
+        if end > mel_width:
+            low = max(start, mel_width)
+            segments.append((query_cap + low - mel_width, end - low))
+    merged: list[tuple[int, int]] = []
+    for start, length in segments:
+        if merged and sum(merged[-1]) == start:
+            merged[-1] = (merged[-1][0], merged[-1][1] + length)
+        elif length > 0:
+            merged.append((start, length))
+    return merged
+
+
+def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tuple[int, int]]) -> None:
+    """Write ``src[..., start:start + length, :]`` segments back to back into ``dst``'s frame axis."""
+    position = 0
+    for start, length in segments:
+        dst[..., position : position + length, :].copy_(src[..., start : start + length, :])
+        position += length
+
+
 def _tensors_from_key(key: tuple) -> tuple[torch.Tensor, ...]:
     """Rebuild zero tensors from a cache key (shape, dtype, device tuples).
 
@@ -285,14 +433,11 @@ class CFMGraphWrapper:
     streaming cache corruption.
     """
 
-    max_serial_batch: int = 4
-
     def __init__(
         self,
         graph_fn,
         *,
         max_graphs: int = 32,
-        max_serial_batch: int | None = None,
     ) -> None:
         self.graph_fn = graph_fn
         self.max_graphs = int(max_graphs)
@@ -311,10 +456,6 @@ class CFMGraphWrapper:
             "flushes": 0,
             "eager": 0,
         }
-        if max_serial_batch is None:
-            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
-        else:
-            self.max_serial_batch = int(max_serial_batch)
 
     def stats_snapshot(self) -> dict[str, int]:
         """Bounded cumulative telemetry for the graph cache."""
@@ -468,12 +609,20 @@ def _zero_padded_cnn_cache(
 
 
 class WholeEulerExecutionArena:
-    """Decoupled memory arena managing static staging buffers for Whole-Euler CFM.
+    """Static staging buffers for Whole-Euler graphs, shared across graph entries.
 
-    Shared static buffers (time embeddings, cnn input/output cache, speakers) are
-    allocated once per CFM execution lane rather than duplicated across every CUDA Graph
-    cache entry. Variable-shape staging buffers (x, mu, cond, att_cache) are reused
-    across graph entries sharing matching dimensions.
+    Time embeddings, CNN caches and speakers are allocated once per graph batch
+    size. The attention caches dominate the arena (timesteps x depth x CFG x
+    heads x frames, ~1.25 MiB per frame per request in fp32 on the shipped
+    DiT), so there is exactly one attention cache storage: every graph, of
+    every batch size and offset, takes a ``[:2B, ..., :frames]`` prefix view
+    of it, and a graph's input and output caches are the same view. Graphs
+    replay one at a time on one stream and refill their inputs first, so the
+    sharing across graphs is safe; within a graph each DiT block concatenates
+    the cache it reads (``torch.cat([k, k_cache])``) before writing the new
+    one back, so reading and writing one view is too. Separate per-offset,
+    per-batch or input/output storages each held another full copy.
+    Small shape-keyed buffers (x, mu, cond, mask) stay per query width.
     """
 
     def __init__(
@@ -485,6 +634,7 @@ class WholeEulerExecutionArena:
         dtype: torch.dtype,
         att_cache_dtype: torch.dtype = torch.float32,
         time_steps: list[torch.Tensor] | None = None,
+        capacity_align: int = 16,
     ) -> None:
         self.estimator = estimator
         self.n_timesteps = int(n_timesteps)
@@ -492,6 +642,7 @@ class WholeEulerExecutionArena:
         self.dtype = dtype
         self.att_cache_dtype = att_cache_dtype
         self.time_steps = list(time_steps) if time_steps is not None else []
+        self.capacity_align = max(1, int(capacity_align))
 
         blocks = estimator.blocks
         self.depth = len(blocks)
@@ -511,9 +662,10 @@ class WholeEulerExecutionArena:
         self._x_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
         self._mu_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
         self._cond_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
-        self._att_cache_in: dict[tuple[int, int], torch.Tensor] = {}
-        self._att_cache_out: dict[tuple[int, int], torch.Tensor] = {}
         self._mask_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._lengths_buffers: dict[int, torch.Tensor] = {}
+        # The one attention cache storage; every graph takes a prefix view.
+        self._att: torch.Tensor | None = None
 
     def get_time_embeddings(self, batch_size: int) -> torch.Tensor:
         t_emb = self._shared_time_embeddings.get(batch_size)
@@ -590,39 +742,31 @@ class WholeEulerExecutionArena:
             self._cond_buffers[key] = buf
         return buf
 
-    def get_att_cache_in(self, batch_size: int, offset: int) -> torch.Tensor:
-        key = (batch_size, offset)
-        buf = self._att_cache_in.get(key)
-        if buf is None:
-            buf = torch.zeros(
-                self.n_timesteps,
-                self.depth,
-                2 * batch_size,
-                self.heads,
-                offset,
-                self.att_width,
-                device=self.device,
-                dtype=self.att_cache_dtype,
-            )
-            self._att_cache_in[key] = buf
-        return buf
+    def att_cache_view(self, batch_size: int, frames: int, *, capacity: int = 0, rows: int = 0) -> torch.Tensor:
+        """``(n_t, depth, 2B, heads, frames, width)`` prefix view of the shared cache storage.
 
-    def get_att_cache_out(self, batch_size: int, total_len: int) -> torch.Tensor:
-        key = (batch_size, total_len)
-        buf = self._att_cache_out.get(key)
-        if buf is None:
-            buf = torch.empty(
+        ``capacity`` frames and ``rows`` requests are reserved up front. A
+        larger request replaces the storage; graphs captured on the old one
+        keep their views, and with them the old storage, until the next
+        generation flush -- correct, only not shared -- so callers pass the
+        steady cache length and the largest graph batch to make that rare.
+        """
+        storage = self._att
+        if storage is None or int(storage.shape[2]) < 2 * batch_size or int(storage.shape[4]) < frames:
+            old_rows = 0 if storage is None else int(storage.shape[2]) // 2
+            old_frames = 0 if storage is None else int(storage.shape[4])
+            storage = torch.zeros(
                 self.n_timesteps,
                 self.depth,
-                2 * batch_size,
+                2 * max(int(batch_size), int(rows), old_rows),
                 self.heads,
-                total_len,
+                _align_up(max(int(frames), int(capacity), old_frames, 1), self.capacity_align),
                 self.att_width,
                 device=self.device,
                 dtype=self.att_cache_dtype,
             )
-            self._att_cache_out[key] = buf
-        return buf
+            self._att = storage
+        return storage[:, :, : 2 * batch_size, :, :frames, :]
 
     def get_mask_staging(self, batch_size: int, mel_width: int, total_len: int) -> torch.Tensor:
         key = (batch_size, mel_width, total_len)
@@ -638,6 +782,14 @@ class WholeEulerExecutionArena:
             self._mask_buffers[key] = buf
         return buf
 
+    def get_lengths_staging(self, batch_size: int) -> torch.Tensor:
+        """Per-CFG-row valid query lengths read by a ragged graph body."""
+        buf = self._lengths_buffers.get(batch_size)
+        if buf is None:
+            buf = torch.zeros(2 * batch_size, dtype=torch.long, device=self.device)
+            self._lengths_buffers[batch_size] = buf
+        return buf
+
     def clear(self) -> None:
         self._shared_time_embeddings.clear()
         self._shared_cnn_in.clear()
@@ -646,9 +798,23 @@ class WholeEulerExecutionArena:
         self._x_buffers.clear()
         self._mu_buffers.clear()
         self._cond_buffers.clear()
-        self._att_cache_in.clear()
-        self._att_cache_out.clear()
         self._mask_buffers.clear()
+        self._lengths_buffers.clear()
+        self._att = None
+
+
+class _WholeEulerStatics(NamedTuple):
+    """A Whole-Euler graph's static inputs (``lengths`` only with a ragged body)."""
+
+    x: torch.Tensor
+    mu_cfg: torch.Tensor
+    speakers_cfg: torch.Tensor
+    cond_cfg: torch.Tensor
+    cnn_cache: torch.Tensor
+    att_cache: torch.Tensor
+    attn_mask: torch.Tensor
+    time_embeddings: torch.Tensor
+    lengths: torch.Tensor | None
 
 
 class WholeEulerCFMGraphWrapper:
@@ -661,6 +827,14 @@ class WholeEulerCFMGraphWrapper:
     Replaces 10 separate step-level graph replays and 30 Python clones per chunk
     with a single graph replay, reducing CPU launch overhead and eliminating host-device
     synchronization bubbles during high concurrency.
+
+    A graph must hold all 10 timesteps' attention caches in static buffers,
+    ten times what one step-level graph holds, so memory is the constraint:
+    graphs exist for the powers of two up to ``micro_batch_size``, all of them
+    share the one attention cache storage of ``WholeEulerExecutionArena``
+    (sized for ``micro_batch_size`` requests), and larger batches run as a
+    sequence of micro-batch replays that copy each request's cache in and out
+    of that storage directly.
     """
 
     max_serial_batch: int = 4
@@ -676,12 +850,27 @@ class WholeEulerCFMGraphWrapper:
         max_serial_batch: int | None = None,
         max_graph_batch: int | None = None,
         micro_batch_size: int = 4,
+        query_bucket_frames: int | None = None,
+        pad_max_rows: int | None = None,
+        ragged_body: Callable[..., torch.Tensor] | None = None,
     ) -> None:
+        """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
+        replaces ``estimator.blocks_forward_chunk`` in the captured solve when
+        given: it takes each row's valid query length as a ``(2B,)`` tensor and
+        writes that row's exact CNN cache (``_blocks_forward_chunk_ragged``).
+        It lets one graph solve rows of different lengths, and lets a padded
+        query axis keep the CNN cache the unpadded solve would produce instead
+        of zeroing it.
+        """
         self.estimator = estimator
+        self.ragged_body = ragged_body
         self.n_timesteps = int(n_timesteps)
         self.inference_cfg_rate = float(inference_cfg_rate)
         self.att_cache_dtype = att_cache_dtype
         self.max_graphs = int(max_graphs)
+        if query_bucket_frames is None:
+            query_bucket_frames = int(os.getenv("VLLM_OMNI_WHOLE_EULER_QUERY_BUCKET", "0"))
+        self.query_bucket_frames = int(query_bucket_frames)
         if max_serial_batch is None:
             self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
         else:
@@ -697,6 +886,11 @@ class WholeEulerCFMGraphWrapper:
                 self.max_graph_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_BATCH", "16"))
         else:
             self.max_graph_batch = int(max_graph_batch)
+        if pad_max_rows is None:
+            pad_max_rows = int(os.getenv("VLLM_OMNI_WHOLE_EULER_PAD_MAX_ROWS", str(self.micro_batch_size // 4)))
+        self.pad_max_rows = max(0, int(pad_max_rows))
+        # Largest steady cache length a caller announced; sizes the arena storage.
+        self._att_capacity = 0
         parameter = next(estimator.parameters(), None)
         if parameter is not None:
             self.device = parameter.device
@@ -762,109 +956,187 @@ class WholeEulerCFMGraphWrapper:
 
     def _run_euler_loop(
         self,
-        static_x: torch.Tensor,
-        static_mu_cfg: torch.Tensor,
-        static_speakers_cfg: torch.Tensor,
-        static_cond_cfg: torch.Tensor,
-        static_cnn_cache: torch.Tensor,
-        static_att_cache: torch.Tensor,
-        static_attn_mask: torch.Tensor | None,
+        statics: _WholeEulerStatics,
         out_cnn_cache: torch.Tensor,
         out_att_cache: torch.Tensor,
-        static_time_embeddings: torch.Tensor,
         *,
         batch_size: int,
-        has_cnn_cache: bool,
-        has_att_cache: bool,
     ) -> torch.Tensor:
-        cur_x = static_x
-        depth = len(self.estimator.blocks)
-        width = int(static_mu_cfg.shape[2])
-        speaker_features = static_speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
+        cur_x = statics.x
+        width = int(statics.mu_cfg.shape[2])
+        speaker_features = statics.speakers_cfg.unsqueeze(-1).expand(-1, -1, width)
 
         for step in range(self.n_timesteps):
             dt = self.dt_steps[step]
-            time_embedding = static_time_embeddings[step]
             x_cfg = torch.cat((cur_x, cur_x), dim=0)
-            estimator_input = torch.cat((x_cfg, static_mu_cfg, speaker_features, static_cond_cfg), dim=1)
-
-            step_cnn_out = out_cnn_cache[step]
-            step_att_out = out_att_cache[step]
-            old_cnn = static_cnn_cache[step] if has_cnn_cache else [None] * depth
-            old_att = static_att_cache[step] if has_att_cache else [None] * depth
-
-            estimate = self.estimator.blocks_forward_chunk(
+            estimator_input = torch.cat((x_cfg, statics.mu_cfg, speaker_features, statics.cond_cfg), dim=1)
+            args = (
                 estimator_input,
-                time_embedding,
-                static_attn_mask,
-                old_cnn,
-                old_att,
-                step_cnn_out,
-                step_att_out,
+                statics.time_embeddings[step],
+                statics.attn_mask,
+                statics.cnn_cache[step],
+                statics.att_cache[step],
+                out_cnn_cache[step],
+                out_att_cache[step],
             )
+            if statics.lengths is not None:
+                assert self.ragged_body is not None
+                estimate = self.ragged_body(self.estimator, *args, statics.lengths)
+            else:
+                estimate = self.estimator.blocks_forward_chunk(*args)
 
             cur_x = _fused_euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
         return cur_x
 
-    def _capture(
-        self,
-        key: tuple,
+    def _graph_batches(self) -> list[int]:
+        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it."""
+        sizes = []
+        size = 1
+        while size < self.micro_batch_size:
+            sizes.append(size)
+            size *= 2
+        sizes.append(self.micro_batch_size)
+        return sizes
+
+    def _plan_groups(self, batch_size: int) -> list[tuple[int, int]] | None:
+        """``(graph_batch, rows)`` replays that cover ``batch_size`` requests.
+
+        Larger batches run whole micro-batches. The remainder takes the smallest
+        native size that holds it if that pads at most ``pad_max_rows`` rows
+        (the padded rows are ignored), and otherwise the largest native size
+        below it, repeating on what is left. On a saturated device a small
+        graph's replay costs well over its share of a larger one, so a padded
+        row is cheaper than a further replay. Returns ``None`` when the plan
+        needs more replays than allowed.
+        """
+        micro = self.micro_batch_size
+        sizes = self._graph_batches()
+        groups: list[tuple[int, int]] = []
+        remainder = batch_size
+        while remainder >= micro:
+            groups.append((micro, micro))
+            remainder -= micro
+        while remainder > 0:
+            up = next(size for size in sizes if size >= remainder)
+            if up - remainder <= self.pad_max_rows:
+                groups.append((up, remainder))
+                break
+            down = max(size for size in sizes if size <= remainder)
+            groups.append((down, down))
+            remainder -= down
+        max_allowed = max(
+            self.max_serial_batch,
+            (self.max_graph_batch + micro - 1) // micro + (micro - 1),
+        )
+        if len(groups) > max_allowed:
+            return None
+        return groups
+
+    @staticmethod
+    def _fill_static_inputs(
+        statics: _WholeEulerStatics,
         *,
+        graph_batch: int,
+        start: int,
+        stop: int,
         x: torch.Tensor,
         mu_cfg: torch.Tensor,
         speakers_cfg: torch.Tensor,
         cond_cfg: torch.Tensor,
+        attn_mask: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
-        attn_mask: torch.Tensor | None,
-        batch_size: int,
+        att_rows: list[torch.Tensor] | None,
         offset: int,
-        has_cnn_cache: bool,
-        has_att_cache: bool,
-        has_mask: bool,
-    ) -> tuple | None:
-        try:
-            channels = int(x.shape[1])
-            mel_width = int(mu_cfg.shape[2])
-            spk_dim = int(speakers_cfg.shape[1])
+        lengths: torch.Tensor | int | None = None,
+    ) -> None:
+        """Copy requests ``start:stop`` into a graph's static inputs.
 
-            static_x = self.arena.get_x_staging(batch_size, channels, mel_width)
-            static_mu_cfg = self.arena.get_mu_staging(batch_size, channels, mel_width)
-            static_speakers_cfg = self.arena.get_speakers_staging(batch_size, spk_dim)
-            static_cond_cfg = self.arena.get_cond_staging(batch_size, channels, mel_width)
-
-            static_cnn_cache = self.arena.get_cnn_cache_in(batch_size)
-            static_att_cache = self.arena.get_att_cache_in(batch_size, offset if (has_att_cache and offset > 0) else 0)
-            static_attn_mask = (
-                self.arena.get_mask_staging(batch_size, mel_width, offset + mel_width)
-                if (has_mask and attn_mask is not None)
-                else None
+        CFG inputs are stacked ``[cond x B | uncond x B]``; ``unflatten`` into
+        ``(2, B)`` moves both halves of a request range with one copy. Rows past
+        ``stop - start`` belong to a padded replay and keep whatever finite
+        values they held: DiT rows never mix, so their output is simply dropped.
+        ``lengths`` is the ragged body's per-row lengths, or one for every row.
+        """
+        batch_size = int(x.shape[0])
+        rows = stop - start
+        statics.x[:rows].copy_(x[start:stop])
+        pairs = [
+            (statics.mu_cfg, mu_cfg),
+            (statics.speakers_cfg, speakers_cfg),
+            (statics.cond_cfg, cond_cfg),
+            (statics.attn_mask, attn_mask),
+        ]
+        if statics.lengths is not None:
+            assert lengths is not None
+            if isinstance(lengths, int):
+                statics.lengths.fill_(lengths)
+            else:
+                pairs.append((statics.lengths, lengths))
+        for static, value in pairs:
+            static.unflatten(0, (2, graph_batch))[:, :rows].copy_(value.unflatten(0, (2, batch_size))[:, start:stop])
+        if cnn_cache is None:
+            statics.cnn_cache.zero_()
+        else:
+            statics.cnn_cache.unflatten(2, (2, graph_batch))[:, :, :, :rows].copy_(
+                cnn_cache.unflatten(2, (2, batch_size))[:, :, :, start:stop]
             )
+        if offset <= 0:
+            return
+        static_att_rows = statics.att_cache.unflatten(2, (2, graph_batch))
+        if att_rows is None:
+            assert att_cache is not None
+            static_att_rows[:, :, :, :rows].copy_(att_cache.unflatten(2, (2, batch_size))[:, :, :, start:stop])
+        else:
+            for row in range(rows):
+                static_att_rows[:, :, :, row].copy_(att_rows[start + row])
 
-            out_cnn_cache = self.arena.get_cnn_cache_out(batch_size)
-            out_att_cache = self.arena.get_att_cache_out(batch_size, offset + mel_width)
-            static_time_embeddings = self.arena.get_time_embeddings(batch_size)
-
-            static_x.copy_(x)
-            static_mu_cfg.copy_(mu_cfg)
-            static_speakers_cfg.copy_(speakers_cfg)
-            static_cond_cfg.copy_(cond_cfg)
-            if has_cnn_cache and cnn_cache is not None:
-                static_cnn_cache.copy_(cnn_cache)
-            else:
-                static_cnn_cache.zero_()
-            if has_att_cache and att_cache is not None and offset > 0:
-                static_att_cache.copy_(att_cache)
-            else:
-                static_att_cache.zero_()
-            if static_attn_mask is not None and attn_mask is not None:
-                static_attn_mask.copy_(attn_mask)
+    def _capture(
+        self,
+        key: tuple,
+        *,
+        graph_batch: int,
+        channels: int,
+        query_cap: int,
+        spk_dim: int,
+        offset: int,
+        fill,
+    ) -> tuple | None:
+        arena = self.arena
+        # Reserve the steady offset plus one query bucket, and the largest
+        # graph batch, up front, so every offset on the way there
+        # (304 -> 368 -> 400) and every batch size share one storage. The wide
+        # offset-0 prompt solve fits within that; adding its width on top of
+        # the steady offset would hold ~300 frames per row that nothing uses.
+        capacity = max(offset + query_cap, max(offset, self._att_capacity) + self.query_bucket_frames)
+        rows = self.micro_batch_size
+        try:
+            statics = _WholeEulerStatics(
+                x=arena.get_x_staging(graph_batch, channels, query_cap),
+                mu_cfg=arena.get_mu_staging(graph_batch, channels, query_cap),
+                speakers_cfg=arena.get_speakers_staging(graph_batch, spk_dim),
+                cond_cfg=arena.get_cond_staging(graph_batch, channels, query_cap),
+                cnn_cache=arena.get_cnn_cache_in(graph_batch),
+                att_cache=arena.att_cache_view(graph_batch, offset, capacity=capacity, rows=rows),
+                attn_mask=arena.get_mask_staging(graph_batch, query_cap, offset + query_cap),
+                time_embeddings=arena.get_time_embeddings(graph_batch),
+                lengths=arena.get_lengths_staging(graph_batch) if self.ragged_body is not None else None,
+            )
+            out_cnn_cache = arena.get_cnn_cache_out(graph_batch)
+            # The output view aliases the input view; see WholeEulerExecutionArena.
+            out_att_cache = arena.att_cache_view(graph_batch, offset + query_cap, capacity=capacity, rows=rows)
+            fill(statics)
         except Exception:
             logger.warning("Failed to allocate static buffers for Whole-Euler graph key: %s", key, exc_info=True)
             self._unsupported.add(key)
             return None
 
+        static_x = statics.x
+        # The fused Euler step integrates static_x in place, so every warmup
+        # and the capture itself start from the same initial state.
+        initial_x = static_x.clone()
+        loop_args = (statics, out_cnn_cache, out_att_cache)
         memory_before = _memory_snapshot(self.device)
         try:
             current_stream = torch.cuda.current_stream(self.device)
@@ -872,66 +1144,63 @@ class WholeEulerCFMGraphWrapper:
             warmup_stream.wait_stream(current_stream)
             with torch.cuda.stream(warmup_stream), torch.no_grad():
                 for _ in range(3):
-                    static_x.copy_(x)
-                    _ = self._run_euler_loop(
-                        static_x,
-                        static_mu_cfg,
-                        static_speakers_cfg,
-                        static_cond_cfg,
-                        static_cnn_cache,
-                        static_att_cache,
-                        static_attn_mask,
-                        out_cnn_cache,
-                        out_att_cache,
-                        static_time_embeddings,
-                        batch_size=batch_size,
-                        has_cnn_cache=has_cnn_cache,
-                        has_att_cache=has_att_cache,
-                    )
+                    static_x.copy_(initial_x)
+                    self._run_euler_loop(*loop_args, batch_size=graph_batch)
             current_stream.wait_stream(warmup_stream)
-
-            static_x.copy_(x)
+            static_x.copy_(initial_x)
             graph = CUDAGraph()
             with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_final_x = self._run_euler_loop(
-                    static_x,
-                    static_mu_cfg,
-                    static_speakers_cfg,
-                    static_cond_cfg,
-                    static_cnn_cache,
-                    static_att_cache,
-                    static_attn_mask,
-                    out_cnn_cache,
-                    out_att_cache,
-                    static_time_embeddings,
-                    batch_size=batch_size,
-                    has_cnn_cache=has_cnn_cache,
-                    has_att_cache=has_att_cache,
-                )
+                static_final_x = self._run_euler_loop(*loop_args, batch_size=graph_batch)
         except Exception:
             self._disable("capture failed", key)
             return None
 
-        static_inputs = (
-            static_x,
-            static_mu_cfg,
-            static_speakers_cfg,
-            static_cond_cfg,
-            static_cnn_cache,
-            static_att_cache,
-            static_attn_mask,
-            static_time_embeddings,
-        )
         self._stats["captures"] += 1
         logger.info(
-            "Captured Whole-Euler CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)%s",
+            "Captured Whole-Euler CFM CUDA Graph for shape %s (cache=%d/%d, att storage rows/frames=%d/%d, stats=%s)%s",
             key,
             len(self._cache) + 1,
             self.max_graphs,
+            int(arena._att.shape[2]) // 2,
+            int(arena._att.shape[4]),
             self.stats_snapshot(),
             _format_memory_delta(memory_before, _memory_snapshot(self.device)),
         )
-        return (static_inputs, static_final_x, out_cnn_cache, out_att_cache, graph)
+        return (statics, static_final_x, out_cnn_cache, out_att_cache, graph)
+
+    def _entry(
+        self,
+        *,
+        graph_batch: int,
+        query_cap: int,
+        offset: int,
+        x: torch.Tensor,
+        spk_dim: int,
+        fill,
+    ) -> tuple | None:
+        # Same (batch, capture-query, offset) triple as #7416's (chunk_width, cache_width).
+        # Presence of cnn/att/mask is data copied into static buffers, not a key.
+        key = ("whole_euler", graph_batch, query_cap, offset, str(x.dtype), str(x.device))
+        if key in self._unsupported:
+            return None
+        entry = self._cache.get(key)
+        if entry is not None:
+            self._stats["hits"] += 1
+            return entry
+        if len(self._cache) >= self.max_graphs:
+            self._flush()
+        entry = self._capture(
+            key,
+            graph_batch=graph_batch,
+            channels=int(x.shape[1]),
+            query_cap=query_cap,
+            spk_dim=spk_dim,
+            offset=offset,
+            fill=fill,
+        )
+        if entry is not None:
+            self._cache[key] = entry
+        return entry
 
     def replay(
         self,
@@ -941,206 +1210,174 @@ class WholeEulerCFMGraphWrapper:
         speakers_cfg: torch.Tensor,
         cond_cfg: torch.Tensor,
         cnn_cache: torch.Tensor | None,
-        att_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | list[torch.Tensor] | None,
         attn_mask: torch.Tensor | None = None,
         mel_frames: int | None = None,
         pad_frames: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        valid_lengths: list[int] | None = None,
+        att_keep: tuple[int, int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor]] | None:
+        """Solve the chunk through captured graphs; ``None`` sends it to the step/eager path.
+
+        ``att_cache`` is the stacked ``(n_t, depth, 2B, heads, L, 2*head_dim)``
+        estimator cache, or one ``(n_t, depth, 2, heads, L, 2*head_dim)``
+        tensor per request; the new cache comes back in the same form, trimmed
+        by ``att_keep`` (``_att_keep_ranges``) on the way out. Per request,
+        caches move straight into and out of the arena and no stacked copy of
+        the batch's cache is ever built. ``sum(att_keep)`` is also the steady
+        cache length the arena reserves.
+
+        ``valid_lengths`` (one per request; needs ``ragged_body``) solves rows
+        of different lengths in one graph, as ``_decode_cfm`` does eagerly:
+        ``mu_cfg`` is padded to the longest row and ``attn_mask`` masks each
+        row's padding. The new cache then always comes back per request, each
+        row keeping only its own current frames.
+        """
         self._stats["calls"] += 1
 
         if not self.enabled or torch.cuda.is_current_stream_capturing() or x.device.type != "cuda":
             return None
 
         batch_size = int(x.shape[0])
-        mel_width = int(mu_cfg.shape[2])
-        if mel_frames is None:
-            mel_frames = mel_width - pad_frames
-
         if batch_size > self.max_graph_batch:
             return None
+        groups = self._plan_groups(batch_size)
+        if groups is None:
+            return None
 
-        native_batch_sizes = (1, self.micro_batch_size)
-        if batch_size not in native_batch_sizes:
-            chunk_sizes: list[int] = []
-            rem = batch_size
-            while rem >= self.micro_batch_size:
-                chunk_sizes.append(self.micro_batch_size)
-                rem -= self.micro_batch_size
-            while rem > 0:
-                chunk_sizes.append(1)
-                rem -= 1
-
-            max_allowed_chunks = max(
-                self.max_serial_batch,
-                (self.max_graph_batch + self.micro_batch_size - 1) // self.micro_batch_size
-                + (self.micro_batch_size - 1),
-            )
-            if len(chunk_sizes) > max_allowed_chunks:
+        att_rows = None if att_cache is None or isinstance(att_cache, torch.Tensor) else list(att_cache)
+        if att_rows is not None:
+            if len(att_rows) != batch_size or len({int(row.shape[4]) for row in att_rows}) != 1:
                 return None
+            offset = int(att_rows[0].shape[4])
+        else:
+            offset = int(att_cache.shape[4]) if att_cache is not None else 0
+        mel_width = int(mu_cfg.shape[2])
+        att_rows_out = att_rows is not None or valid_lengths is not None
+        if valid_lengths is not None:
+            if self.ragged_body is None or len(valid_lengths) != batch_size:
+                return None
+            pad_frames = 0
+            mel_frames = mel_width
+        elif mel_frames is None:
+            mel_frames = mel_width - pad_frames
+        if att_keep is not None:
+            self._att_capacity = max(self._att_capacity, sum(att_keep))
 
-            channels = int(x.shape[1])
-            chunk_mel = torch.empty((batch_size, channels, mel_frames), device=x.device, dtype=x.dtype)
-            out_cnn = torch.empty(
-                (
-                    self.n_timesteps,
-                    self.arena.depth,
-                    2 * batch_size,
-                    self.arena.cnn_channels,
-                    self.arena.cnn_width,
-                ),
-                device=x.device,
-                dtype=self.dtype,
-            )
-            total_len = (int(att_cache.shape[4]) if att_cache is not None else 0) + mel_width
+        query_cap = _capture_query_width(mel_width, self.query_bucket_frames)
+        x_cap, mu_cap, cond_cap = _pad_query_for_capture(x, mu_cfg, cond_cfg, query_cap)
+        mask_cap = _build_capture_mask(
+            attn_mask=attn_mask,
+            batch_size=batch_size,
+            query_cap=query_cap,
+            offset=offset,
+            mel_width=mel_width,
+            mel_frames=mel_frames,
+            device=x.device,
+        )
+        row_lengths = [mel_width] * batch_size if valid_lengths is None else [int(n) for n in valid_lengths]
+        lengths: torch.Tensor | int | None = None
+        if self.ragged_body is not None:
+            lengths = mel_width
+            if valid_lengths is not None:
+                lengths = torch.tensor((*row_lengths, *row_lengths), dtype=torch.long, device=x.device)
+                # Queries past a row's length take its first query's mask, as
+                # capture padding does, so no attention row is left empty.
+                invalid = torch.arange(query_cap, device=x.device).unsqueeze(0) >= lengths.unsqueeze(1)
+                mask_cap = torch.where(invalid.unsqueeze(2), mask_cap[:, :1, :], mask_cap)
+        segments_by_length = {
+            length: _whole_euler_att_segments(mel_width=length, query_cap=query_cap, offset=offset, keep=att_keep)
+            for length in set(row_lengths)
+        }
+        segments = segments_by_length[row_lengths[0]]
+        keep_len = sum(length for _, length in segments)
+
+        arena = self.arena
+        chunk_mel = x.new_empty((batch_size, int(x.shape[1]), mel_frames))
+        out_cnn = torch.empty(
+            (self.n_timesteps, arena.depth, 2 * batch_size, arena.cnn_channels, arena.cnn_width),
+            device=x.device,
+            dtype=self.dtype,
+        )
+        out_cnn_rows = out_cnn.unflatten(2, (2, batch_size))
+        out_att: torch.Tensor | None = None
+        out_att_rows = None
+        request_att: list[torch.Tensor] = []
+        if not att_rows_out:
             out_att = torch.empty(
-                (
-                    self.n_timesteps,
-                    self.arena.depth,
-                    2 * batch_size,
-                    self.arena.heads,
-                    total_len,
-                    self.arena.att_width,
-                ),
+                (self.n_timesteps, arena.depth, 2 * batch_size, arena.heads, keep_len, arena.att_width),
                 device=x.device,
                 dtype=self.att_cache_dtype,
             )
+            out_att_rows = out_att.unflatten(2, (2, batch_size))
+        # A ragged body writes each row's exact CNN cache; only #7416 padding
+        # (``pad_frames``) is then cleared. Otherwise every padded position is.
+        cnn_pad = pad_frames if self.ragged_body is not None else query_cap - mel_frames
 
-            start = 0
-            for k in chunk_sizes:
-                end = start + k
-                sub_x = x[start:end]
-                sub_mu = torch.cat((mu_cfg[start:end], mu_cfg[batch_size + start : batch_size + end]), dim=0)
-                sub_spk = torch.cat(
-                    (speakers_cfg[start:end], speakers_cfg[batch_size + start : batch_size + end]), dim=0
-                )
-                sub_cond = torch.cat((cond_cfg[start:end], cond_cfg[batch_size + start : batch_size + end]), dim=0)
-                sub_cnn = (
-                    torch.cat(
-                        (cnn_cache[:, :, start:end], cnn_cache[:, :, batch_size + start : batch_size + end]),
-                        dim=2,
-                    )
-                    if cnn_cache is not None
-                    else None
-                )
-                sub_att = (
-                    torch.cat(
-                        (att_cache[:, :, start:end], att_cache[:, :, batch_size + start : batch_size + end]),
-                        dim=2,
-                    )
-                    if att_cache is not None
-                    else None
-                )
-                sub_mask = (
-                    torch.cat(
-                        (attn_mask[start:end], attn_mask[batch_size + start : batch_size + end]),
-                        dim=0,
-                    )
-                    if attn_mask is not None
-                    else None
-                )
-                sub_res = self.replay(
-                    x=sub_x,
-                    mu_cfg=sub_mu,
-                    speakers_cfg=sub_spk,
-                    cond_cfg=sub_cond,
-                    cnn_cache=sub_cnn,
-                    att_cache=sub_att,
-                    attn_mask=sub_mask,
-                    mel_frames=mel_frames,
-                    pad_frames=pad_frames,
-                )
-                if sub_res is None:
-                    return None
-                chunk_mel[start:end].copy_(sub_res[0])
-                if sub_res[1] is not None:
-                    out_cnn[:, :, start:end].copy_(sub_res[1][:, :, :k])
-                    out_cnn[:, :, batch_size + start : batch_size + end].copy_(sub_res[1][:, :, k : 2 * k])
-                if sub_res[2] is not None:
-                    out_att[:, :, start:end].copy_(sub_res[2][:, :, :k])
-                    out_att[:, :, batch_size + start : batch_size + end].copy_(sub_res[2][:, :, k : 2 * k])
-                start = end
+        start = 0
+        for graph_batch, rows in groups:
+            stop = start + rows
 
-            return chunk_mel, out_cnn, out_att
-        offset = int(att_cache.shape[4]) if att_cache is not None else 0
-        has_cnn_cache = cnn_cache is not None
-        has_att_cache = att_cache is not None
-        has_mask = attn_mask is not None
+            def fill(statics, *, _graph_batch=graph_batch, _start=start, _stop=stop):
+                self._fill_static_inputs(
+                    statics,
+                    graph_batch=_graph_batch,
+                    start=_start,
+                    stop=_stop,
+                    x=x_cap,
+                    mu_cfg=mu_cap,
+                    speakers_cfg=speakers_cfg,
+                    cond_cfg=cond_cap,
+                    attn_mask=mask_cap,
+                    cnn_cache=cnn_cache,
+                    att_cache=att_cache if att_rows is None else None,
+                    att_rows=att_rows,
+                    offset=offset,
+                    lengths=lengths,
+                )
 
-        key = (
-            "whole_euler",
-            batch_size,
-            mel_width,
-            offset,
-            has_cnn_cache,
-            has_att_cache,
-            has_mask,
-            str(x.dtype),
-            str(x.device),
-        )
-
-        if key in self._unsupported:
-            return None
-
-        entry = self._cache.get(key)
-        if entry is None:
-            if len(self._cache) >= self.max_graphs:
-                self._flush()
-            entry = self._capture(
-                key,
-                x=x,
-                mu_cfg=mu_cfg,
-                speakers_cfg=speakers_cfg,
-                cond_cfg=cond_cfg,
-                cnn_cache=cnn_cache,
-                att_cache=att_cache,
-                attn_mask=attn_mask,
-                batch_size=batch_size,
+            entry = self._entry(
+                graph_batch=graph_batch,
+                query_cap=query_cap,
                 offset=offset,
-                has_cnn_cache=has_cnn_cache,
-                has_att_cache=has_att_cache,
-                has_mask=has_mask,
+                x=x,
+                spk_dim=int(speakers_cfg.shape[1]),
+                fill=fill,
             )
             if entry is None:
                 return None
-            self._cache[key] = entry
-        else:
-            self._stats["hits"] += 1
+            statics, static_final_x, out_cnn_cache, out_att_cache, graph = entry
+            fill(statics)
+            graph.replay()
 
-        static_inputs, static_final_x, out_cnn_cache, out_att_cache, graph = entry
-        (
-            static_x,
-            static_mu_cfg,
-            static_speakers_cfg,
-            static_cond_cfg,
-            static_cnn_cache,
-            static_att_cache,
-            static_attn_mask,
-            _static_time_embeddings,
-        ) = static_inputs
+            chunk_mel[start:stop].copy_(static_final_x[:rows, :, :mel_frames])
+            if cnn_pad > 0:
+                _zero_padded_cnn_cache(out_cnn_cache, self.estimator, cnn_pad)
+            out_cnn_rows[:, :, :, start:stop].copy_(out_cnn_cache.unflatten(2, (2, graph_batch))[:, :, :, :rows])
+            att_src = out_att_cache.unflatten(2, (2, graph_batch))[:, :, :, :rows]
+            if pad_frames > 0:
+                # The static output is scratch until the next replay, so the
+                # padded frames are cleared once here rather than per copy.
+                att_src[..., mel_frames:mel_width, :] = 0.0
+            if out_att_rows is not None:
+                _copy_frame_segments(out_att_rows[:, :, :, start:stop], att_src, segments)
+            else:
+                for row in range(rows):
+                    row_segments = segments_by_length[row_lengths[start + row]]
+                    request = torch.empty(
+                        (
+                            self.n_timesteps,
+                            arena.depth,
+                            2,
+                            arena.heads,
+                            sum(length for _, length in row_segments),
+                            arena.att_width,
+                        ),
+                        device=x.device,
+                        dtype=self.att_cache_dtype,
+                    )
+                    _copy_frame_segments(request, att_src[:, :, :, row], row_segments)
+                    request_att.append(request)
+            start = stop
 
-        static_x.copy_(x)
-        static_mu_cfg.copy_(mu_cfg)
-        static_speakers_cfg.copy_(speakers_cfg)
-        static_cond_cfg.copy_(cond_cfg)
-        if has_cnn_cache and cnn_cache is not None:
-            static_cnn_cache.copy_(cnn_cache)
-        elif not has_cnn_cache:
-            static_cnn_cache.zero_()
-        if has_att_cache and att_cache is not None and offset > 0:
-            static_att_cache.copy_(att_cache)
-        if has_mask and attn_mask is not None and static_attn_mask is not None:
-            static_attn_mask.copy_(attn_mask)
-
-        graph.replay()
-
-        out_cnn = out_cnn_cache.detach().clone()
-        out_att = out_att_cache.detach().clone()
-        if pad_frames > 0:
-            _zero_padded_cnn_cache(out_cnn, self.estimator, pad_frames)
-            out_att[..., mel_frames : mel_frames + pad_frames, :] = 0.0
-
-        return (
-            static_final_x[:, :, :mel_frames].detach().clone(),
-            out_cnn,
-            out_att,
-        )
+        return chunk_mel, out_cnn, (request_att if att_rows_out else out_att)

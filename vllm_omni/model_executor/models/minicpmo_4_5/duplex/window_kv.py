@@ -692,10 +692,22 @@ class MiniCPMO45DuplexSchedulerHelper:
         # Worker instruction derived from the same applied compaction result
         info = update.model_intermediate_buffer
         duplex = info.setdefault("duplex", {})
+        runtime_config = duplex.get("runtime_config")
+        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+        preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
+        seq = int(duplex.get("seq", 0) or 0)
+
+        reanchor_count = getattr(session, "_minicpmo45_reanchor_count", 0) + 1
+        session._minicpmo45_reanchor_count = reanchor_count
+        reanchor_id = f"{session.request_id}-r{reanchor_count}-{plan.moved_from}-{plan.delta}"
         duplex["stage0_reanchor"] = {
+            "reanchor_id": reanchor_id,
             "delta": plan.delta,
             "moved_from": plan.moved_from,
             "sink_blocks": plan.sink_blocks,
+            "sink_end": plan.sink_end,
+            "prefix_tokens": preserve_len,
+            "block_size": block_size,
             "old_computed_tokens": old_computed,
         }
 
@@ -707,11 +719,6 @@ class MiniCPMO45DuplexSchedulerHelper:
             stage0_window["completed_terminator_token_id"] = int(completed_terminator)
 
         # Synchronize scheduler window units and coordinates atomically with compaction
-        runtime_config = duplex.get("runtime_config")
-        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
-        preserve_len = int(runtime_config.get("duplex_first_append_context_tokens", 0) or 0)
-        seq = int(duplex.get("seq", 0) or 0)
-
         boundary_before = old_prompt_tokens + len(generated_ids) + 2
         recorded_open_start = getattr(session, "_minicpmo45_window_open_start", None)
         open_start = preserve_len if recorded_open_start is None else int(recorded_open_start)
@@ -732,28 +739,35 @@ class MiniCPMO45DuplexSchedulerHelper:
             )
 
         # Prune units dropped by compaction
-        dropped = 0
-        idx = 0
-        while idx < len(units):
-            u_len = int(units[idx]["length"])
-            if dropped + u_len <= freed_tokens:
-                dropped += u_len
-                idx += 1
+        drop_start = max(0, plan.sink_end - preserve_len)
+        drop_end = drop_start + freed_tokens
+
+        new_units: list[dict[str, Any]] = []
+        curr_offset = 0
+        for u in units:
+            u_len = int(u.get("length", 0))
+            u_start = curr_offset
+            u_end = curr_offset + u_len
+            curr_offset = u_end
+
+            local_drop_start = max(0, drop_start - u_start)
+            local_drop_end = min(u_len, drop_end - u_start)
+
+            if local_drop_start >= local_drop_end:
+                new_units.append(u)
+            elif local_drop_start == 0 and local_drop_end == u_len:
+                continue
             else:
-                break
-        if idx > 0:
-            del units[:idx]
-        rem = freed_tokens - dropped
-        if rem > 0 and units:
-            curr_len = int(units[0].get("length", 0))
-            if rem < curr_len:
-                units[0] = {
-                    "length": curr_len - rem,
-                    "generated_token_ids": units[0].get("generated_token_ids", []),
-                }
-            else:
-                del units[:1]
-        session._minicpmo45_window_units = units
+                new_len = u_len - (local_drop_end - local_drop_start)
+                gen_ids = u.get("generated_token_ids", [])
+                kept_gen_ids = gen_ids if local_drop_end < u_len else []
+                new_units.append(
+                    {
+                        "length": new_len,
+                        "generated_token_ids": kept_gen_ids,
+                    }
+                )
+        session._minicpmo45_window_units = new_units
 
         # Rebase open_start into compacted coordinates
         if seq > 1:
@@ -836,12 +850,16 @@ class MiniCPMO45DuplexWorkerHelper:
         return []
 
     @classmethod
-    def maybe_apply_reanchor(cls, runner: Any) -> None:
+    def maybe_apply_reanchor(cls, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
         if not hasattr(runner, "input_batch") or runner.input_batch is None:
             return
         num_reqs = getattr(runner.input_batch, "num_reqs", len(runner.input_batch.req_ids))
         req_ids = runner.input_batch.req_ids[:num_reqs]
+        applied_reanchors = getattr(runner, "_applied_stage0_reanchor_ids", None)
+        if applied_reanchors is None:
+            applied_reanchors = runner._applied_stage0_reanchor_ids = set()
+
         for req_idx, req_id in enumerate(req_ids):
             info = runner.model_intermediate_buffer.get(req_id)
             if not isinstance(info, dict):
@@ -852,6 +870,25 @@ class MiniCPMO45DuplexWorkerHelper:
             reanchor = duplex.pop("stage0_reanchor", None)
             if reanchor is None:
                 continue
+
+            # Sanitize scheduled_new_reqs in scheduler_output so subsequent runner
+            # metadata refreshes (_update_additional_information in _preprocess)
+            # do not re-inject this already popped reanchor command.
+            if scheduler_output is not None and hasattr(scheduler_output, "scheduled_new_reqs"):
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    if getattr(new_req, "req_id", None) == req_id:
+                        buf = getattr(new_req, "model_intermediate_buffer", None)
+                        if isinstance(buf, dict) and isinstance(buf.get("duplex"), dict):
+                            buf["duplex"].pop("stage0_reanchor", None)
+
+            reanchor_sig = (
+                f"{req_id}:{reanchor.get('moved_from')}:{reanchor.get('delta')}:{reanchor.get('old_computed_tokens')}"
+            )
+            reanchor_id = reanchor.get("reanchor_id") or reanchor_sig
+            if reanchor_id in applied_reanchors:
+                continue
+            applied_reanchors.add(reanchor_id)
+            reanchor["reanchor_id"] = reanchor_id
 
             plan = PositionReanchor(
                 delta=reanchor["delta"],
@@ -910,7 +947,9 @@ class MiniCPMO45DuplexWorkerHelper:
             helper = getattr(model, "_minicpmo45_duplex_data_plane_helper", None)
             if helper is not None and isinstance(getattr(helper, "sessions", None), dict):
                 req_sessions = getattr(model, "_minicpmo45_duplex_request_sessions", {})
-                session_key = req_sessions.get(req_id) if isinstance(req_sessions, dict) else None
+                session_key = duplex.get("session_id") or (
+                    req_sessions.get(req_id) if isinstance(req_sessions, dict) else None
+                )
                 session_state = helper.sessions.get(session_key) if session_key else None
                 if session_state is not None and hasattr(session_state, "window_units"):
                     if hasattr(helper, "_evict_window_units_for_reanchor"):

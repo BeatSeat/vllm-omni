@@ -1365,3 +1365,206 @@ def test_validate_duplex_window_install_block_sizes():
     model_config_small = SimpleNamespace(max_model_len=2048)
     with pytest.raises(ValueError, match="does not fit max_model_len"):
         validate_duplex_window_install(cache_config_npu, model_config_small, geometry_128)
+
+
+def test_exactly_once_reanchor_across_metadata_refreshes():
+    """Verify that stage0_reanchor executes exactly once even across runner metadata refreshes.
+
+    1. _update_states() pops stage0_reanchor and rotates KV caches.
+    2. scheduled_new_reqs is sanitized so subsequent _update_additional_information()
+       does not re-inject the reanchor command.
+    3. Even if re-injected with the same reanchor_id, rotation and history eviction
+       are skipped (idempotent).
+    """
+    head_dim = 16
+    inv_freq = torch.tensor([1.0 / (10000.0 ** (2 * i / head_dim)) for i in range(head_dim // 2)])
+    block_size = 16
+    k_pool = torch.randn(8, 1, block_size, head_dim)
+
+    evicted_reanchors = []
+
+    class _MockHelper:
+        def __init__(self):
+            self.sessions = {
+                "sess-1": SimpleNamespace(
+                    window_units=[
+                        SimpleNamespace(
+                            token_ids=list(range(i * 16, (i + 1) * 16)),
+                            embeds=[torch.zeros(1, 10)] * 16,
+                        )
+                        for i in range(10)
+                    ]
+                )
+            }
+
+        def _evict_window_units_for_reanchor(self, state, reanchor):
+            evicted_reanchors.append(reanchor)
+
+    mock_helper = _MockHelper()
+    mock_model = SimpleNamespace(
+        _minicpmo45_duplex_data_plane_helper=mock_helper,
+        _minicpmo45_duplex_request_sessions={"req-1": "sess-1"},
+    )
+
+    reanchor_dict = {
+        "reanchor_id": "req-1-r1-48-16",
+        "delta": 16,
+        "moved_from": 48,
+        "sink_blocks": 1,
+        "sink_end": 16,
+        "old_computed_tokens": 64,
+    }
+
+    new_req = SimpleNamespace(
+        req_id="req-1",
+        model_intermediate_buffer={
+            "duplex": {
+                "session_id": "sess-1",
+                "stage0_reanchor": dict(reanchor_dict),
+            }
+        },
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[new_req],
+    )
+
+    runner = SimpleNamespace(
+        model=mock_model,
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=["req-1"],
+            block_table=SimpleNamespace(
+                num_blocks_per_row=np.array([4]),
+                block_table=SimpleNamespace(np=np.array([[0, 1, 2, 3]])),
+            ),
+            num_computed_tokens_cpu=np.array([48], dtype=np.int32),
+        ),
+        model_intermediate_buffer={
+            "req-1": {
+                "duplex": {
+                    "session_id": "sess-1",
+                    "stage0_reanchor": dict(reanchor_dict),
+                }
+            }
+        },
+        requests={
+            "req-1": SimpleNamespace(
+                block_ids=[0, 1, 2, 3],
+                num_computed_tokens=48,
+                mrope_positions=None,
+            )
+        },
+        device=torch.device("cpu"),
+        cache_config=SimpleNamespace(block_size=block_size),
+        kv_caches=[k_pool],
+        _duplex_inv_freq=inv_freq,
+    )
+
+    # Step 1: worker reanchor runs
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler_output)
+
+    # Assert KV rotated once
+    assert len(evicted_reanchors) == 1
+    # Check that new_req buffer in scheduler_output was sanitized
+    assert "stage0_reanchor" not in new_req.model_intermediate_buffer["duplex"]
+    # Save rotated state
+    k_pool_after_first = k_pool.clone()
+
+    # Step 2: Simulate second call with the same reanchor_id (e.g. reinjection or duplicate metadata)
+    runner.model_intermediate_buffer["req-1"]["duplex"]["stage0_reanchor"] = dict(reanchor_dict)
+    MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler_output)
+
+    # Verify: rotation was SKIPPED, no second rotation occurred!
+    assert len(evicted_reanchors) == 1
+    assert torch.equal(k_pool, k_pool_after_first)
+
+
+def test_history_slicing_multi_row_embeddings_and_non_aligned_prefix():
+    """Verify that history eviction properly handles:
+    1. Non-aligned prefix: tokens in [prefix_tokens, sink_end) are kept in the sink!
+    2. Multi-row embedding tensors: audio and vision tensors are sliced by token row,
+       preserving 1-to-1 correspondence with token IDs for fallback prompt rebuild.
+    """
+    prefix_tokens = 100
+    sink_end = 112
+    moved_from = 176
+    delta = 64
+
+    # Unit 0: 64 tokens (covers relative [0, 64), absolute [100, 164))
+    unit0_embeds = [
+        torch.full((1, 8), 100.0),
+        torch.stack([torch.full((8,), float(101 + i)) for i in range(32)]),
+        torch.full((1, 8), 133.0),
+        *[torch.full((1, 8), float(134 + i)) for i in range(30)],
+    ]
+    unit0_tokens = list(range(100, 164))
+    assert sum(t.shape[0] for t in unit0_embeds) == 64
+    assert len(unit0_tokens) == 64
+    unit0 = _MiniCPMO45WindowUnit(embeds=unit0_embeds, token_ids=unit0_tokens)
+
+    # Unit 1: 64 tokens (covers relative [64, 128), absolute [164, 228))
+    unit1_embeds = [torch.stack([torch.full((8,), float(164 + i)) for i in range(64)])]
+    unit1_tokens = list(range(164, 228))
+    assert sum(t.shape[0] for t in unit1_embeds) == 64
+    assert len(unit1_tokens) == 64
+    unit1 = _MiniCPMO45WindowUnit(embeds=unit1_embeds, token_ids=unit1_tokens)
+
+    state = _MiniCPMO45Stage0SessionState(
+        session_id="req-multi-row",
+        window_enabled=True,
+        context_embeds=[torch.full((1, 8), float(i)) for i in range(prefix_tokens)],
+        context_token_ids=list(range(prefix_tokens)),
+        context_prefix_embeds=[torch.full((1, 8), float(i)) for i in range(prefix_tokens)],
+        context_prefix_token_ids=list(range(prefix_tokens)),
+        window_units=[unit0, unit1],
+    )
+
+    helper = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    reanchor_payload = {
+        "reanchor_id": "r-slice-1",
+        "delta": delta,
+        "moved_from": moved_from,
+        "sink_end": sink_end,
+        "prefix_tokens": prefix_tokens,
+    }
+    helper._evict_window_units_for_reanchor(state, reanchor_payload)
+
+    # Dropped absolute interval: [112, 176)
+    # Unit 0 (absolute [100, 164)):
+    # - Retains [100, 112) -> 12 tokens!
+    # - Token IDs must be 100..111
+    # - Embeddings must have exactly 12 rows, matching token IDs 100..111
+    assert len(state.window_units) == 2
+    u0_retained = state.window_units[0]
+    assert len(u0_retained.token_ids) == 12
+    assert u0_retained.token_ids == list(range(100, 112))
+    u0_rows = [row[0].item() for emb in u0_retained.embeds for row in emb]
+    assert len(u0_rows) == 12
+    assert u0_rows == [float(x) for x in range(100, 112)]
+
+    # Unit 1 (absolute [164, 228)):
+    # - Dropped [164, 176) -> first 12 tokens dropped
+    # - Retains [176, 228) -> 52 tokens!
+    # - Token IDs must be 176..227
+    # - Embeddings must have exactly 52 rows, matching token IDs 176..227
+    u1_retained = state.window_units[1]
+    assert len(u1_retained.token_ids) == 52
+    assert u1_retained.token_ids == list(range(176, 228))
+    u1_rows = [row[0].item() for emb in u1_retained.embeds for row in emb]
+    assert len(u1_rows) == 52
+    assert u1_rows == [float(x) for x in range(176, 228)]
+
+    # Verify fallback rebuild parts: row count must equal token ID count
+    rebuild_parts = helper._window_replacement_parts(
+        state,
+        {
+            "replace": True,
+            "drop_units": 0,
+            "mode": "basic",
+            "replacement_prompt_len": prefix_tokens + 12 + 52,
+        },
+    )
+    assert rebuild_parts is not None
+    embeds, token_ids = rebuild_parts
+    total_embed_rows = sum(t.shape[0] if t.ndim >= 2 else 1 for t in embeds)
+    assert total_embed_rows == len(token_ids) == prefix_tokens + 12 + 52

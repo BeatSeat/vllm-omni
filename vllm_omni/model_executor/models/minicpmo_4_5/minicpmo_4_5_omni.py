@@ -183,13 +183,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         return Sampler()
 
-    def apply_duplex_kv_reanchor(self, runner: Any) -> None:
+    def apply_duplex_kv_reanchor(self, runner: Any, scheduler_output: Any = None) -> None:
         """Apply in-place Stage-0 KV reanchor and rotation on worker before model forward."""
         from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
             MiniCPMO45DuplexWorkerHelper,
         )
 
-        MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner)
+        MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(runner, scheduler_output=scheduler_output)
 
     def prepare_duplex_sampling(
         self,

@@ -240,8 +240,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             result["input_token_ids"] = list(state.prepared_input_token_ids)
             return result
         self._require_special_token_ids()
-        if isinstance(stage0_reanchor, dict):
-            self._evict_window_units_for_reanchor(state, stage0_reanchor)
         if isinstance(stage0_window, dict):
             completed_ids = stage0_window.get("completed_token_ids")
             if isinstance(completed_ids, list):
@@ -438,6 +436,49 @@ class MiniCPMO45Stage0DuplexRuntime:
         state.pending_window_unit = None
         state.pending_window_generated_tokens.clear()
 
+    @staticmethod
+    def _tensor_rows(t: Any) -> int:
+        if hasattr(t, "shape"):
+            if getattr(t, "ndim", len(t.shape)) == 1:
+                return 1
+            if getattr(t, "ndim", len(t.shape)) == 3 and t.shape[0] == 1:
+                return int(t.shape[1])
+            return int(t.shape[0])
+        return 1
+
+    @classmethod
+    def _slice_single_tensor(cls, t: Any, start_row: int, end_row: int) -> Any:
+        if hasattr(t, "ndim"):
+            if t.ndim == 1:
+                return t
+            if t.ndim == 3 and t.shape[0] == 1:
+                return t[:, start_row:end_row]
+            return t[start_row:end_row]
+        return t
+
+    @classmethod
+    def _slice_embed_list(cls, embeds: list[Any], start_token: int, end_token: int) -> list[Any]:
+        if start_token >= end_token or not embeds:
+            return []
+        result: list[Any] = []
+        curr_offset = 0
+        for t in embeds:
+            num_rows = cls._tensor_rows(t)
+            t_start = curr_offset
+            t_end = curr_offset + num_rows
+            curr_offset = t_end
+
+            overlap_start = max(t_start, start_token)
+            overlap_end = min(t_end, end_token)
+            if overlap_start < overlap_end:
+                local_start = overlap_start - t_start
+                local_end = overlap_end - t_start
+                if local_start == 0 and local_end == num_rows:
+                    result.append(t)
+                else:
+                    result.append(cls._slice_single_tensor(t, local_start, local_end))
+        return result
+
     def _evict_window_units_for_reanchor(
         self,
         state: _MiniCPMO45Stage0SessionState,
@@ -448,28 +489,57 @@ class MiniCPMO45Stage0DuplexRuntime:
         Ensures worker history (state.window_units) stays bounded over long streaming sessions
         when zero-copy Re-RoPE KV reuse is active and prompt rebuild is bypassed.
         """
+        reanchor_id = stage0_reanchor.get("reanchor_id")
+        if reanchor_id:
+            applied = getattr(state, "_applied_reanchor_ids", None)
+            if applied is None:
+                applied = state._applied_reanchor_ids = set()
+            if reanchor_id in applied:
+                return
+            applied.add(reanchor_id)
+
         delta = int(stage0_reanchor.get("delta", 0) or 0)
         if delta <= 0 or not state.window_units:
             return
-        dropped = 0
-        idx = 0
-        while idx < len(state.window_units):
-            unit_len = len(state.window_units[idx].token_ids)
-            if dropped + unit_len <= delta:
-                dropped += unit_len
-                idx += 1
+
+        moved_from = stage0_reanchor.get("moved_from")
+        sink_end = stage0_reanchor.get("sink_end")
+        if sink_end is None and moved_from is not None:
+            sink_end = int(moved_from) - delta
+        if sink_end is None:
+            sink_blocks = int(stage0_reanchor.get("sink_blocks", 0) or 0)
+            block_size = int(stage0_reanchor.get("block_size", 16) or 16)
+            sink_end = sink_blocks * block_size
+
+        prefix_tokens = int(stage0_reanchor.get("prefix_tokens", 0) or len(state.context_token_ids))
+        drop_start = max(0, int(sink_end) - prefix_tokens)
+        drop_end = drop_start + delta
+
+        new_units: list[_MiniCPMO45WindowUnit] = []
+        curr_offset = 0
+        for unit in state.window_units:
+            u_len = len(unit.token_ids)
+            u_start = curr_offset
+            u_end = curr_offset + u_len
+            curr_offset = u_end
+
+            local_drop_start = max(0, drop_start - u_start)
+            local_drop_end = min(u_len, drop_end - u_start)
+
+            if local_drop_start >= local_drop_end:
+                new_units.append(unit)
+            elif local_drop_start == 0 and local_drop_end == u_len:
+                continue
             else:
-                break
-        if idx > 0:
-            del state.window_units[:idx]
-        remaining_delta = delta - dropped
-        if remaining_delta > 0 and state.window_units:
-            first_unit = state.window_units[0]
-            if remaining_delta < len(first_unit.token_ids):
-                first_unit.token_ids = first_unit.token_ids[remaining_delta:]
-                first_unit.embeds = first_unit.embeds[remaining_delta:]
-            else:
-                del state.window_units[:1]
+                kept_tokens = unit.token_ids[:local_drop_start] + unit.token_ids[local_drop_end:]
+                kept_embeds = self._slice_embed_list(unit.embeds, 0, local_drop_start) + self._slice_embed_list(
+                    unit.embeds, local_drop_end, u_len
+                )
+                unit.token_ids = kept_tokens
+                unit.embeds = kept_embeds
+                new_units.append(unit)
+
+        state.window_units = new_units
 
     def _window_replacement_parts(
         self,

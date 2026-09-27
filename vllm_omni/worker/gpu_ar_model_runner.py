@@ -468,19 +468,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
-        self._maybe_apply_duplex_window_reanchor()
+        self._maybe_apply_duplex_window_reanchor(scheduler_output)
         return deferred_state_corrections_fn
 
-    def _maybe_apply_duplex_window_reanchor(self) -> None:
+    def _maybe_apply_duplex_window_reanchor(self, scheduler_output: SchedulerOutput | None = None) -> None:
         """Apply in-place KV reanchor and rotation on worker before model forward."""
         reanchor_hook = getattr(getattr(self, "model", None), "apply_duplex_kv_reanchor", None)
         if callable(reanchor_hook):
-            reanchor_hook(self)
+            try:
+                reanchor_hook(self, scheduler_output=scheduler_output)
+            except TypeError:
+                reanchor_hook(self)
             return
 
         helper = getattr(self, "_duplex_window_helper", None)
         if helper is not None and hasattr(helper, "maybe_apply_reanchor"):
-            helper.maybe_apply_reanchor(self)
+            try:
+                helper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
+            except TypeError:
+                helper.maybe_apply_reanchor(self)
             return
 
         # Fallback for dynamic runner inspection without hardcoding model classes
@@ -504,7 +510,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 MiniCPMO45DuplexWorkerHelper,
             )
 
-            MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self)
+            MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
 
     def _maybe_apply_stage0_reanchor(self) -> None:
         """Backward-compatible alias for _maybe_apply_duplex_window_reanchor."""

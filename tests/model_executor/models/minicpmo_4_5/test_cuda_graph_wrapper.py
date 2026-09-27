@@ -1348,15 +1348,15 @@ def test_whole_euler_query_capture_bucket_reuses_decode_widths(monkeypatch: pyte
             att_cache=None,
         )
 
+    # The wide offset-0 prompt solve comes first, as in serving; it reserves
+    # the storage the decode widths then share.
+    assert _call(304) is not None
     assert _call(16) is not None
     assert _call(48) is not None
     assert _call(64) is not None
-    assert wrapper._stats["captures"] == 1
-    assert wrapper._stats["hits"] == 2
-    keys = list(wrapper._cache)
-    assert keys[0][2] == 64
-    assert _call(304) is not None
     assert wrapper._stats["captures"] == 2
+    assert wrapper._stats["hits"] == 2
+    assert wrapper._stats["flushes"] == 0
     query_caps = {key[2] for key in wrapper._cache}
     assert query_caps == {64, 320}
     wrapper._flush()
@@ -1482,7 +1482,7 @@ def test_whole_euler_execution_arena_buffer_reuse(monkeypatch: pytest.MonkeyPatc
     spk1 = torch.randn(2, 4, device="cuda")
     cond1 = torch.randn(2, 4, w, device="cuda")
 
-    # First call captures shape 1 (offset=0)
+    # First call captures shape 1 (offset=0); att_keep reserves both offsets.
     res1 = wrapper.replay(
         x=x1,
         mu_cfg=mu1,
@@ -1490,6 +1490,7 @@ def test_whole_euler_execution_arena_buffer_reuse(monkeypatch: pytest.MonkeyPatc
         cond_cfg=cond1,
         cnn_cache=None,
         att_cache=None,
+        att_keep=(w, w),
     )
     assert res1 is not None
     assert wrapper._stats["captures"] == 1
@@ -1585,6 +1586,61 @@ def test_whole_euler_graphs_share_one_attention_storage(monkeypatch: pytest.Monk
         assert out_att.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
     wrapper._flush()
     assert wrapper.arena._att is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_storage_growth_retires_the_graphs_on_the_old_storage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A capture that outgrows the attention storage must not leave the old one alive beside it."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=8)
+
+    w = 8
+    first = _whole_euler_chunk(1, w)
+    # att_keep reserves 2 * w frames: the next w-wide chunk fits, a 2w-wide one does not.
+    _, cnn, att = wrapper.replay(**first, cnn_cache=None, att_cache=None, att_keep=(w, w))
+    _, eager_cnn, eager_att = _eager_solve_euler(
+        estimator,
+        first["x"],
+        first["mu_cfg"],
+        first["speakers_cfg"],
+        first["cond_cfg"],
+        None,
+        None,
+        None,
+        wrapper.timeline,
+    )
+    wrapper.replay(**_whole_euler_chunk(1, w), cnn_cache=cnn, att_cache=att)
+    assert wrapper._stats["flushes"] == 0
+    assert len(wrapper._cache) == 2
+
+    wide = _whole_euler_chunk(1, 2 * w)
+    graph_x, _, graph_att = wrapper.replay(**wide, cnn_cache=cnn, att_cache=att)
+
+    assert wrapper._stats["flushes"] == 1
+    assert len(wrapper._cache) == 1
+    storage = wrapper.arena._att
+    assert storage is not None and int(storage.shape[4]) >= 3 * w
+    for statics, _final_x, _out_cnn, out_att, _graph in wrapper._cache.values():
+        assert statics.att_cache.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+        assert out_att.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+    eager_x, _, eager_wide_att = _eager_solve_euler(
+        estimator,
+        wide["x"],
+        wide["mu_cfg"],
+        wide["speakers_cfg"],
+        wide["cond_cfg"],
+        eager_cnn,
+        eager_att,
+        None,
+        wrapper.timeline,
+    )
+    torch.testing.assert_close(graph_x, eager_x, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(graph_att, eager_wide_att, rtol=1e-4, atol=1e-5)
+    wrapper._flush()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
@@ -1757,6 +1813,8 @@ def test_whole_euler_real_attention_causal_conv_parity_across_chunks(monkeypatch
         attn_mask=mask1,
         mel_frames=12,
         pad_frames=4,
+        # Reserves chunk 2's 12 + 16 frames up front, as serving does; trims nothing.
+        att_keep=(12, 16),
     )
     e_x1, e_cnn1, e_att1 = _eager_solve_euler(
         dit,
@@ -1960,6 +2018,8 @@ def test_whole_euler_query_bucket_keeps_current_first_cache_layout(monkeypatch: 
                 attn_mask=_mask(width, mel_frames, offset) if pad_frames else None,
                 mel_frames=mel_frames,
                 pad_frames=pad_frames,
+                # Reserves all three chunks (16 + 6 + 16 frames) up front; trims nothing.
+                att_keep=(16, 48),
             )
             assert results[name] is not None
             assert all(torch.isfinite(t).all() for t in results[name])

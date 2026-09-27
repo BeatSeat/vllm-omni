@@ -773,17 +773,21 @@ class WholeEulerExecutionArena:
             self._cond_buffers[key] = buf
         return buf
 
+    def att_cache_fits(self, batch_size: int, frames: int) -> bool:
+        """Whether ``att_cache_view(batch_size, frames)`` fits the current storage."""
+        storage = self._att
+        return storage is not None and int(storage.shape[2]) >= 2 * batch_size and int(storage.shape[4]) >= frames
+
     def att_cache_view(self, batch_size: int, frames: int, *, capacity: int = 0, rows: int = 0) -> torch.Tensor:
         """``(n_t, depth, 2B, heads, frames, width)`` prefix view of the shared cache storage.
 
         ``capacity`` frames and ``rows`` requests are reserved up front. A
-        larger request replaces the storage; graphs captured on the old one
-        keep their views, and with them the old storage, until the next
-        generation flush -- correct, only not shared -- so callers pass the
-        steady cache length and the largest graph batch to make that rare.
+        larger request replaces the storage. Graphs captured on the old one
+        would keep it alive beside the new one, so
+        ``WholeEulerCFMGraphWrapper._capture`` flushes them first.
         """
         storage = self._att
-        if storage is None or int(storage.shape[2]) < 2 * batch_size or int(storage.shape[4]) < frames:
+        if not self.att_cache_fits(batch_size, frames):
             old_rows = 0 if storage is None else int(storage.shape[2]) // 2
             old_frames = 0 if storage is None else int(storage.shape[4])
             storage = torch.zeros(
@@ -1135,13 +1139,19 @@ class WholeEulerCFMGraphWrapper:
         fill,
     ) -> tuple | None:
         arena = self.arena
-        # Reserve the steady offset plus one query bucket, and the largest
+        # Reserve the steady offset plus two query buckets, and the largest
         # graph batch, up front, so every offset on the way there
-        # (304 -> 368 -> 400) and every batch size share one storage. The wide
-        # offset-0 prompt solve fits within that; adding its width on top of
-        # the steady offset would hold ~300 frames per row that nothing uses.
-        capacity = max(offset + query_cap, max(offset, self._att_capacity) + self.query_bucket_frames)
+        # (304 -> 368 -> 400) and every batch size share one storage. Two
+        # buckets because a final chunk carries the lookahead tail past one
+        # (50 + 6 mel frames). The wide offset-0 prompt solve fits within that;
+        # adding its width on top of the steady offset would hold ~300 frames
+        # per row that nothing uses.
+        capacity = max(offset + query_cap, max(offset, self._att_capacity) + 2 * self.query_bucket_frames)
         rows = self.micro_batch_size
+        if self._cache and not arena.att_cache_fits(graph_batch, offset + query_cap):
+            # The captured graphs hold views of the current storage: retire
+            # them, or they keep it alive beside the larger replacement.
+            self._flush()
         try:
             statics = _WholeEulerStatics(
                 x=arena.get_x_staging(graph_batch, channels, query_cap),

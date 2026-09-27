@@ -112,22 +112,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             if getattr(getattr(vllm_config, "model_config", None), "session_mode", None) == "duplex":
                 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                    DUPLEX_WINDOW_BLOCK_SIZE,
                     duplex_window_geometry,
                     install_duplex_window_layers,
                     validate_duplex_window_install,
                 )
 
+                cache_config = getattr(vllm_config, "cache_config", None)
+                model_config = getattr(vllm_config, "model_config", None)
+                block_size = int(
+                    getattr(cache_config, "block_size", DUPLEX_WINDOW_BLOCK_SIZE) or DUPLEX_WINDOW_BLOCK_SIZE
+                )
+                max_model_len = getattr(model_config, "max_model_len", None) if model_config is not None else None
+                if max_model_len is None:
+                    max_model_len = 8192
+
                 geometry = duplex_window_geometry(
                     prefix_tokens=96,
                     window_tokens=6000,
-                    block_size=vllm_config.cache_config.block_size,
-                    max_model_len=vllm_config.model_config.max_model_len,
+                    block_size=block_size,
+                    max_model_len=max_model_len,
                     high_watermark_tokens=8000,
                 )
                 install_duplex_window_layers(self.thinker, geometry=geometry)
                 validate_duplex_window_install(
-                    vllm_config.cache_config,
-                    vllm_config.model_config,
+                    cache_config,
+                    model_config,
                     geometry,
                 )
 

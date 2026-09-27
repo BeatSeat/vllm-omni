@@ -176,9 +176,10 @@ def validate_duplex_window_install(
             f"does not match cache_config.block_size ({configured_block_size})"
         )
     needed = geometry.prefix_tokens + geometry.trigger_tokens + geometry.sample_room
-    if needed > model_config.max_model_len:
+    max_model_len = getattr(model_config, "max_model_len", None) if model_config is not None else None
+    if max_model_len is not None and needed > max_model_len:
         raise ValueError(
-            f"duplex window does not fit max_model_len={model_config.max_model_len}: "
+            f"duplex window does not fit max_model_len={max_model_len}: "
             f"prefix={geometry.prefix_tokens} + trigger={geometry.trigger_tokens} "
             f"+ sample_room={geometry.sample_room} = {needed}"
         )
@@ -806,8 +807,14 @@ class MiniCPMO45DuplexWorkerHelper:
     def get_rope_inv_freq(cls, runner: Any) -> torch.Tensor:
         inv_freq = getattr(runner, "_duplex_inv_freq", None)
         if inv_freq is None:
-            head_dim = runner.model_config.get_head_size()
-            base = float(getattr(runner.model_config.hf_config, "rope_theta", 1000000.0) or 1000000.0)
+            model_config = getattr(runner, "model_config", None)
+            head_dim = (
+                model_config.get_head_size()
+                if model_config is not None and hasattr(model_config, "get_head_size")
+                else 128
+            )
+            hf_config = getattr(model_config, "hf_config", None) if model_config is not None else None
+            base = float(getattr(hf_config, "rope_theta", 1000000.0) or 1000000.0)
             inv_freq = 1.0 / (
                 base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=runner.device) / head_dim)
             )
@@ -910,7 +917,8 @@ class MiniCPMO45DuplexWorkerHelper:
             mrope_pos = getattr(req_state, "mrope_positions", None) if req_state is not None else None
             if mrope_pos is not None:
                 assert_uniform_position_shift(mrope_pos, plan.moved_from)
-                sink_tokens = plan.sink_blocks * runner.cache_config.block_size
+                block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+                sink_tokens = plan.sink_blocks * block_size
                 if mrope_pos.shape[1] >= old_computed:
                     req_state.mrope_positions = torch.cat(
                         [

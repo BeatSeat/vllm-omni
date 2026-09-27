@@ -1568,3 +1568,22 @@ def test_history_slicing_multi_row_embeddings_and_non_aligned_prefix():
     embeds, token_ids = rebuild_parts
     total_embed_rows = sum(t.shape[0] if t.ndim >= 2 else 1 for t in embeds)
     assert total_embed_rows == len(token_ids) == prefix_tokens + 12 + 52
+
+
+def test_duplex_window_install_tolerates_missing_cache_or_model_config() -> None:
+    """Startup installation must tolerate minimal or absent cache/model configs."""
+    geometry = duplex_window_geometry(
+        prefix_tokens=96,
+        window_tokens=6000,
+        block_size=16,
+        max_model_len=8192,
+        high_watermark_tokens=8000,
+    )
+    # cache_config is None, model_config is SimpleNamespace with no max_model_len
+    validate_duplex_window_install(None, SimpleNamespace(), geometry)
+    validate_duplex_window_install(None, None, geometry)
+
+    # Worker rope inv freq helper tolerates runner with no or minimal model_config
+    runner = SimpleNamespace(device=torch.device("cpu"))
+    inv_freq = MiniCPMO45DuplexWorkerHelper.get_rope_inv_freq(runner)
+    assert inv_freq is not None and inv_freq.shape == (64,)

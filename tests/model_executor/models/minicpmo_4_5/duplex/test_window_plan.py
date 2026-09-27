@@ -337,3 +337,60 @@ def test_a_long_session_trims_once_per_spare_window_not_once_per_append():
     # it simply trades the rotation for a shorter session cap.
     unwindowed = _stage0_geometry(window_tokens=40960, high_watermark_tokens=None)
     assert unwindowed.trigger_tokens == 40960
+
+
+def test_paged_retention_policy_vs_unpaged_reference():
+    """Verify and document retention differences between paged KV and unpaged reference.
+
+    Case from reviewer @amy-why-3459:
+      prefix_tokens = 100, block_size = 16
+      unit_tokens = [28, 36] (units at [100..128) and [128..164), current total = 164)
+      watermarks: high = 160, low = 148
+
+    Reference unpaged policy (OpenBMB):
+      - Drops unit 0 ([100..128), 28 tokens)
+      - Retains [0..100) + [128..164), total length = 136
+      - Token at 128 moves to position 100
+
+    Paged zero-copy policy (plan_position_reanchor):
+      - sink_end = cdiv(100, 16) * 16 = 112
+      - Preserves [100..112) inside the physical sink block (block 6)
+      - moved_from = 128, delta = 16 (1 block)
+      - Drops [112..128) (16 tokens)
+      - Retains [0..112) + [128..164), total length = 148
+      - Token at 128 moves to position 112 (128 - 16)
+    """
+    geometry = DuplexWindowGeometry(
+        prefix_tokens=100,
+        window_tokens=48,  # low watermark target = 100 + 48 = 148
+        block_size=16,
+        max_model_len=2048,
+        high_watermark_tokens=60,  # trigger = 100 + 60 = 160
+    )
+    plan = plan_position_reanchor(
+        geometry,
+        computed_tokens=164,
+        pending_tokens=0,
+        unit_tokens=[28, 36],
+    )
+    assert plan is not None
+    assert plan.delta == 16
+    assert plan.moved_from == 128
+    assert plan.sink_blocks == 7
+    assert plan.sink_end == 112
+
+    # Verify position mapping:
+    # Sink prefix [0..100) unchanged
+    assert reanchor_positions(0, plan) == 0
+    assert reanchor_positions(99, plan) == 99
+    # Paged sink tail [100..112) unchanged
+    assert reanchor_positions(100, plan) == 100
+    assert reanchor_positions(111, plan) == 111
+    # Dropped span [112..128) raises ValueError
+    with pytest.raises(ValueError, match="was dropped by reanchor"):
+        reanchor_positions(112, plan)
+    with pytest.raises(ValueError, match="was dropped by reanchor"):
+        reanchor_positions(127, plan)
+    # Retained tail [128..164) shifts by -delta (-16)
+    assert reanchor_positions(128, plan) == 112
+    assert reanchor_positions(163, plan) == 147

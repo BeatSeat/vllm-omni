@@ -34,6 +34,28 @@ rotation of the retained keys, which is what :class:`PositionReanchor` plans.
 Everything here is pure integer arithmetic so the invariants are testable
 without a GPU, a checkpoint, or a vLLM engine. ``window_kv.py`` is the vLLM
 tier that consumes it.
+
+Paged KV Retention Semantics vs. Unpaged Reference
+--------------------------------------------------
+In the unpaged HuggingFace reference implementation (OpenBMB MiniCPM-o 4.5), KV
+tensors are dense PyTorch tensors. The reference basic window drops whole units
+immediately after the exact preserved prefix length:
+`retained = [0, prefix_tokens) + [unit_end, total)`.
+
+In vLLM, KV memory is paged into physical blocks of size `block_size` (e.g. 16 or 128).
+To achieve zero-copy in-place KV reuse without allocating new blocks or shifting
+physical slot rows across pages:
+1. The sink region is aligned up to whole blocks:
+   `sink_end = cdiv(prefix_tokens, block_size) * block_size`.
+2. Any tokens in `[prefix_tokens, sink_end)` reside in the physical sink block and
+   remain resident in-place (up to `block_size - 1` tokens).
+3. The dropped interval is `[sink_end, moved_from)`.
+4. The retained tail `[moved_from, total)` is translated down by `delta = moved_from - sink_end`,
+   where `delta` is an exact multiple of `block_size`.
+
+This guarantees that physical pages in the block table require no data movement or
+reallocation, at the cost of retaining up to `block_size - 1` tokens of the oldest
+unit in the sink page.
 """
 
 from __future__ import annotations

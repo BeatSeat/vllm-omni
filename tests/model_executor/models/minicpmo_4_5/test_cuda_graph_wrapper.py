@@ -1437,29 +1437,18 @@ def test_cfm_step_graph_captures_distinct_batch_shapes(monkeypatch: pytest.Monke
     wrapper._flush()
 
 
-def test_zero_padded_cnn_cache_vectorized() -> None:
-    depth, batch, cnn_channels, cnn_width = 2, 4, 8, 4
-    # 4D tensor test
-    cnn_cache_4d = torch.randn(depth, batch, cnn_channels, cnn_width)
-    expected_4d = cnn_cache_4d.clone()
-    pad_frames = 2
-    zero_from = max(0, cnn_width - pad_frames)
-    expected_4d[..., zero_from:] = 0.0
-
-    actual_4d = cnn_cache_4d.clone()
+def test_zero_padded_cnn_cache_clears_every_timestep_of_a_whole_euler_cache() -> None:
+    # Whole-Euler keeps every timestep's CNN cache as (n_timesteps, depth, 2B, C, W)
+    # and hands the helper a block-first view of it.
     estimator = _WholeEulerDiT()
-    wrapper_module._zero_padded_cnn_cache(actual_4d, estimator, pad_frames)
-    torch.testing.assert_close(actual_4d, expected_4d)
+    width = int(estimator.blocks[0].conv.block[1].causal_padding[0])
+    cache = torch.randn(10, len(estimator.blocks), 4, 8, width)
+    expected = cache.clone()
+    expected[..., width - 1 :] = 0.0
 
-    # 5D tensor test (timesteps, depth, batch, channels, width)
-    timesteps = 10
-    cnn_cache_5d = torch.randn(timesteps, depth, batch, cnn_channels, cnn_width)
-    expected_5d = cnn_cache_5d.clone()
-    expected_5d[..., zero_from:] = 0.0
+    wrapper_module._zero_padded_cnn_cache(cache.transpose(0, 1), estimator, 1)
 
-    actual_5d = cnn_cache_5d.clone()
-    wrapper_module._zero_padded_cnn_cache(actual_5d, estimator, pad_frames)
-    torch.testing.assert_close(actual_5d, expected_5d)
+    torch.testing.assert_close(cache, expected)
 
 
 def test_fused_euler_step_eager_fallback() -> None:

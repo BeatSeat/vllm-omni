@@ -23,6 +23,7 @@ from .cuda_graph_wrapper import (
     _att_keep_ranges,
     _copy_frame_segments,
     _fused_euler_step,
+    _zero_padded_cnn_cache,
 )
 
 logger = init_logger(__name__)
@@ -130,52 +131,6 @@ def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     if valid_frames is None or valid_frames >= int(tensor.shape[-1]):
         return
     tensor[..., valid_frames:] = 0.0
-
-
-def _zero_padded_cnn_cache(
-    cnn_cache: torch.Tensor,
-    estimator: nn.Module,
-    pad_frames: int,
-) -> None:
-    """Clear the cache positions that come from padded frames, in place.
-
-    Each block's CNN cache holds the tail of its convolution output
-    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
-    so when the padding sits at the chunk tail those positions are
-    padding-derived and would otherwise become the next chunk's left context.
-    Padding is at most ``pad_frames`` wide, so only the trailing positions that
-    can come from it are cleared; the valid part of the window is kept.
-    """
-    blocks = getattr(estimator, "blocks", None)
-    if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
-        width = int(cnn_cache.shape[-1])
-        if width > 0 and all(
-            hasattr(block, "conv")
-            and hasattr(block.conv, "block")
-            and len(block.conv.block) > 1
-            and hasattr(block.conv.block[1], "causal_padding")
-            and int(block.conv.block[1].causal_padding[0]) == width
-            for block in blocks
-        ):
-            # _estimator_buffers packs equal-width blocks into one tensor.
-            # Clear their shared tail with one write instead of one per block.
-            cnn_cache[..., max(0, width - pad_frames) :] = 0.0
-            return
-
-    if blocks is not None:
-        for index, block in enumerate(blocks):
-            if index >= len(cnn_cache):
-                break
-            conv = getattr(block, "conv", None)
-            conv_block = getattr(conv, "block", None) if conv is not None else None
-            if conv_block is None or len(conv_block) <= 1 or not hasattr(conv_block[1], "causal_padding"):
-                continue
-            width = int(conv_block[1].causal_padding[0])
-            if width <= 0:
-                continue
-            zero_from = max(0, width - pad_frames)
-            if zero_from < width:
-                cnn_cache[index][..., zero_from:] = 0.0
 
 
 def plan_token2wav_encode_slices(
@@ -345,7 +300,7 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
-        self._timeline_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+        self._timeline_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, list[float]]] = {}
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
@@ -792,14 +747,20 @@ class BatchedToken2Wav(nn.Module):
 
         return estimator.final_layer(x, time_embedding).transpose(1, 2)
 
-    def _get_timeline(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _get_timeline(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, list[float]]:
+        """The Euler timeline and its step sizes, read to the host once.
+
+        ``_fused_euler_step`` takes ``dt`` as a Python float, so reading it
+        from the device timeline on every decode would sync once per step.
+        """
         key = (device, dtype)
-        timeline = self._timeline_cache.get(key)
-        if timeline is None:
+        cached = self._timeline_cache.get(key)
+        if cached is None:
             t = torch.linspace(0, 1, self.n_timesteps + 1, device=device, dtype=dtype)
             timeline = (1 - torch.cos(t * 0.5 * torch.pi)).contiguous()
-            self._timeline_cache[key] = timeline
-        return timeline
+            cached = (timeline, (timeline[1:] - timeline[:-1]).tolist())
+            self._timeline_cache[key] = cached
+        return cached
 
     def _decode_cfm(
         self,
@@ -876,7 +837,7 @@ class BatchedToken2Wav(nn.Module):
             # is what removes them; zeroing alone would not, since a zero row
             # still occupies part of the softmax denominator.
             x[:, :, mel_frames:] = 0.0
-        timeline = self._get_timeline(mu.device, mu.dtype)
+        timeline, dt_steps = self._get_timeline(mu.device, mu.dtype)
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
@@ -939,7 +900,6 @@ class BatchedToken2Wav(nn.Module):
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
-        dt_floats = [float((timeline[s + 1] - timeline[s]).item()) for s in range(self.n_timesteps)]
         time_embeddings = [
             estimator.t_embedder(timeline[s].expand(2 * batch_size)).unsqueeze(1) for s in range(self.n_timesteps)
         ]
@@ -964,7 +924,7 @@ class BatchedToken2Wav(nn.Module):
                 )
                 if pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
-                x = _fused_euler_step(x, estimate, dt_floats[step], decoder.inference_cfg_rate, batch_size)
+                x = _fused_euler_step(x, estimate, dt_steps[step], decoder.inference_cfg_rate, batch_size)
                 if pad_frames:
                     _zero_padded_frames(x, mel_frames)
                 next_cnn.append(step_cnn)

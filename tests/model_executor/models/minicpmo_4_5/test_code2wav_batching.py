@@ -749,6 +749,40 @@ def test_decode_cfm_enters_platform_sdpa_context(monkeypatch):
     assert entered == ["enter", "exit"]
 
 
+def test_eager_cfm_reads_the_step_sizes_to_the_host_once(monkeypatch):
+    """The eager Euler loop must not sync the stream for ``dt`` on every decode."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    reads: list[str] = []
+
+    def recording(name):
+        original = getattr(torch.Tensor, name)
+
+        def read(self, *args, **kwargs):
+            # The fake estimator records its inputs with ``tolist``; skip those.
+            if sys._getframe(1).f_code.co_filename != __file__:
+                reads.append(name)
+            return original(self, *args, **kwargs)
+
+        return read
+
+    for name in ("item", "tolist"):
+        monkeypatch.setattr(torch.Tensor, name, recording(name))
+
+    def decode():
+        adapter._decode_cfm(
+            torch.ones((1, 1, 2)),
+            torch.ones((1, 1)),
+            torch.zeros((1, 1, 2)),
+            cnn_cache=None,
+            att_cache=None,
+        )
+
+    decode()
+    assert reads == ["tolist"]
+    decode()
+    assert reads == ["tolist"]
+
+
 def test_ragged_decode_bypasses_exact_shape_accelerators():
     adapter = BatchedToken2Wav(_FakeToken2Wav())
     _enable_fake_ragged_kernel(adapter)

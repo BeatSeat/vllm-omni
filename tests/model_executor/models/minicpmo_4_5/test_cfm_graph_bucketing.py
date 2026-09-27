@@ -16,7 +16,6 @@ import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _cfm_pad_frames,
-    _zero_padded_cnn_cache,
     _zero_padded_frames,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
@@ -24,6 +23,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     _build_capture_mask,
     _capture_query_width,
     _whole_euler_att_segments,
+    _zero_padded_cnn_cache,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

@@ -597,15 +597,46 @@ def _zero_padded_cnn_cache(
     estimator: torch.nn.Module,
     pad_frames: int,
 ) -> None:
-    """Clear the cache positions that come from padded frames, in place."""
-    if pad_frames <= 0:
-        return
-    width = cnn_cache.shape[-1]
-    if width <= 0:
-        return
-    zero_from = max(0, width - pad_frames)
-    if zero_from < width:
-        cnn_cache[..., zero_from:] = 0.0
+    """Clear the cache positions that come from padded frames, in place.
+
+    Each block's CNN cache holds the tail of its convolution output
+    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
+    so when the padding sits at the chunk tail those positions are
+    padding-derived and would otherwise become the next chunk's left context.
+    Padding is at most ``pad_frames`` wide, so only the trailing positions that
+    can come from it are cleared; the valid part of the window is kept.
+    ``cnn_cache`` is indexed by block on its first axis.
+    """
+    blocks = getattr(estimator, "blocks", None)
+    if pad_frames > 0 and blocks and len(blocks) == cnn_cache.shape[0]:
+        width = int(cnn_cache.shape[-1])
+        if width > 0 and all(
+            hasattr(block, "conv")
+            and hasattr(block.conv, "block")
+            and len(block.conv.block) > 1
+            and hasattr(block.conv.block[1], "causal_padding")
+            and int(block.conv.block[1].causal_padding[0]) == width
+            for block in blocks
+        ):
+            # _estimator_buffers packs equal-width blocks into one tensor.
+            # Clear their shared tail with one write instead of one per block.
+            cnn_cache[..., max(0, width - pad_frames) :] = 0.0
+            return
+
+    if blocks is not None:
+        for index, block in enumerate(blocks):
+            if index >= len(cnn_cache):
+                break
+            conv = getattr(block, "conv", None)
+            conv_block = getattr(conv, "block", None) if conv is not None else None
+            if conv_block is None or len(conv_block) <= 1 or not hasattr(conv_block[1], "causal_padding"):
+                continue
+            width = int(conv_block[1].causal_padding[0])
+            if width <= 0:
+                continue
+            zero_from = max(0, width - pad_frames)
+            if zero_from < width:
+                cnn_cache[index][..., zero_from:] = 0.0
 
 
 class WholeEulerExecutionArena:
@@ -1352,7 +1383,8 @@ class WholeEulerCFMGraphWrapper:
 
             chunk_mel[start:stop].copy_(static_final_x[:rows, :, :mel_frames])
             if cnn_pad > 0:
-                _zero_padded_cnn_cache(out_cnn_cache, self.estimator, cnn_pad)
+                # (n_timesteps, depth, ...): put the block axis first for the helper.
+                _zero_padded_cnn_cache(out_cnn_cache.transpose(0, 1), self.estimator, cnn_pad)
             out_cnn_rows[:, :, :, start:stop].copy_(out_cnn_cache.unflatten(2, (2, graph_batch))[:, :, :, :rows])
             att_src = out_att_cache.unflatten(2, (2, graph_batch))[:, :, :, :rows]
             if pad_frames > 0:

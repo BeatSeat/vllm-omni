@@ -364,18 +364,71 @@ class PersonaPlexStage0DuplexRuntime:
         One gather from the slot buffers. A request of a superseded epoch gets
         the neutral row (silence, nothing forced): its output is discarded.
         """
-        slots: list[int] = []
+        slots = [
+            self.scratch_slot if request_id in self._stale_requests else self._prepared_state(request_id).slot
+            for request_id in request_ids
+        ]
+        return self.teacher_forcing_rows(self._index(slots))
+
+    @property
+    def scratch_slot(self) -> int:
+        """The slot-buffer row past the live slots.
+
+        Its teacher forcing is neutral and never written; it takes the commits
+        that must not reach a live slot.
+        """
+        return self.max_sessions
+
+    def depformer_rows(self, request_ids: list[str]) -> tuple[list[int], list[int]]:
+        """The slots one post-sample step reads and writes, one pair per row.
+
+        Row ``i`` reads its teacher forcing from ``read[i]`` and commits its sample
+        to ``write[i]``. A superseded epoch's request, a session's repeated row and
+        an already committed frame write to the scratch row, so ``write`` names
+        each live slot at most once. Committing frames are marked sampled, as
+        ``record_samples`` does.
+        """
+        scratch = self.scratch_slot
+        read: list[int] = []
+        write: list[int] = []
+        committing: dict[int, PersonaPlexStage0SessionState] = {}
         for request_id in request_ids:
             if request_id in self._stale_requests:
-                slots.append(self.max_sessions)
+                read.append(scratch)
+                write.append(scratch)
                 continue
-            key = self.request_sessions.get(request_id)
-            state = self.sessions.get(key) if key is not None else None
-            if state is None or state.prepared_identity is None:
-                raise ValueError("PersonaPlex duplex depformer teacher-forcing state is missing")
-            slots.append(state.slot)
-        index = self._index(slots)
-        return self._teacher_tokens[index], self._teacher_provided[index]
+            state = self._prepared_state(request_id)
+            read.append(state.slot)
+            if state.sampled_identity == state.prepared_identity or id(state) in committing:
+                write.append(scratch)
+            else:
+                write.append(state.slot)
+                committing[id(state)] = state
+        for state in committing.values():
+            state.sampled_identity = state.prepared_identity
+        return read, write
+
+    def teacher_forcing_rows(self, slots: Any) -> tuple[Any, Any]:
+        """``[B, 16]`` depformer teacher-forcing tokens and mask of the ``slots`` rows."""
+        return self._teacher_tokens[slots], self._teacher_provided[slots]
+
+    def commit_rows(self, slots: Any, text_tokens: Any, agent_codes: Any, tokens: Any, provided: Any) -> None:
+        """Write each row's effective agent frame (the forced code where ``provided``) and text token.
+
+        ``slots`` must not repeat a live slot. Device-only, so it can run inside a
+        CUDA graph.
+        """
+        import torch
+
+        self._last_agent[slots] = torch.where(provided[:, :8], tokens[:, :8], agent_codes[:, :8])
+        self._last_text[slots] = text_tokens
+
+    def _prepared_state(self, request_id: str) -> PersonaPlexStage0SessionState:
+        key = self.request_sessions.get(request_id)
+        state = self.sessions.get(key) if key is not None else None
+        if state is None or state.prepared_identity is None:
+            raise ValueError("PersonaPlex duplex depformer teacher-forcing state is missing")
+        return state
 
     def record_samples(
         self,
@@ -423,12 +476,7 @@ class PersonaPlexStage0DuplexRuntime:
             row_index = self._index(rows)
             text, codes = text[row_index], codes[row_index]
         slots = self._index([state.slot for state in states])
-        self._last_agent[slots] = torch.where(
-            self._teacher_provided[slots, :8],
-            self._teacher_tokens[slots, :8],
-            codes[:, :8],
-        )
-        self._last_text[slots] = text[:, 0]
+        self.commit_rows(slots, text[:, 0], codes, *self.teacher_forcing_rows(slots))
         for state in states:
             state.sampled_identity = state.prepared_identity
 
@@ -556,18 +604,22 @@ class PersonaPlexStage0DuplexRuntime:
         import torch
 
         device = self._model_device_dtype()[0]
-        slots = self.max_sessions
+        # One row per slot plus the scratch row (scratch_slot). The buffers are
+        # only ever updated in place: a captured depformer graph holds their
+        # addresses.
+        rows = self.max_sessions + 1
         self._silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long, device=device)
         self._sine = torch.tensor(SINE_TOKENS, dtype=torch.long, device=device)
         self._silence_cpu = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
-        self._last_text = torch.full((slots,), ZERO_TEXT_TOKEN, dtype=torch.long, device=device)
-        self._last_agent = self._silence.repeat(slots, 1)
+        self._last_text = torch.full((rows,), ZERO_TEXT_TOKEN, dtype=torch.long, device=device)
+        self._last_agent = self._silence.repeat(rows, 1)
         # Newest first: [:, 0] is the frame being appended, [:, 1] and [:, 2]
         # the two before it.
-        self._user_history = self._sine.repeat(slots, 3, 1)
-        # One extra neutral row for requests of a superseded epoch.
-        self._teacher_tokens = self._silence.repeat(slots + 1, 2)
-        self._teacher_provided = torch.zeros((slots + 1, 16), dtype=torch.bool, device=device)
+        self._user_history = self._sine.repeat(rows, 3, 1)
+        # The scratch row stays neutral: requests of a superseded epoch and
+        # padding rows read it.
+        self._teacher_tokens = self._silence.repeat(rows, 2)
+        self._teacher_provided = torch.zeros((rows, 16), dtype=torch.bool, device=device)
         self._live_provided = torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool, device=device)
         self._slot_device = device
         return device
@@ -603,8 +655,10 @@ class PersonaPlexStage0DuplexRuntime:
         Built with the weights, its checkpoint read stays off the first
         session's step and vLLM's memory profiling sees its weights, streaming
         state and graph pool. ``cuda_graph`` replays each step's encode from a
-        CUDA graph over all ``max_sessions`` rows.
+        CUDA graph over all ``max_sessions`` rows. The per-slot frame state is
+        allocated here too, before any graph captures its addresses.
         """
+        self._slot_buffers()
         codec = self._shared_codec()
         if cuda_graph:
             codec.capture_encode_graph()

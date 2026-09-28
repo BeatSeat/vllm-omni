@@ -29,6 +29,7 @@ encode of the input WAV (built in ``preprocess``); live duplex is Phase 2.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import Any
 
@@ -46,18 +47,38 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
     PersonaPlexConfig,
+    PersonaPlexDepformerConfig,
 )
 from vllm_omni.model_executor.models.personaplex.modeling_helium import HeliumModel
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
     PersonaPlexDepformer,
 )
+from vllm_omni.model_executor.models.personaplex.personaplex_depformer_graph import (
+    PersonaPlexDepformerGraphs,
+    depformer_graph_buckets,
+)
 from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
     PersonaPlexInputEmbeddings,
 )
 
-__all__ = ["PersonaPlexTalkerForConditionalGeneration"]
+__all__ = ["PersonaPlexTalkerForConditionalGeneration", "serving_depformer_config"]
 
 logger = init_logger(__name__)
+
+
+def serving_depformer_config(config: PersonaPlexDepformerConfig, session_mode: str) -> PersonaPlexDepformerConfig:
+    """The depformer config a talker serving ``session_mode`` builds.
+
+    Duplex draws only the vocoded agent codebooks (``num_active_codebooks``
+    steps), and the depformer is causal over its steps, so the weight sets of
+    the later steps (the user-codebook steps, about 1.3 GB in bf16) are never
+    read there and are not built.
+    """
+    if session_mode != "duplex" or config.dep_q <= config.num_active_codebooks:
+        return config
+    config = copy.deepcopy(config)
+    config.dep_q = config.num_active_codebooks
+    return config
 
 
 class PersonaPlexTalkerForConditionalGeneration(nn.Module):
@@ -97,11 +118,12 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.text_vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        session_mode = getattr(vllm_config.model_config, "session_mode", "turn")
 
         # Verified custom components: embed_codes + depformer.
         self.input_embeddings = PersonaPlexInputEmbeddings(config)
         self.depformer = PersonaPlexDepformer(
-            config.depformer_config,
+            serving_depformer_config(config.depformer_config, session_mode),
             temporal_hidden_size=hidden,
             text_card=config.text_vocab_size,
         )
@@ -116,8 +138,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = hidden
         self.talker_mtp_output_key = ("codes", "audio")
         # dep_q audio codebooks per frame; only cb 0..num_active are vocoded.
-        self.dep_q = config.depformer_config.dep_q
+        self.dep_q = self.depformer.dep_q
         self.num_active_codebooks = config.depformer_config.num_active_codebooks
+        # Duplex post-sample depformer steps, replayed from CUDA graphs when
+        # ``depformer_cuda_graphs`` is set (built in load_weights).
+        self._depformer_graphs: PersonaPlexDepformerGraphs | None = None
 
     # ------------------------------------------------------------------
     # Core forward / logits
@@ -572,6 +597,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             raise ValueError(f"PersonaPlex depformer request ids do not match batch: {len(req_ids)} != {bsz}")
         text_token = input_ids.reshape(bsz).to(torch.long)
         hidden = hidden_states.reshape(bsz, 1, -1).to(self._dtype)
+        graphs = getattr(self, "_depformer_graphs", None)
+        if graphs is not None:
+            # Teacher-forcing gather, depformer and frame-state commit in one
+            # replay; the codes come back on the host.
+            return graphs.run(req_ids, text_token, hidden)
         runtime = self._duplex_stage0_runtime()
         audio_tokens, audio_provided = runtime.depformer_teacher_forcing(req_ids)
         codes = self.depformer(
@@ -599,7 +629,8 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         * ``emb.*`` / ``text_emb.weight`` -> input embeddings.
         * ``depformer*`` / ``linears.*`` -> depformer.
 
-        A duplex deploy also builds the Stage 0 streaming Mimi encoder here.
+        A duplex deploy also builds the Stage 0 streaming Mimi encoder here and,
+        with ``depformer_cuda_graphs``, captures the depformer step graphs.
         """
         weights = list(weights)
         params = dict(self.named_parameters(remove_duplicate=False))
@@ -623,8 +654,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             for tgt in module.load_weights(sub_w):
                 loaded.add(f"{sub}.{tgt}")
         if getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
-            self._duplex_stage0_runtime().load_encoder(cuda_graph=bool(getattr(self.config, "mimi_cuda_graphs", False)))
+            runtime = self._duplex_stage0_runtime()
+            runtime.load_encoder(cuda_graph=bool(getattr(self.config, "mimi_cuda_graphs", False)))
             self._warm_duplex_prefill()
+            if getattr(self.config, "depformer_cuda_graphs", False):
+                self._depformer_graphs = self._build_depformer_graphs(runtime)
         return loaded
 
     def _warm_duplex_prefill(self) -> None:
@@ -639,6 +673,26 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             logger.warning(
                 "PersonaPlex could not warm the default voice prefill; it is built on first use", exc_info=True
             )
+
+    def _build_depformer_graphs(self, runtime: Any) -> PersonaPlexDepformerGraphs:
+        """Capture the duplex depformer step at vLLM's padded batch sizes."""
+        scheduler_config = self.vllm_config.scheduler_config
+        compilation_config = self.vllm_config.compilation_config
+        buckets = depformer_graph_buckets(
+            getattr(compilation_config, "cudagraph_capture_sizes", None),
+            int(scheduler_config.max_num_seqs),
+        )
+        graphs = PersonaPlexDepformerGraphs(
+            self.depformer,
+            runtime,
+            buckets=buckets,
+            num_steps=self.num_active_codebooks,
+            hidden_size=self.mtp_hidden_size,
+            dtype=self._dtype,
+            device=next(self.parameters()).device,
+        )
+        graphs.capture()
+        return graphs
 
     def _load_temporal(
         self,

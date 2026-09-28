@@ -207,6 +207,10 @@ class PersonaPlexConfig(PretrainedConfig):
             Replay the streaming Mimi codec from model-local CUDA graphs. Set
             per stage through ``hf_overrides``; independent of ``enforce_eager``,
             which only governs vLLM's own graphs.
+        depformer_cuda_graphs (`bool`, *optional*, defaults to `False`):
+            Replay the duplex post-sample depformer step (teacher-forcing gather,
+            depformer, frame-state commit) from model-local CUDA graphs at vLLM's
+            cudagraph capture sizes. Set per stage through ``hf_overrides``.
     """
 
     model_type = "personaplex"
@@ -227,6 +231,7 @@ class PersonaPlexConfig(PretrainedConfig):
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
         mimi_cuda_graphs: bool = False,
+        depformer_cuda_graphs: bool = False,
         **kwargs: Any,
     ) -> None:
         if temporal_config is None:
@@ -263,6 +268,7 @@ class PersonaPlexConfig(PretrainedConfig):
             self.mimi_config.mimi_name = mimi_name
         self.mimi_name = self.mimi_config.mimi_name
         self.mimi_cuda_graphs = mimi_cuda_graphs
+        self.depformer_cuda_graphs = depformer_cuda_graphs
 
     @staticmethod
     def _coerce(value: Any, config_cls: type[PretrainedConfig]) -> PretrainedConfig:

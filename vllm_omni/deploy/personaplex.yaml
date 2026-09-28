@@ -52,6 +52,10 @@ stages:
     # Temporal transformer sliding_window is 3000 frames; keep model len within.
     max_model_len: 3000
     devices: "0"
+    # Replay each step's streaming Mimi encode (all max_sessions rows) from a
+    # model-local CUDA graph captured at load.
+    hf_overrides:
+      mimi_cuda_graphs: true
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:

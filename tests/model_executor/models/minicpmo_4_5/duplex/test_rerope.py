@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""A/B Correctness Regression Suite for MiniCPM-o 4.5 Stage-0 KV Window:
+"""Re-RoPE Correctness Regression Suite for MiniCPM-o 4.5 Stage-0 KV Window:
 
 Compares in-place Re-RoPE + Block-Table Compaction against clean re-prefill ground truth:
 1. Retained K after Re-RoPE vs. K from clean re-prefill (FP32 & BF16).

@@ -18,41 +18,31 @@ from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class _FakeStreamingMimi(nn.Module):
-    def __init__(self, stream_value: int = 0) -> None:
-        super().__init__()
-        self.stream_value = stream_value
-        self.decode_frame_calls = 0
-        self.reset_calls = 0
+class _FakeBatchedMimi(nn.Module):
+    """Shared streaming decoder: row ``r``'s ``n``-th decoded frame is 4 samples of ``100 * r + n``."""
 
-    def decode(self, codes: torch.Tensor, return_dict: bool = True):
-        assert return_dict
-        frames = int(codes.shape[-1])
-        return SimpleNamespace(audio_values=torch.arange(frames * 4, dtype=torch.float32).reshape(1, 1, -1))
-
-    def streaming_init(self, batch_size: int) -> None:
-        assert batch_size == 1
-
-    def decode_frame(self, codes: torch.Tensor) -> torch.Tensor:
-        assert codes.shape == (1, 2)
-        self.decode_frame_calls += 1
-        value = self.stream_value + self.decode_frame_calls
-        return torch.full((1, 4), float(value), dtype=torch.float32)
-
-    def reset_streaming(self) -> None:
-        self.reset_calls += 1
-
-
-class _FakeChunkedMimi(_FakeStreamingMimi):
     def __init__(self) -> None:
         super().__init__()
-        self.decode_frames_calls = 0
-        self.decode_frames_shapes: list[tuple[int, ...]] = []
+        self.frames: torch.Tensor | None = None
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.reset_rows: list[int] = []
 
-    def decode_frames(self, codes: torch.Tensor) -> torch.Tensor:
-        self.decode_frames_calls += 1
-        self.decode_frames_shapes.append(tuple(codes.shape))
-        return torch.arange(codes.shape[-1] * 4, dtype=torch.float32).reshape(1, -1)
+    def streaming_init(self, batch_size: int) -> None:
+        self.frames = torch.zeros(batch_size)
+
+    def decode_frame(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        assert self.frames is not None
+        assert codes.shape == (self.frames.shape[0], 2)
+        assert active.shape == self.frames.shape
+        self.calls.append((codes.clone(), active.clone()))
+        self.frames += active
+        rows = torch.arange(self.frames.shape[0], dtype=torch.float32)
+        return (100 * rows + self.frames)[:, None].expand(-1, 4).clone()
+
+    def reset_slot(self, row: int) -> None:
+        assert self.frames is not None
+        self.frames[row] = 0
+        self.reset_rows.append(row)
 
 
 class _FakeMimiModel(nn.Module):
@@ -182,9 +172,11 @@ def test_mimi_full_stream_reset_reuses_all_state_storage_and_clears_offsets() ->
     assert all(state._fresh.all() for state in conv_states)
 
 
-def _model(*, max_sessions: int = 1) -> tuple[PersonaPlexCode2Wav, _FakeStreamingMimi]:
+def _model(
+    *, max_sessions: int = 1, install: bool = True, cuda_graphs: bool = False
+) -> tuple[PersonaPlexCode2Wav, _FakeBatchedMimi]:
     mimi_config = SimpleNamespace(num_codebooks=2, sample_rate=24000, samples_per_frame=4, mimi_name=None)
-    config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None)
+    config = SimpleNamespace(mimi_config=mimi_config, mimi_name=None, mimi_cuda_graphs=cuda_graphs)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="/unused",
@@ -194,9 +186,9 @@ def _model(*, max_sessions: int = 1) -> tuple[PersonaPlexCode2Wav, _FakeStreamin
         device_config=SimpleNamespace(device="cpu"),
     )
     model = PersonaPlexCode2Wav(vllm_config=vllm_config)
-    mimi = _FakeStreamingMimi()
-    model.mimi = mimi
-    model._mimi_device = torch.device("cpu")
+    mimi = _FakeBatchedMimi()
+    if install:
+        model._install_mimi(mimi, torch.device("cpu"))
     return model, mimi
 
 
@@ -208,6 +200,50 @@ def _audio(output) -> torch.Tensor:
     return output.multimodal_outputs["model_outputs"][0]
 
 
+def _audios(output) -> list[list[float]]:
+    return [audio.tolist() for audio in output.multimodal_outputs["model_outputs"]]
+
+
+def _pcm(*values: float) -> list[float]:
+    """Fake PCM of consecutive decoded frames (4 samples each)."""
+    return [float(value) for value in values for _ in range(4)]
+
+
+def _actives(mimi: _FakeBatchedMimi) -> list[list[bool]]:
+    return [active.tolist() for _, active in mimi.calls]
+
+
+@pytest.mark.parametrize("cuda_graphs", [False, True])
+def test_load_weights_builds_one_shared_decoder_with_a_row_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_graphs: bool,
+) -> None:
+    built: list[_FakeBatchedMimi] = []
+
+    class _Codec(_FakeBatchedMimi):
+        def __init__(self, checkpoint: str | None, device: str) -> None:
+            super().__init__()
+            self.model = SimpleNamespace(config=SimpleNamespace(sampling_rate=24000))
+            self.captured_rows: list[int] = []
+            built.append(self)
+
+        def capture_decode_graph(self) -> bool:
+            # The graph is captured over the streaming rows, so they must exist.
+            assert self.frames is not None
+            self.captured_rows.append(self.frames.shape[0])
+            return True
+
+    monkeypatch.setattr(personaplex_mimi, "PersonaPlexMimiCodec", _Codec)
+    model, _ = _model(max_sessions=3, install=False, cuda_graphs=cuda_graphs)
+
+    model.load_weights(iter([("unused.weight", torch.zeros(1))]))
+
+    # Three session rows plus the scratch row, allocated before the first request.
+    assert built[0].frames is not None and built[0].frames.shape == (4,)
+    # Only mimi_cuda_graphs decides the decode graph; Stage 1 stays enforce_eager.
+    assert built[0].captured_rows == ([4] if cuda_graphs else [])
+
+
 @pytest.mark.parametrize("second_codes", [_codes(3), _codes(1, start=100)])
 def test_resumable_codes_emit_only_new_pcm(second_codes: torch.Tensor) -> None:
     model, mimi = _model()
@@ -215,31 +251,23 @@ def test_resumable_codes_emit_only_new_pcm(second_codes: torch.Tensor) -> None:
     first = model(input_ids=_codes(2), request_ids=["req"])
     second = model(input_ids=second_codes, request_ids=["req"])
 
-    assert _audio(first).numel() == 8
-    assert _audio(second).numel() == 4
-    assert mimi.decode_frame_calls == 3
+    assert _audio(first).tolist() == _pcm(1, 2)
+    assert _audio(second).tolist() == _pcm(3)
+    assert len(mimi.calls) == 3
 
 
-@pytest.mark.parametrize(
-    ("frames", "expected_shapes"),
-    [
-        (5, [(1, 2, 5)]),
-        (12, [(1, 2, 5), (1, 2, 5), (1, 2, 2)]),
-    ],
-)
-def test_streaming_decode_uses_bounded_multi_frame_calls(
-    frames: int,
-    expected_shapes: list[tuple[int, ...]],
-) -> None:
-    model, _ = _model()
-    mimi = _FakeChunkedMimi()
-    model.mimi = mimi
+@pytest.mark.parametrize("frames", [5, 12])
+def test_each_frame_is_one_decoder_call_across_all_rows(frames: int) -> None:
+    model, mimi = _model()
 
     output = model(input_ids=_codes(frames), request_ids=["req"])
 
-    assert _audio(output).numel() == frames * 4
-    assert mimi.decode_frames_shapes == expected_shapes
-    assert mimi.decode_frame_calls == 0
+    assert _audio(output).tolist() == _pcm(*range(1, frames + 1))
+    assert len(mimi.calls) == frames
+    for frame, (codes, active) in enumerate(mimi.calls):
+        # Row 0 is the request's leased row; row 1 is the idle scratch row.
+        assert codes[0].tolist() == [frame, 100 + frame]
+        assert active.tolist() == [True, False]
 
 
 def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
@@ -256,13 +284,13 @@ def test_profile_inputs_skip_decode_while_malformed_online_input_warns(
     )
 
     assert _audio(output).numel() == 0
-    assert mimi.decode_frame_calls == 0
+    assert mimi.calls == []
     assert warnings == []
 
     output = model(input_ids=torch.arange(3))
 
     assert _audio(output).numel() == 0
-    assert mimi.decode_frame_calls == 0
+    assert mimi.calls == []
     assert len(warnings) == 1
     assert "not divisible by" in warnings[0][0]
     assert model.get_dummy_runtime_additional_information(2) == [
@@ -278,15 +306,11 @@ def test_request_id_falls_back_to_runtime_information() -> None:
     model(input_ids=_codes(2), runtime_additional_information=info)
     second = model(input_ids=_codes(3), runtime_additional_information=info)
 
-    assert _audio(second).numel() == 4
+    assert _audio(second).tolist() == _pcm(3)
 
 
-def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:
-    model, _ = _model(max_sessions=2)
-    first = _FakeStreamingMimi(stream_value=10)
-    second = _FakeStreamingMimi(stream_value=20)
-    model._set_mimi_codecs([first, second])
-    assert model._max_codec_sessions == 2
+def test_rows_are_leased_per_request_isolated_and_recycled() -> None:
+    model, mimi = _model(max_sessions=2)
 
     initial = model(
         input_ids=torch.cat([_codes(1), _codes(1)]),
@@ -299,18 +323,58 @@ def test_decoder_slot_lifecycle_isolated_capacity_and_reuse() -> None:
         seq_token_counts=[2, 2],
     )
 
-    initial_audio = initial.multimodal_outputs["model_outputs"]
-    continued_audio = continued.multimodal_outputs["model_outputs"]
-    assert initial_audio[0].tolist() == [11.0] * 4
-    assert initial_audio[1].tolist() == [21.0] * 4
-    assert continued_audio[0].tolist() == [12.0] * 4
-    assert continued_audio[1].tolist() == [22.0] * 4
-    assert model._request_codec_slots == {"first": 0, "second": 1}
+    assert _audios(initial) == [_pcm(1), _pcm(101)]
+    assert _audios(continued) == [_pcm(2), _pcm(102)]
+    assert model._request_rows == {"first": 0, "second": 1}
     with pytest.raises(RuntimeError, match="decoder capacity 2 is exhausted"):
-        model._codec_for_request("overflow")
+        model(input_ids=_codes(1), request_ids=["overflow"])
 
     model.on_requests_finished(["first"])
-    assert first.reset_calls == 1
-    assert second.reset_calls == 0
-    replacement = model(input_ids=_codes(1), request_ids=["replacement"])
-    assert _audio(replacement).tolist() == [13.0] * 4
+    assert mimi.reset_rows == [0]
+    assert "first" not in model._request_codes
+
+    replacement = model(
+        input_ids=torch.cat([_codes(1), _codes(1, start=30)]),
+        request_ids=["replacement", "second"],
+        seq_token_counts=[2, 2],
+    )
+    # The recycled row restarts its stream; the other session carries on.
+    assert _audios(replacement) == [_pcm(1), _pcm(103)]
+    assert model._request_rows == {"second": 1, "replacement": 0}
+
+
+def test_requests_without_id_use_the_scratch_row_one_pass_each() -> None:
+    model, _ = _model(max_sessions=1)
+
+    output = model(
+        input_ids=torch.cat([_codes(1), _codes(2), _codes(1)]),
+        runtime_additional_information=[{"request_id": "leased"}, {}, {}],
+        seq_token_counts=[2, 4, 2],
+    )
+
+    # Row 1 is scratch and is reset after every pass, so each id-less request
+    # decodes as a fresh stream and never touches the leased row.
+    assert _audios(output) == [_pcm(1), _pcm(101, 102), _pcm(101)]
+    assert model._request_rows == {"leased": 0}
+
+    continued = model(input_ids=_codes(1, start=10), request_ids=["leased"])
+
+    assert _audio(continued).tolist() == _pcm(2)
+
+
+def test_mixed_frame_counts_route_pcm_and_advance_only_active_rows() -> None:
+    model, mimi = _model(max_sessions=2)
+
+    output = model(
+        input_ids=torch.cat([_codes(3), _codes(1, start=50)]),
+        request_ids=["long", "short"],
+        seq_token_counts=[6, 2],
+    )
+
+    long_audio, short_audio = output.multimodal_outputs["model_outputs"]
+    assert long_audio.tolist() == _pcm(1, 2, 3)
+    assert short_audio.tolist() == _pcm(101)
+    assert all(audio.ndim == 1 and audio.is_contiguous() for audio in (long_audio, short_audio))
+    assert _actives(mimi) == [[True, True, False], [True, False, False], [True, False, False]]
+    assert mimi.calls[0][0][:2].tolist() == [[0, 100], [50, 150]]
+    assert mimi.frames is not None and mimi.frames.tolist() == [3.0, 1.0, 0.0]

@@ -490,21 +490,39 @@ class PersonaPlexStage0DuplexRuntime:
             state.encoded_frame = codes[state.slot : state.slot + 1, :8].clone()
             state.encoded_identity = identity
 
+    def load_encoder(self, *, cuda_graph: bool = False) -> None:
+        """Build the shared encoder at model load instead of on the first append.
+
+        Built with the weights, its checkpoint read stays off the first
+        session's step and vLLM's memory profiling sees its weights, streaming
+        state and graph pool. ``cuda_graph`` replays each step's encode from a
+        CUDA graph over all ``max_sessions`` rows.
+        """
+        codec = self._shared_codec()
+        if cuda_graph:
+            codec.capture_encode_graph()
+
     def _shared_codec(self):
         if self._codec is not None:
             return self._codec
         if self._codec_factory is not None:
             codec = self._codec_factory()
         else:
+            import torch
+            from vllm.utils.torch_utils import set_default_torch_dtype
+
             from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
                 PersonaPlexMimiCodec,
             )
 
             checkpoint = Path(self.model_path) / "tokenizer-e351c8d8-checkpoint125.safetensors"
-            codec = PersonaPlexMimiCodec(
-                checkpoint=str(checkpoint) if checkpoint.is_file() else None,
-                device=self.device,
-            )
+            # The encoder runs in fp32. vLLM loads weights with the model dtype
+            # as the default, which would otherwise build it in bf16.
+            with set_default_torch_dtype(torch.float32):
+                codec = PersonaPlexMimiCodec(
+                    checkpoint=str(checkpoint) if checkpoint.is_file() else None,
+                    device=self.device,
+                )
         codec.streaming_init(self.max_sessions)
         self._codec = codec
         return codec

@@ -600,6 +600,8 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         * ``text_linear.weight`` -> ``lm_head``.
         * ``emb.*`` / ``text_emb.weight`` -> input embeddings.
         * ``depformer*`` / ``linears.*`` -> depformer.
+
+        A duplex deploy also builds the Stage 0 streaming Mimi encoder here.
         """
         weights = list(weights)
         params = dict(self.named_parameters(remove_duplicate=False))
@@ -622,6 +624,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             module = getattr(self, sub)
             for tgt in module.load_weights(sub_w):
                 loaded.add(f"{sub}.{tgt}")
+
+        if getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
+            self._duplex_stage0_runtime().load_encoder(cuda_graph=bool(getattr(self.config, "mimi_cuda_graphs", False)))
         return loaded
 
     def _load_temporal(

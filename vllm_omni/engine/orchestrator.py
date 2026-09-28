@@ -153,9 +153,13 @@ def build_engine_core_request_from_tokens(
     sampling_params = None
     pooling_params = None
     if isinstance(params, SamplingParams):
-        sampling_params = params.clone()
+        # Clone (a deep copy, built per appended chunk) only to adjust a field;
+        # the request is serialized to the stage and nothing mutates its params.
+        sampling_params = params
         if model_config is not None:
             remaining = model_config.max_model_len - len(prompt_token_ids)
+            if params.max_tokens is None or params.min_tokens > remaining:
+                sampling_params = params.clone()
             if sampling_params.max_tokens is None:
                 sampling_params.max_tokens = remaining
             # ``check_stop`` returns early while ``min_tokens`` is unmet, so a

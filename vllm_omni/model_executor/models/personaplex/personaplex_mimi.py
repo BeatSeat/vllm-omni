@@ -29,18 +29,25 @@ codec composes with elastic slot recycling in batched duplex serving.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
     _apply_rope,
     _RingKV,
 )
 
+logger = init_logger(__name__)
+
 DEFAULT_HF_REPO = "kyutai/mimi"
 FRAME_SIZE = 1920
 CODEBOOKS = 8
+_GRAPH_WARMUP_ITERS = 2
 
 
 def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
@@ -107,6 +114,8 @@ class _StreamConv1d:
     ``pad_mode`` controls the stream-start left padding: SEANet convs use zeros
     (``constant``); the down/upsample resamplers use ``replicate`` (the first
     real sample), marked per row so elastic slot recycling re-primes correctly.
+
+    The carry and the fresh-row flags are updated in place, so CUDA graph replays advance them.
     """
 
     def __init__(self, conv: nn.Conv1d, pad_mode: str = "constant") -> None:
@@ -126,18 +135,22 @@ class _StreamConv1d:
         self.prev[b].zero_()
         self._fresh[b] = True
 
+    def reset_all_slots(self) -> None:
+        self.prev.zero_()
+        self._fresh.fill_(True)
+
     def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         if self.pad_mode == "replicate":
             pad = self.prev.shape[-1]
             edge = x[..., 0:1].expand(-1, -1, pad)
             fresh = (self._fresh & active).view(-1, 1, 1)
-            self.prev = torch.where(fresh, edge.to(self.prev.dtype), self.prev)
-        self._fresh[active] = False
+            self.prev.copy_(torch.where(fresh, edge.to(self.prev.dtype), self.prev))
+        self._fresh.logical_and_(~active)
         x = torch.cat([self.prev, x], dim=-1)
         t = x.shape[-1]
         num_frames = max(0, (t - self.kernel) // self.stride + 1)
         prev = x[..., num_frames * self.stride :]
-        self.prev = torch.where(active.view(-1, 1, 1), prev, self.prev)
+        self.prev.copy_(torch.where(active.view(-1, 1, 1), prev, self.prev))
         if num_frames == 0:
             return x.new_zeros(x.shape[0], self.conv.out_channels, 0)
         return self.conv(x[..., : (num_frames - 1) * self.stride + self.kernel])
@@ -163,22 +176,25 @@ class _StreamConvTr1d:
         self.partial[b].zero_()
         self._fresh[b] = True
 
+    def reset_all_slots(self) -> None:
+        self.partial.zero_()
+        self._fresh.fill_(True)
+
     def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         out = self.conv(x)
         length = out.shape[-1]
         tail = self.kernel - self.stride
         pt = self.partial.shape[-1]
-        merge = self.partial.clone()
+        merge = self.partial
         if self.conv.bias is not None:
             # The carried tail already includes the bias; the fresh output adds
             # it again, so subtract one copy -- except on a row's very first
             # frame, where the carry is zeros by construction.
-            merge = merge - self.conv.bias[:, None]
-            merge[self._fresh & active] = 0.0
-            self._fresh[active] = False
+            fresh = (self._fresh & active).view(-1, 1, 1)
+            merge = torch.where(fresh, 0.0, merge - self.conv.bias[:, None])
+            self._fresh.logical_and_(~active)
         out[..., :pt] += merge
-        partial = out[..., length - tail :].clone()
-        self.partial = torch.where(active.view(-1, 1, 1), partial, self.partial)
+        self.partial.copy_(torch.where(active.view(-1, 1, 1), out[..., length - tail :], self.partial))
         return out[..., : length - tail]
 
 
@@ -309,6 +325,22 @@ def _walk_seanet(layers) -> list[tuple[str, object]]:
     return stages
 
 
+@dataclass
+class _CodecGraph:
+    """One codec call over every streaming row, captured into a CUDA graph."""
+
+    graph: torch.cuda.CUDAGraph
+    inputs: torch.Tensor
+    active: torch.Tensor
+    output: torch.Tensor
+
+    def replay(self, inputs: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        self.inputs.copy_(inputs.reshape(self.inputs.shape))
+        self.active.copy_(active)
+        self.graph.replay()
+        return self.output.clone()
+
+
 class PersonaPlexMimiCodec(nn.Module):
     """Streaming Mimi encode/decode at one 80 ms frame per call (moshi-free)."""
 
@@ -366,6 +398,7 @@ class PersonaPlexMimiCodec(nn.Module):
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
         self._all_active: torch.Tensor
+        self._encode_graph: _CodecGraph | None = None
 
     # -- streaming state ------------------------------------------------------
 
@@ -380,6 +413,8 @@ class PersonaPlexMimiCodec(nn.Module):
         yield self._upsample
 
     def streaming_init(self, batch_size: int) -> None:
+        # New state buffers invalidate a graph captured over the old ones.
+        self._encode_graph = None
         self._batch_size = batch_size
         self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
@@ -390,8 +425,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def reset_streaming(self) -> None:
         assert self._batch_size is not None
         for state in self._conv_states():
-            for b in range(self._batch_size):
-                state.reset_slot(b)
+            state.reset_all_slots()
         self.encoder_transformer.reset_streaming()
         self.decoder_transformer.reset_streaming()
 
@@ -413,11 +447,71 @@ class PersonaPlexMimiCodec(nn.Module):
                 x = stage(x, active) if kind in {"conv", "convtr"} else stage(x)
         return x
 
+    # -- CUDA graphs ------------------------------------------------------------
+
+    @torch.no_grad()
+    def _capture(
+        self,
+        kind: str,
+        run: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> _CodecGraph | None:
+        """Capture ``run(inputs, active)`` over every streaming row; None (run eagerly) off CUDA or on failure.
+
+        Warmup advances every row's streaming state, so all rows are reset
+        afterwards; the graph keeps the addresses of the state buffers, which
+        are only ever updated in place.
+        """
+        if self._batch_size is None:
+            raise RuntimeError("PersonaPlex Mimi streaming_init must run before capturing a graph")
+        if self.device.type != "cuda":
+            return None
+        inputs = torch.zeros(self._batch_size, *shape, device=self.device, dtype=dtype)
+        active = torch.ones_like(self._all_active)
+        try:
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(_GRAPH_WARMUP_ITERS):
+                    run(inputs, active)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            # A private pool: the codec replays between the stage's other
+            # graphs in an order unrelated to their capture order.
+            with torch.cuda.graph(
+                graph,
+                pool=torch.cuda.graph_pool_handle(),
+                capture_error_mode="thread_local",
+            ):
+                output = run(inputs, active)
+        except Exception:
+            logger.warning("PersonaPlex Mimi CUDA graph capture failed; the codec runs eagerly", exc_info=True)
+            return None
+        finally:
+            self.reset_streaming()
+        logger.info("Captured the PersonaPlex Mimi %s CUDA graph for %d streaming rows", kind, self._batch_size)
+        return _CodecGraph(graph=graph, inputs=inputs, active=active, output=output)
+
+    def capture_encode_graph(self) -> bool:
+        """Replay full-batch ``encode_frame`` calls from a CUDA graph; returns whether one is in use."""
+        if self._encode_graph is None:
+            self._encode_graph = self._capture("encoder", self._encode_frame, (FRAME_SIZE,), self.dtype)
+        return self._encode_graph is not None
+
+    # -- per-frame codec -------------------------------------------------------
+
     @torch.no_grad()
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
-        x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
         active = _normalize_active(active, self._all_active)
+        graph = self._encode_graph
+        if graph is not None and pcm.shape[0] == self._batch_size and not torch.cuda.is_current_stream_capturing():
+            return graph.replay(pcm, active)
+        return self._encode_frame(pcm, active)
+
+    def _encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
         x = self._run_stages(x, self._enc_stages, active)
         x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
         x = self._downsample(x, active)

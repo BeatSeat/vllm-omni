@@ -10,8 +10,9 @@
 #     first-chunk latency (not correctness).
 #   * Stage 1 (code2wav) wraps the external Mimi codec. Each codec frame is
 #     8 active codebooks (cb 0..7) -> 1920 PCM samples @ 24 kHz / 12.5 Hz.
-#   * Stage 0 runs cudagraph by default; Stage 1 (Mimi) is eager because the
-#     external decoder performs host-to-device copies that cannot be captured.
+#   * Stage 0 runs cudagraph by default. Stage 1 (Mimi) keeps enforce_eager,
+#     since vLLM's own capture records nothing for it; both stages replay their
+#     streaming Mimi codec from model-local CUDA graphs (mimi_cuda_graphs).
 #   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
 #     To serve more sessions, raise duplex_session.max_sessions and both stages'
 #     max_num_seqs together (Stage 0's to a cudagraph capture size, e.g. a
@@ -29,7 +30,9 @@ connectors:
     name: SharedMemoryConnector
     extra:
       codec_streaming: true
-      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk.
+      # Mimi runs at 12.5 Hz (80 ms / frame). Stream a few frames per chunk:
+      # at 16 sessions, 1-frame chunks spend more on per-chunk transfer and
+      # scheduling than the shared decode saves.
       codec_chunk_frames: 5
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
@@ -87,6 +90,10 @@ stages:
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
+    # Replay each frame's streaming Mimi decode (all sessions plus a scratch
+    # row) from a model-local CUDA graph captured at load.
+    hf_overrides:
+      mimi_cuda_graphs: true
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:

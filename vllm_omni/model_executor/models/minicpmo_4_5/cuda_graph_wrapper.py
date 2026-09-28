@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from collections import Counter
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -391,6 +392,30 @@ def _whole_euler_att_segments(
     return merged
 
 
+def _resized_frame_view(cache: torch.Tensor, frames: int) -> torch.Tensor | None:
+    """``cache`` (..., L, width) as ``frames`` frames of its own allocation, or ``None`` when it has no room.
+
+    Only a view of the first frames of a whole contiguous allocation
+    qualifies, as ``WholeEulerCFMGraphWrapper.replay`` hands out: a cache
+    allocated for its steady length then grows into it without a second copy.
+    """
+    width = int(cache.shape[-1])
+    room = cache.stride(-3) // max(width, 1)
+    full = (*cache.shape[:-2], room, width)
+    strides, step = [], 1
+    for size in reversed(full):
+        strides.append(step)
+        step *= size
+    if (
+        room < frames
+        or cache.stride() != tuple(reversed(strides))
+        or cache.storage_offset() != 0
+        or cache.untyped_storage().nbytes() != step * cache.element_size()
+    ):
+        return None
+    return cache.as_strided((*cache.shape[:-2], frames, width), cache.stride())
+
+
 def _copy_frame_segments(dst: torch.Tensor, src: torch.Tensor, segments: list[tuple[int, int]]) -> None:
     """Write ``src[..., start:start + length, :]`` segments back to back into ``dst``'s frame axis."""
     position = 0
@@ -646,13 +671,15 @@ class WholeEulerExecutionArena:
     size. The attention caches dominate the arena (timesteps x depth x CFG x
     heads x frames, ~1.25 MiB per frame per request in fp32 on the shipped
     DiT), so there is exactly one attention cache storage: every graph, of
-    every batch size and offset, takes a ``[:2B, ..., :frames]`` prefix view
-    of it, and a graph's input and output caches are the same view. Graphs
-    replay one at a time on one stream and refill their inputs first, so the
-    sharing across graphs is safe; within a graph each DiT block concatenates
-    the cache it reads (``torch.cat([k, k_cache])``) before writing the new
-    one back, so reading and writing one view is too. Separate per-offset,
-    per-batch or input/output storages each held another full copy.
+    every batch size and offset, takes a ``[:2B, ..., :frames]`` view of it.
+    A graph's output cache is ``[current(query_cap) | cache(offset)]`` and its
+    input cache is the ``cache`` part of that same view, so a block that
+    attends over its output in place (``_attend_in_place``) finds the cache
+    already there; upstream's block concatenates the cache it reads
+    (``torch.cat([k, k_cache])``) before writing it back, which is safe on
+    that aliasing too. Graphs replay one at a time on one stream and refill
+    their inputs first, so the sharing across graphs is safe. Separate
+    per-offset, per-batch or input/output storages each held another full copy.
     Small shape-keyed buffers (x, mu, cond, mask) stay per query width.
     """
 
@@ -774,12 +801,14 @@ class WholeEulerExecutionArena:
         return buf
 
     def att_cache_fits(self, batch_size: int, frames: int) -> bool:
-        """Whether ``att_cache_view(batch_size, frames)`` fits the current storage."""
+        """Whether a view of ``batch_size`` requests ending at frame ``frames`` fits the current storage."""
         storage = self._att
         return storage is not None and int(storage.shape[2]) >= 2 * batch_size and int(storage.shape[4]) >= frames
 
-    def att_cache_view(self, batch_size: int, frames: int, *, capacity: int = 0, rows: int = 0) -> torch.Tensor:
-        """``(n_t, depth, 2B, heads, frames, width)`` prefix view of the shared cache storage.
+    def att_cache_view(
+        self, batch_size: int, frames: int, *, start: int = 0, capacity: int = 0, rows: int = 0
+    ) -> torch.Tensor:
+        """``(n_t, depth, 2B, heads, frames, width)`` view of the shared cache storage from frame ``start``.
 
         ``capacity`` frames and ``rows`` requests are reserved up front. A
         larger request replaces the storage. Graphs captured on the old one
@@ -787,7 +816,9 @@ class WholeEulerExecutionArena:
         ``WholeEulerCFMGraphWrapper._capture`` flushes them first.
         """
         storage = self._att
-        if not self.att_cache_fits(batch_size, frames):
+        frames = int(frames)
+        end = int(start) + frames
+        if not self.att_cache_fits(batch_size, end):
             old_rows = 0 if storage is None else int(storage.shape[2]) // 2
             old_frames = 0 if storage is None else int(storage.shape[4])
             storage = torch.zeros(
@@ -795,13 +826,13 @@ class WholeEulerExecutionArena:
                 self.depth,
                 2 * max(int(batch_size), int(rows), old_rows),
                 self.heads,
-                _align_up(max(int(frames), int(capacity), old_frames, 1), self.capacity_align),
+                _align_up(max(end, int(capacity), old_frames, 1), self.capacity_align),
                 self.att_width,
                 device=self.device,
                 dtype=self.att_cache_dtype,
             )
             self._att = storage
-        return storage[:, :, : 2 * batch_size, :, :frames, :]
+        return storage[:, :, : 2 * batch_size, :, start:end, :]
 
     def get_mask_staging(self, batch_size: int, mel_width: int, total_len: int) -> torch.Tensor:
         key = (batch_size, mel_width, total_len)
@@ -1159,7 +1190,8 @@ class WholeEulerCFMGraphWrapper:
                 speakers_cfg=arena.get_speakers_staging(graph_batch, spk_dim),
                 cond_cfg=arena.get_cond_staging(graph_batch, channels, query_cap),
                 cnn_cache=arena.get_cnn_cache_in(graph_batch),
-                att_cache=arena.att_cache_view(graph_batch, offset, capacity=capacity, rows=rows),
+                # Right behind the current chunk in the output view below.
+                att_cache=arena.att_cache_view(graph_batch, offset, start=query_cap, capacity=capacity, rows=rows),
                 attn_mask=arena.get_mask_staging(graph_batch, query_cap, offset + query_cap),
                 time_embeddings=arena.get_time_embeddings(graph_batch),
                 lengths=arena.get_lengths_staging(graph_batch) if self.ragged_body is not None else None,
@@ -1243,6 +1275,26 @@ class WholeEulerCFMGraphWrapper:
             self._cache[key] = entry
         return entry
 
+    def _group_entries(self, groups: list[tuple[int, int]], fills: list, **entry_args) -> list[tuple] | None:
+        """Every group's graph, acquired before any of them replays.
+
+        A replay may update request caches in place, so no group may fall back
+        to eager after an earlier one ran. Capturing a later group can flush the
+        cache (``max_graphs``, arena growth) and retire an earlier group's
+        graph; the groups are then acquired once more, and fit this time.
+        """
+        for _ in range(2):
+            flushes = self._stats["flushes"]
+            entries = []
+            for (graph_batch, _), fill in zip(groups, fills, strict=True):
+                entry = self._entry(graph_batch=graph_batch, fill=fill, **entry_args)
+                if entry is None:
+                    return None
+                entries.append(entry)
+            if self._stats["flushes"] == flushes:
+                return entries
+        return None
+
     def replay(
         self,
         *,
@@ -1267,6 +1319,14 @@ class WholeEulerCFMGraphWrapper:
         caches move straight into and out of the arena and no stacked copy of
         the batch's cache is ever built. ``sum(att_keep)`` is also the steady
         cache length the arena reserves.
+
+        Request caches are updated in place: holding the old and new cache of
+        every request at once was the largest block of Stage-2 memory at high
+        concurrency (~7 GiB at 16 requests). A new one is allocated with room
+        for the steady length ``sum(att_keep)`` and returned as a view of its
+        first frames, so it also grows in place (``_resized_frame_view``). The
+        caller hands over those caches; a tensor shared by several rows (the
+        prompt state) is never written.
 
         ``valid_lengths`` (one per request; needs ``ragged_body``) solves rows
         of different lengths in one graph, as ``_decode_cfm`` does eagerly:
@@ -1355,6 +1415,7 @@ class WholeEulerCFMGraphWrapper:
         # (``pad_frames``) is then cleared. Otherwise every padded position is.
         cnn_pad = pad_frames if self.ragged_body is not None else query_cap - mel_frames
 
+        fills = []
         start = 0
         for graph_batch, rows in groups:
             stop = start + rows
@@ -1377,16 +1438,24 @@ class WholeEulerCFMGraphWrapper:
                     lengths=lengths,
                 )
 
-            entry = self._entry(
-                graph_batch=graph_batch,
-                query_cap=query_cap,
-                offset=offset,
-                x=x,
-                spk_dim=int(speakers_cfg.shape[1]),
-                fill=fill,
-            )
-            if entry is None:
-                return None
+            fills.append(fill)
+            start = stop
+        entries = self._group_entries(
+            groups,
+            fills,
+            query_cap=query_cap,
+            offset=offset,
+            x=x,
+            spk_dim=int(speakers_cfg.shape[1]),
+        )
+        if entries is None:
+            return None
+        owners = Counter(row.data_ptr() for row in att_rows) if att_rows is not None else Counter()
+        steady_frames = sum(att_keep) if att_keep is not None else 0
+
+        start = 0
+        for (graph_batch, rows), fill, entry in zip(groups, fills, entries, strict=True):
+            stop = start + rows
             statics, static_final_x, out_cnn_cache, out_att_cache, graph = entry
             fill(statics)
             graph.replay()
@@ -1406,18 +1475,25 @@ class WholeEulerCFMGraphWrapper:
             else:
                 for row in range(rows):
                     row_segments = segments_by_length[row_lengths[start + row]]
-                    request = torch.empty(
-                        (
-                            self.n_timesteps,
-                            arena.depth,
-                            2,
-                            arena.heads,
-                            sum(length for _, length in row_segments),
-                            arena.att_width,
-                        ),
-                        device=x.device,
-                        dtype=self.att_cache_dtype,
+                    shape = (
+                        self.n_timesteps,
+                        arena.depth,
+                        2,
+                        arena.heads,
+                        sum(length for _, length in row_segments),
+                        arena.att_width,
                     )
+                    # The row's old cache was copied into the arena by ``fill``.
+                    old = att_rows[start + row] if att_rows is not None else None
+                    request = None
+                    if old is not None and old.dtype == self.att_cache_dtype and owners[old.data_ptr()] == 1:
+                        request = _resized_frame_view(old, shape[4])
+                    if request is None:
+                        # Room for the steady length, so the cache grows into it in place.
+                        room = max(shape[4], steady_frames)
+                        request = torch.empty(
+                            (*shape[:4], room, shape[5]), device=x.device, dtype=self.att_cache_dtype
+                        )[..., : shape[4], :]
                     _copy_frame_segments(request, att_src[:, :, :, row], row_segments)
                     request_att.append(request)
             start = stop

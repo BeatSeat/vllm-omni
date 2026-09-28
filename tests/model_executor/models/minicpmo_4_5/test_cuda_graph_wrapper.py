@@ -2237,3 +2237,70 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.
         assert out_att[row].shape[4] == length + width
         torch.testing.assert_close(out_att[row], ref_att, rtol=1e-4, atol=1e-5)
     wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A request's cache is allocated once, with room for the steady length, then updated in place.
+
+    Both requests start from one shared prompt cache, which is never written.
+    Each chunk must match a solve whose input caches cannot be updated in place.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=_tiny_upstream_dit(),
+        n_timesteps=10,
+        max_graphs=8,
+        query_bucket_frames=8,
+        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
+    )
+    batch_size, width, keep = 2, 8, (8, 16)
+    _, _, prompt_att = wrapper.replay(**_whole_euler_chunk(1, width), cnn_cache=None, att_cache=None, att_keep=keep)
+    (shared,) = _split_cfg_rows(prompt_att, 1)
+    shared_before = shared.clone()
+
+    def fixed_copy(cache: torch.Tensor) -> torch.Tensor:
+        # Same values in another memory layout, which is never resized in place.
+        return cache.transpose(0, 1).contiguous().transpose(0, 1)
+
+    rows = [shared, shared]
+    storages: list[int] | None = None
+    for frames in (16, 24, 24):
+        chunk = _whole_euler_chunk(batch_size, width)
+        _, _, expected = wrapper.replay(
+            **chunk, cnn_cache=None, att_cache=[fixed_copy(row) for row in rows], att_keep=keep
+        )
+        _, _, rows = wrapper.replay(**chunk, cnn_cache=None, att_cache=rows, att_keep=keep)
+        for row, reference in zip(rows, expected, strict=True):
+            assert row.shape[4] == frames
+            assert torch.equal(row, reference)
+            assert row.untyped_storage().nbytes() == row[..., :1, :].numel() * sum(keep) * row.element_size()
+        if storages is None:
+            storages = [row.data_ptr() for row in rows]
+            assert shared.data_ptr() not in storages and len(set(storages)) == batch_size
+        else:
+            assert [row.data_ptr() for row in rows] == storages
+    assert torch.equal(shared, shared_before)
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_whole_euler_groups_are_acquired_again_after_a_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Capturing a later group can retire an earlier one; no group replays until all are held at once."""
+    wrapper = WholeEulerCFMGraphWrapper(estimator=_tiny_upstream_dit(), n_timesteps=10, max_graphs=8)
+    calls: list[int] = []
+
+    def entry(*, graph_batch: int, fill, **_: object) -> tuple:
+        calls.append(graph_batch)
+        if len(calls) == 2 or flush_always:
+            wrapper._stats["flushes"] += 1
+        return ("entry", graph_batch, len(calls))
+
+    monkeypatch.setattr(wrapper, "_entry", entry)
+    flush_always = False
+    groups, fills = [(16, 16), (1, 1)], [None, None]
+    assert wrapper._group_entries(groups, fills) == [("entry", 16, 3), ("entry", 1, 4)]
+    assert calls == [16, 1, 16, 1]
+    flush_always = True
+    assert wrapper._group_entries(groups, fills) is None

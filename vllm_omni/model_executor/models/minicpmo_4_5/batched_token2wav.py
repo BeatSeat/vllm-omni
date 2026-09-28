@@ -73,12 +73,17 @@ def _supports_ragged_kernel(estimator: nn.Module) -> bool:
     if not blocks or not hasattr(estimator, "in_proj") or not hasattr(estimator, "final_layer"):
         return False
     block = blocks[0]
+    attn = getattr(block, "attn", None)
     conv_blocks = getattr(getattr(block, "conv", None), "block", None)
     return (
         hasattr(block, "adaLN_modulation")
-        and hasattr(getattr(block, "attn", None), "forward_chunk")
+        and all(
+            hasattr(attn, name)
+            for name in ("forward_chunk", "to_q", "to_k", "to_v", "to_heads", "q_norm", "k_norm", "proj")
+        )
         and conv_blocks is not None
         and len(conv_blocks) >= 8
+        and all(isinstance(conv_blocks[index], nn.Conv1d) for index in (1, 6))
     )
 
 
@@ -658,11 +663,81 @@ class BatchedToken2Wav(nn.Module):
         valid_lengths: torch.Tensor,
         width: int,
     ) -> torch.Tensor:
+        """The ``width`` frames of ``history`` (b, width + t, c) ending each row's valid frames, as (b, c, width)."""
         indices = valid_lengths[:, None] + torch.arange(width, device=history.device)[None, :]
-        return history.gather(
-            2,
-            indices[:, None, :].expand(-1, int(history.shape[1]), -1),
+        return history.gather(1, indices[:, :, None].expand(-1, -1, int(history.shape[2]))).transpose(1, 2)
+
+    @staticmethod
+    def _causal_conv_frames_major(conv: nn.Conv1d, history: torch.Tensor) -> torch.Tensor:
+        """``conv`` over ``history`` (b, width + t, c_in) as (b, t, c_out), without a layout change.
+
+        The DiT keeps activations as (b, t, c), which already is NHWC for a
+        height-1 image. Upstream transposes them to (b, c, t) for ``Conv1d``,
+        and cuDNN converted that to NHWC and back around every convolution
+        (``nchwToNhwc`` was ~6% of Stage-2 GPU time at 16 requests). As a
+        channels-last conv2d it reads the activations where they are. The
+        channels-last weight is converted once and reused.
+        """
+        weight = conv.weight
+        version = (weight.data_ptr(), weight._version, weight.dtype)
+        cached = conv.__dict__.get("_channels_last_weight")
+        if cached is None or cached[0] != version:
+            cached = (version, weight.detach().unsqueeze(2).contiguous(memory_format=torch.channels_last))
+            conv.__dict__["_channels_last_weight"] = cached
+        output = F.conv2d(
+            history.transpose(1, 2).unsqueeze(2),
+            cached[1],
+            conv.bias,
+            (1, conv.stride[0]),
+            (0, conv.padding[0]),
+            (1, conv.dilation[0]),
+            conv.groups,
         )
+        return output.squeeze(2).transpose(1, 2)
+
+    @staticmethod
+    def _attend_in_place(
+        attn: nn.Module,
+        x: torch.Tensor,
+        att_cache: torch.Tensor | None,
+        attn_mask: torch.Tensor | None,
+        kv: torch.Tensor,
+    ) -> torch.Tensor:
+        """``attn.forward_chunk`` that keeps the new keys and values in ``kv``.
+
+        ``kv`` (b, heads, >= t + cache frames, 2 * head_dim) is the block's new
+        cache, ``[current | cache]`` like upstream's. Upstream concatenates the
+        whole cache behind the current keys and values, then both into the new
+        cache, which the caller copied into ``kv``: four passes over Stage 2's
+        largest tensor (``torch.cat`` was ~9% of its GPU time at 16 requests).
+        Here only the current chunk is written and attention reads ``kv`` in
+        place. A cache that already sits behind the current chunk in ``kv``
+        (Whole-Euler) is not moved; any other is copied there once.
+        """
+        if kv.dtype != x.dtype:
+            # A reduced-precision cache: attention runs in the activation dtype.
+            x_att, new_att = attn.forward_chunk(x, att_cache, attn_mask)
+            kv[:, :, : int(new_att.shape[2])].copy_(new_att)
+            return x_att
+        batch, frames, _ = x.shape
+        q = attn.q_norm(attn.to_heads(attn.to_q(x)))
+        k = attn.k_norm(attn.to_heads(attn.to_k(x)))
+        v = attn.to_heads(attn.to_v(x))
+        cached = 0 if att_cache is None else int(att_cache.shape[2])
+        kv = kv[:, :, : frames + cached]
+        behind = kv[:, :, frames:]
+        if cached and (att_cache.data_ptr() != behind.data_ptr() or att_cache.stride() != behind.stride()):
+            behind.copy_(att_cache)
+        head_dim = int(k.shape[3])
+        kv[..., :frames, :head_dim].copy_(k)
+        kv[..., :frames, head_dim:].copy_(v)
+        out = F.scaled_dot_product_attention(
+            q,
+            kv[..., :head_dim],
+            kv[..., head_dim:],
+            attn_mask=None if attn_mask is None else attn_mask.unsqueeze(1),
+        )
+        return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))
 
     @staticmethod
     def _blocks_forward_chunk_ragged(
@@ -679,7 +754,10 @@ class BatchedToken2Wav(nn.Module):
         """Run one padded DiT batch while capturing exact per-row CNN state.
 
         ``valid_lengths`` is one length per request, or the ``(2B,)`` CFG
-        lengths tensor a CUDA graph captures as a static input.
+        lengths tensor a CUDA graph captures as a static input. Upstream's
+        ``DiTBlock.forward_chunk``, with attention over the output cache in
+        place (``_attend_in_place``) and the causal convolutions on the
+        frames-major activations (``_causal_conv_frames_major``).
         """
         if isinstance(valid_lengths, torch.Tensor):
             lengths = valid_lengths
@@ -704,46 +782,39 @@ class BatchedToken2Wav(nn.Module):
             ) = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
 
             normalized = block.norm1(x) * (1 + scale_msa) + shift_msa
-            x_att, new_att = block.attn.forward_chunk(
+            x_att = BatchedToken2Wav._attend_in_place(
+                block.attn,
                 normalized,
                 att_cache[block_index],
                 attn_mask,
+                att_cache_buffer[block_index],
             )
             x = x + gate_msa * x_att
 
+            # CausalConvBlock: [T, conv1, T, LayerNorm, Mish, T, conv2, T]
+            # with the transposes (T) dropped.
+            conv = block.conv
             conv_input = block.norm3(x) * (1 + scale_conv) + shift_conv
             old_cnn = cnn_cache[block_index]
             if old_cnn is None:
-                width = int(block.conv.block[1].causal_padding[0])
                 old_cnn = conv_input.new_zeros(
                     (
                         int(conv_input.shape[0]),
-                        int(block.conv.in_channels + block.conv.out_channels),
-                        width,
+                        int(conv.in_channels + conv.out_channels),
+                        int(conv.block[1].causal_padding[0]),
                     )
                 )
-            old_cnn1, old_cnn2 = old_cnn.split((block.conv.in_channels, block.conv.out_channels), dim=1)
-
-            conv1_input = block.conv.block[0](conv_input)
-            conv1_output, _ = block.conv.block[1].forward_chunk(conv1_input, old_cnn1)
-            new_cnn1 = BatchedToken2Wav._gather_causal_cache(
-                torch.cat((old_cnn1, conv1_input), dim=2),
-                lengths,
-                int(old_cnn1.shape[2]),
-            )
-
-            conv2_input = block.conv.block[2:6](conv1_output)
-            conv2_output, _ = block.conv.block[6].forward_chunk(conv2_input, old_cnn2)
-            new_cnn2 = BatchedToken2Wav._gather_causal_cache(
-                torch.cat((old_cnn2, conv2_input), dim=2),
-                lengths,
-                int(old_cnn2.shape[2]),
-            )
-            x = x + gate_conv * block.conv.block[7](conv2_output)
+            width = int(old_cnn.shape[2])
+            history = torch.cat((old_cnn[:, : conv.in_channels].transpose(1, 2), conv_input), dim=1)
+            new_cnn1 = BatchedToken2Wav._gather_causal_cache(history, lengths, width)
+            hidden = conv.block[4](conv.block[3](BatchedToken2Wav._causal_conv_frames_major(conv.block[1], history)))
+            history = torch.cat((old_cnn[:, conv.in_channels :].transpose(1, 2), hidden), dim=1)
+            new_cnn2 = BatchedToken2Wav._gather_causal_cache(history, lengths, width)
+            x = x + gate_conv * BatchedToken2Wav._causal_conv_frames_major(conv.block[6], history)
             x = x + gate_mlp * block.mlp(block.norm2(x) * (1 + scale_mlp) + shift_mlp)
 
-            cnn_cache_buffer[block_index].copy_(torch.cat((new_cnn1, new_cnn2), dim=1))
-            att_cache_buffer[block_index][:, :, : int(new_att.shape[2]), :].copy_(new_att)
+            cnn_cache_buffer[block_index][:, : conv.in_channels].copy_(new_cnn1)
+            cnn_cache_buffer[block_index][:, conv.in_channels :].copy_(new_cnn2)
 
         return estimator.final_layer(x, time_embedding).transpose(1, 2)
 
@@ -1121,9 +1192,12 @@ class BatchedToken2Wav(nn.Module):
 
         Every request starts from the same prompt tokens, speaker, mels and
         noise, so the prompt is solved once and all requests share that one
-        read-only state (decoding never writes into a state). Solving it per
-        batch size recomputed identical rows and cached one ~0.3 GiB estimator
-        cache copy per request.
+        read-only state. Decoding writes a state only where Whole-Euler updates
+        an estimator cache in place, which needs a cache held by one request
+        and allocated with room for its new length; the prompt cache is shared
+        and allocated exactly, and the first chunk always grows it. Solving it
+        per batch size recomputed identical rows and cached one ~0.3 GiB
+        estimator cache copy per request.
         """
         bucket_frames = (
             self._cfm_graph_bucket_frames

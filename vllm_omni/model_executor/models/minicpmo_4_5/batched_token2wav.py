@@ -676,8 +676,20 @@ class BatchedToken2Wav(nn.Module):
         and cuDNN converted that to NHWC and back around every convolution
         (``nchwToNhwc`` was ~6% of Stage-2 GPU time at 16 requests). As a
         channels-last conv2d it reads the activations where they are. The
-        channels-last weight is converted once and reused.
+        channels-last weight is converted once and reused. Other devices run
+        upstream's ``Conv1d`` layout (Ascend has no channels-last format).
         """
+        if not history.is_cuda:
+            output = F.conv1d(
+                history.transpose(1, 2),
+                conv.weight,
+                conv.bias,
+                conv.stride,
+                conv.padding,
+                conv.dilation,
+                conv.groups,
+            )
+            return output.transpose(1, 2)
         weight = conv.weight
         version = (weight.data_ptr(), weight._version, weight.dtype)
         cached = conv.__dict__.get("_channels_last_weight")
@@ -712,10 +724,11 @@ class BatchedToken2Wav(nn.Module):
         largest tensor (``torch.cat`` was ~9% of its GPU time at 16 requests).
         Here only the current chunk is written and attention reads ``kv`` in
         place. A cache that already sits behind the current chunk in ``kv``
-        (Whole-Euler) is not moved; any other is copied there once.
+        (Whole-Euler) is not moved; any other is copied there once. Other
+        devices keep upstream's attention and copy its cache into ``kv``.
         """
-        if kv.dtype != x.dtype:
-            # A reduced-precision cache: attention runs in the activation dtype.
+        if kv.dtype != x.dtype or not x.is_cuda:
+            # A reduced-precision cache attends in the activation dtype.
             x_att, new_att = attn.forward_chunk(x, att_cache, attn_mask)
             kv[:, :, : int(new_att.shape[2])].copy_(new_att)
             return x_att

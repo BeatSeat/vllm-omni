@@ -125,9 +125,6 @@ def _patched_estimator_step(
         or attn_mask is not None
         or valid_lengths is not None
     ):
-        step_kwargs = {}
-        if time_embedding is not None:
-            step_kwargs["time_embedding"] = time_embedding
         return _original_estimator_step(
             self,
             estimator,
@@ -141,7 +138,7 @@ def _patched_estimator_step(
             attn_mask=attn_mask,
             valid_lengths=valid_lengths,
             valid_frames=valid_frames,
-            **step_kwargs,
+            time_embedding=time_embedding,
         )
     if (cnn_cache is None) != (att_cache is None):
         raise ValueError("estimator CNN and attention caches must both be present or absent")

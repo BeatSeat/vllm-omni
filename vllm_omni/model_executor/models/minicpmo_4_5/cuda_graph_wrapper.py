@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import os
 from collections import Counter
 from collections.abc import Callable
 from typing import NamedTuple
@@ -14,75 +13,28 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-try:
-    import triton
-    import triton.language as tl
 
-    _HAS_TRITON = True
-except ImportError:
-    triton = None
-    tl = None
-    _HAS_TRITON = False
-
-if _HAS_TRITON:
-
-    @triton.jit
-    def _fused_euler_step_kernel(
-        x_ptr,
-        estimate_ptr,
-        dt,
-        cfg_rate,
-        n_elements,
-        block_size: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        offsets = pid * block_size + tl.arange(0, block_size)
-        mask = offsets < n_elements
-
-        x = tl.load(x_ptr + offsets, mask=mask)
-        cond = tl.load(estimate_ptr + offsets, mask=mask)
-        uncond = tl.load(estimate_ptr + n_elements + offsets, mask=mask)
-
-        v = (1.0 + cfg_rate) * cond - cfg_rate * uncond
-        new_x = x + dt * v
-
-        tl.store(x_ptr + offsets, new_x.to(x.dtype), mask=mask)
-
-
-def _fused_euler_step(
+def _euler_step(
     cur_x: torch.Tensor,
     estimate: torch.Tensor,
     dt: float,
     inference_cfg_rate: float,
     batch_size: int,
 ) -> torch.Tensor:
-    """In-place Euler ODE update: cur_x = cur_x + dt * ((1+cfg)*cond - cfg*uncond).
-
-    Uses Triton kernel when available on CUDA for a single fused launch without DRAM roundtrips.
-    Falls back to standard PyTorch ops when Triton is unavailable or tensors are non-contiguous.
-    """
-    if _HAS_TRITON and cur_x.is_cuda and cur_x.is_contiguous() and estimate.is_contiguous():
-        n_elements = cur_x.numel()
-        block_size = 1024
-        grid = (triton.cdiv(n_elements, block_size),)
-        _fused_euler_step_kernel[grid](
-            cur_x,
-            estimate,
-            float(dt),
-            float(inference_cfg_rate),
-            n_elements,
-            block_size=block_size,
-        )
-        return cur_x
-
+    """One Euler step of the CFG-guided flow: ``cur_x + dt * ((1 + cfg) * cond - cfg * uncond)``."""
     conditional, unconditional = estimate.split(batch_size, dim=0)
     velocity = (1.0 + inference_cfg_rate) * conditional - inference_cfg_rate * unconditional
     return cur_x + dt * velocity
 
 
-class HiFTGraphWrapper:
-    max_serial_batch: int = 4
+def _euler_timeline(n_timesteps: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, list[float]]:
+    """The cosine Euler timeline and its step sizes, read to the host once."""
+    t = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=dtype)
+    timeline = 1 - torch.cos(t * 0.5 * torch.pi)
+    return timeline, (timeline[1:] - timeline[:-1]).tolist()
 
+
+class HiFTGraphWrapper:
     def __init__(self, token2wav, connector_config, capture_batch_sizes, max_serial_batch: int | None = None):
         self.decode_fn = token2wav.hift.inference
         self.graph_fn = token2wav.hift._inference_pre_istft
@@ -109,10 +61,7 @@ class HiFTGraphWrapper:
         self.dtype = parameter.dtype
         self.max_lazy_graphs = 8
         self.lazy_graph_count = 0
-        if max_serial_batch is None:
-            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
-        else:
-            self.max_serial_batch = int(max_serial_batch)
+        self.max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
 
     def derive_capture_bucket_size(self):
         chunk_mel_frames = (
@@ -255,6 +204,10 @@ def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] 
     )
 
 
+# Frame granularity of the shared attention cache storage.
+_ATT_FRAME_ALIGN = 16
+
+
 def _align_up(n: int, bucket: int) -> int:
     if n <= 0 or bucket <= 1:
         return max(0, n)
@@ -267,7 +220,7 @@ def _capture_query_width(mel_width: int, bucket: int) -> int:
     ``_cfm_pad_frames`` already aligns onto ``bucket_frames=16``, which is why
     12+4 and 10+6 share a graph (``test_whole_euler_same_bucket_different_padding_hits_cache``)
     but 16/32/48/64 stay distinct (``test_varied_chunk_lengths_collapse_onto_few_widths``).
-    The capture bucket reuses that same pad-and-mask scheme from #7416 so those
+    The capture bucket reuses that same pad-and-mask scheme so those
     decode widths collapse onto one CUDA graph; first-chunk widths above the
     bucket (e.g. 304) align up separately so streaming replay stays on the
     small decode graph.
@@ -692,7 +645,6 @@ class WholeEulerExecutionArena:
         dtype: torch.dtype,
         att_cache_dtype: torch.dtype = torch.float32,
         time_steps: list[torch.Tensor] | None = None,
-        capacity_align: int = 16,
     ) -> None:
         self.estimator = estimator
         self.n_timesteps = int(n_timesteps)
@@ -700,7 +652,6 @@ class WholeEulerExecutionArena:
         self.dtype = dtype
         self.att_cache_dtype = att_cache_dtype
         self.time_steps = list(time_steps) if time_steps is not None else []
-        self.capacity_align = max(1, int(capacity_align))
 
         blocks = estimator.blocks
         self.depth = len(blocks)
@@ -710,23 +661,22 @@ class WholeEulerExecutionArena:
         self.heads = int(block0.attn.num_heads)
         self.att_width = int(block0.attn.head_dim * 2)
 
-        # Shared static staging buffers (allocated once per lane, shared across shapes)
-        self._shared_time_embeddings: dict[int, torch.Tensor] = {}
-        self._shared_cnn_in: dict[int, torch.Tensor] = {}
-        self._shared_cnn_out: dict[int, torch.Tensor] = {}
-        self._shared_speakers: dict[tuple[int, int], torch.Tensor] = {}
-
-        # Shape-keyed variable staging buffers (reused when dimensions match)
-        self._x_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
-        self._mu_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
-        self._cond_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
-        self._mask_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
-        self._lengths_buffers: dict[int, torch.Tensor] = {}
+        # Static staging buffers, shared by every graph that stages the same shape.
+        self._buffers: dict[tuple, torch.Tensor] = {}
         # The one attention cache storage; every graph takes a prefix view.
         self._att: torch.Tensor | None = None
 
+    def _buffer(self, name: str, shape: tuple[int, ...], new=torch.zeros, dtype: torch.dtype | None = None):
+        key = (name, shape)
+        buf = self._buffers.get(key)
+        if buf is None:
+            buf = new(shape, device=self.device, dtype=self.dtype if dtype is None else dtype)
+            self._buffers[key] = buf
+        return buf
+
     def get_time_embeddings(self, batch_size: int) -> torch.Tensor:
-        t_emb = self._shared_time_embeddings.get(batch_size)
+        key = ("time_embeddings", batch_size)
+        t_emb = self._buffers.get(key)
         if t_emb is None:
             t_emb = torch.stack(
                 [
@@ -735,70 +685,29 @@ class WholeEulerExecutionArena:
                 ],
                 dim=0,
             )
-            self._shared_time_embeddings[batch_size] = t_emb
+            self._buffers[key] = t_emb
         return t_emb
 
+    def _cnn_cache_shape(self, batch_size: int) -> tuple[int, ...]:
+        return (self.n_timesteps, self.depth, 2 * batch_size, self.cnn_channels, self.cnn_width)
+
     def get_cnn_cache_in(self, batch_size: int) -> torch.Tensor:
-        buf = self._shared_cnn_in.get(batch_size)
-        if buf is None:
-            buf = torch.zeros(
-                self.n_timesteps,
-                self.depth,
-                2 * batch_size,
-                self.cnn_channels,
-                self.cnn_width,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            self._shared_cnn_in[batch_size] = buf
-        return buf
+        return self._buffer("cnn_in", self._cnn_cache_shape(batch_size))
 
     def get_cnn_cache_out(self, batch_size: int) -> torch.Tensor:
-        buf = self._shared_cnn_out.get(batch_size)
-        if buf is None:
-            buf = torch.empty(
-                self.n_timesteps,
-                self.depth,
-                2 * batch_size,
-                self.cnn_channels,
-                self.cnn_width,
-                device=self.device,
-                dtype=self.dtype,
-            )
-            self._shared_cnn_out[batch_size] = buf
-        return buf
+        return self._buffer("cnn_out", self._cnn_cache_shape(batch_size), new=torch.empty)
 
     def get_speakers_staging(self, batch_size: int, spk_dim: int) -> torch.Tensor:
-        key = (batch_size, spk_dim)
-        buf = self._shared_speakers.get(key)
-        if buf is None:
-            buf = torch.zeros(2 * batch_size, spk_dim, device=self.device, dtype=self.dtype)
-            self._shared_speakers[key] = buf
-        return buf
+        return self._buffer("speakers", (2 * batch_size, spk_dim))
 
     def get_x_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
-        key = (batch_size, channels, mel_width)
-        buf = self._x_buffers.get(key)
-        if buf is None:
-            buf = torch.zeros(batch_size, channels, mel_width, device=self.device, dtype=self.dtype)
-            self._x_buffers[key] = buf
-        return buf
+        return self._buffer("x", (batch_size, channels, mel_width))
 
     def get_mu_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
-        key = (batch_size, channels, mel_width)
-        buf = self._mu_buffers.get(key)
-        if buf is None:
-            buf = torch.zeros(2 * batch_size, channels, mel_width, device=self.device, dtype=self.dtype)
-            self._mu_buffers[key] = buf
-        return buf
+        return self._buffer("mu", (2 * batch_size, channels, mel_width))
 
     def get_cond_staging(self, batch_size: int, channels: int, mel_width: int) -> torch.Tensor:
-        key = (batch_size, channels, mel_width)
-        buf = self._cond_buffers.get(key)
-        if buf is None:
-            buf = torch.zeros(2 * batch_size, channels, mel_width, device=self.device, dtype=self.dtype)
-            self._cond_buffers[key] = buf
-        return buf
+        return self._buffer("cond", (2 * batch_size, channels, mel_width))
 
     def att_cache_fits(self, batch_size: int, frames: int) -> bool:
         """Whether a view of ``batch_size`` requests ending at frame ``frames`` fits the current storage."""
@@ -826,7 +735,7 @@ class WholeEulerExecutionArena:
                 self.depth,
                 2 * max(int(batch_size), int(rows), old_rows),
                 self.heads,
-                _align_up(max(end, int(capacity), old_frames, 1), self.capacity_align),
+                _align_up(max(end, int(capacity), old_frames, 1), _ATT_FRAME_ALIGN),
                 self.att_width,
                 device=self.device,
                 dtype=self.att_cache_dtype,
@@ -835,37 +744,14 @@ class WholeEulerExecutionArena:
         return storage[:, :, : 2 * batch_size, :, start:end, :]
 
     def get_mask_staging(self, batch_size: int, mel_width: int, total_len: int) -> torch.Tensor:
-        key = (batch_size, mel_width, total_len)
-        buf = self._mask_buffers.get(key)
-        if buf is None:
-            buf = torch.ones(
-                2 * batch_size,
-                mel_width,
-                total_len,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            self._mask_buffers[key] = buf
-        return buf
+        return self._buffer("mask", (2 * batch_size, mel_width, total_len), new=torch.ones, dtype=torch.bool)
 
     def get_lengths_staging(self, batch_size: int) -> torch.Tensor:
         """Per-CFG-row valid query lengths read by a ragged graph body."""
-        buf = self._lengths_buffers.get(batch_size)
-        if buf is None:
-            buf = torch.zeros(2 * batch_size, dtype=torch.long, device=self.device)
-            self._lengths_buffers[batch_size] = buf
-        return buf
+        return self._buffer("lengths", (2 * batch_size,), dtype=torch.long)
 
     def clear(self) -> None:
-        self._shared_time_embeddings.clear()
-        self._shared_cnn_in.clear()
-        self._shared_cnn_out.clear()
-        self._shared_speakers.clear()
-        self._x_buffers.clear()
-        self._mu_buffers.clear()
-        self._cond_buffers.clear()
-        self._mask_buffers.clear()
-        self._lengths_buffers.clear()
+        self._buffers.clear()
         self._att = None
 
 
@@ -903,8 +789,6 @@ class WholeEulerCFMGraphWrapper:
     of that storage directly.
     """
 
-    max_serial_batch: int = 4
-
     def __init__(
         self,
         estimator: torch.nn.Module,
@@ -934,26 +818,18 @@ class WholeEulerCFMGraphWrapper:
         self.inference_cfg_rate = float(inference_cfg_rate)
         self.att_cache_dtype = att_cache_dtype
         self.max_graphs = int(max_graphs)
-        if query_bucket_frames is None:
-            query_bucket_frames = int(os.getenv("VLLM_OMNI_WHOLE_EULER_QUERY_BUCKET", "0"))
-        self.query_bucket_frames = int(query_bucket_frames)
-        if max_serial_batch is None:
-            self.max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
-        else:
-            self.max_serial_batch = int(max_serial_batch)
-        if micro_batch_size is not None:
-            self.micro_batch_size = int(micro_batch_size)
-        else:
-            self.micro_batch_size = int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
+        self.query_bucket_frames = 0 if query_bucket_frames is None else int(query_bucket_frames)
+        self.max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
+        self.micro_batch_size = 4 if micro_batch_size is None else int(micro_batch_size)
         if max_graph_batch is None:
             if max_serial_batch is not None and max_serial_batch < self.micro_batch_size:
                 self.max_graph_batch = int(max_serial_batch)
             else:
-                self.max_graph_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_BATCH", "16"))
+                self.max_graph_batch = 16
         else:
             self.max_graph_batch = int(max_graph_batch)
         if pad_max_rows is None:
-            pad_max_rows = int(os.getenv("VLLM_OMNI_WHOLE_EULER_PAD_MAX_ROWS", str(self.micro_batch_size // 4)))
+            pad_max_rows = self.micro_batch_size // 4
         self.pad_max_rows = max(0, int(pad_max_rows))
         # Largest steady cache length a caller announced; sizes the arena storage.
         self._att_capacity = 0
@@ -976,15 +852,7 @@ class WholeEulerCFMGraphWrapper:
             "eager": 0,
         }
 
-        timeline = torch.linspace(
-            0,
-            1,
-            self.n_timesteps + 1,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        self.timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
-        self.dt_steps = [float((self.timeline[i + 1] - self.timeline[i]).item()) for i in range(self.n_timesteps)]
+        self.timeline, self.dt_steps = _euler_timeline(self.n_timesteps, self.device, self.dtype)
         self.time_steps = [self.timeline[i] for i in range(self.n_timesteps)]
         self.arena = WholeEulerExecutionArena(
             estimator=self.estimator,
@@ -1051,7 +919,7 @@ class WholeEulerCFMGraphWrapper:
             else:
                 estimate = self.estimator.blocks_forward_chunk(*args)
 
-            cur_x = _fused_euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
+            cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 
         return cur_x
 
@@ -1251,7 +1119,7 @@ class WholeEulerCFMGraphWrapper:
         spk_dim: int,
         fill,
     ) -> tuple | None:
-        # Same (batch, capture-query, offset) triple as #7416's (chunk_width, cache_width).
+        # One graph per (batch, capture query width, cache offset).
         # Presence of cnn/att/mask is data copied into static buffers, not a key.
         key = ("whole_euler", graph_batch, query_cap, offset, str(x.dtype), str(x.device))
         if key in self._unsupported:
@@ -1411,8 +1279,8 @@ class WholeEulerCFMGraphWrapper:
                 dtype=self.att_cache_dtype,
             )
             out_att_rows = out_att.unflatten(2, (2, batch_size))
-        # A ragged body writes each row's exact CNN cache; only #7416 padding
-        # (``pad_frames``) is then cleared. Otherwise every padded position is.
+        # A ragged body writes each row's exact CNN cache; only the bucket
+        # padding (``pad_frames``) is then cleared. Otherwise every padded position is.
         cnn_pad = pad_frames if self.ragged_body is not None else query_cap - mel_frames
 
         fills = []

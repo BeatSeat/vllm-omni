@@ -20,7 +20,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
-    _fused_euler_step,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
@@ -978,8 +977,7 @@ def test_whole_euler_arena_cleaned_when_first_capture_fails(
     assert wrapper.enabled is False
     assert len(wrapper._cache) == 0
     # Arena must be cleared even when cache has zero entries
-    assert len(wrapper.arena._shared_cnn_in) == 0
-    assert len(wrapper.arena._x_buffers) == 0
+    assert not wrapper.arena._buffers
 
 
 @pytest.mark.parametrize(
@@ -1177,30 +1175,6 @@ def test_whole_euler_hierarchical_microbatch_b4_and_b8(monkeypatch: pytest.Monke
 
     wrapper._flush()
     wrapper_16._flush()
-
-
-def test_batched_eager_fused_euler_parity() -> None:
-    torch.manual_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 4
-    channels = 80
-    mel_frames = 14
-    inference_cfg_rate = 0.7
-    dt = 0.05
-
-    cur_x = torch.randn(batch_size, channels, mel_frames, device=device)
-    estimate = torch.randn(2 * batch_size, channels, mel_frames, device=device)
-
-    ref_x = cur_x.clone()
-    cond, uncond = estimate.split(batch_size, dim=0)
-    velocity = (1.0 + inference_cfg_rate) * cond - inference_cfg_rate * uncond
-    expected_x = ref_x + dt * velocity
-
-    test_x = cur_x.clone()
-    result_x = _fused_euler_step(test_x, estimate, dt, inference_cfg_rate, batch_size)
-
-    max_diff = torch.max(torch.abs(expected_x - result_x)).item()
-    assert max_diff < 1e-5, f"Fused Euler max difference {max_diff} exceeds 1e-5"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
@@ -1451,7 +1425,7 @@ def test_zero_padded_cnn_cache_clears_every_timestep_of_a_whole_euler_cache() ->
     torch.testing.assert_close(cache, expected)
 
 
-def test_fused_euler_step_eager_fallback() -> None:
+def test_euler_step_applies_cfg_guidance() -> None:
     torch.manual_seed(42)
     B, C, T = 2, 8, 16
     cur_x = torch.randn(B, C, T)
@@ -1463,7 +1437,7 @@ def test_fused_euler_step_eager_fallback() -> None:
     v = (1.0 + cfg) * cond - cfg * uncond
     expected = cur_x + dt * v
 
-    actual = wrapper_module._fused_euler_step(cur_x.clone(), estimate, dt, cfg, B)
+    actual = wrapper_module._euler_step(cur_x.clone(), estimate, dt, cfg, B)
     torch.testing.assert_close(actual, expected)
 
 
@@ -1494,13 +1468,9 @@ def test_whole_euler_execution_arena_buffer_reuse(monkeypatch: pytest.MonkeyPatc
     )
     assert res1 is not None
     assert wrapper._stats["captures"] == 1
-    assert len(wrapper.arena._shared_time_embeddings) == 1
-    assert len(wrapper.arena._shared_cnn_in) == 1
-    assert len(wrapper.arena._shared_cnn_out) == 1
-
-    shared_time_emb = wrapper.arena._shared_time_embeddings[1]
-    shared_cnn_in = wrapper.arena._shared_cnn_in[1]
-    shared_cnn_out = wrapper.arena._shared_cnn_out[1]
+    arena = wrapper.arena
+    shared = {key: buf for key, buf in arena._buffers.items() if key[0] in ("time_embeddings", "cnn_in", "cnn_out")}
+    assert sorted(key[0] for key in shared) == ["cnn_in", "cnn_out", "time_embeddings"]
 
     # Second call with cache (offset=10)
     res2 = wrapper.replay(
@@ -1515,14 +1485,10 @@ def test_whole_euler_execution_arena_buffer_reuse(monkeypatch: pytest.MonkeyPatc
     assert wrapper._stats["captures"] == 2
 
     # Verify that the shared buffers are the exact same tensor instances (no duplicate allocation)
-    assert wrapper.arena._shared_time_embeddings[1] is shared_time_emb
-    assert wrapper.arena._shared_cnn_in[1] is shared_cnn_in
-    assert wrapper.arena._shared_cnn_out[1] is shared_cnn_out
+    assert all(arena._buffers[key] is buf for key, buf in shared.items())
 
     wrapper._flush()
-    assert len(wrapper.arena._shared_time_embeddings) == 0
-    assert len(wrapper.arena._shared_cnn_in) == 0
-    assert len(wrapper.arena._shared_cnn_out) == 0
+    assert not arena._buffers
 
 
 def _whole_euler_chunk(batch_size: int, width: int) -> dict[str, torch.Tensor]:
@@ -2095,7 +2061,7 @@ def test_whole_euler_skipped_when_trt_stepper_configured() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
-def test_whole_euler_disabled_via_serving_config(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_euler_disabled_via_serving_config() -> None:
     from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
         BatchedToken2Wav,
     )
@@ -2138,7 +2104,6 @@ def test_whole_euler_disabled_via_serving_config(monkeypatch: pytest.MonkeyPatch
     assert adapter_enabled._cfm_graph_wrapper is not None
 
     # Unconfigured, the capture width is the steady chunk's mel width.
-    monkeypatch.delenv("VLLM_OMNI_WHOLE_EULER_QUERY_BUCKET", raising=False)
     adapter_derived = BatchedToken2Wav(
         _MockToken2Wav(),
         connector_config={"codec_chunk_frames": 25, "codec_left_context_frames": 3},

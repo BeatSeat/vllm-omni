@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -22,7 +21,8 @@ from .cuda_graph_wrapper import (
     WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
     _copy_frame_segments,
-    _fused_euler_step,
+    _euler_step,
+    _euler_timeline,
     _zero_padded_cnn_cache,
 )
 
@@ -321,12 +321,7 @@ class BatchedToken2Wav(nn.Module):
                         "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
                     )
                 capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
-                max_serial_batch = int(
-                    graph_config.get(
-                        "max_serial_batch",
-                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
-                    )
-                )
+                max_serial_batch = int(graph_config.get("max_serial_batch", 4))
                 logger.info(
                     "Enabling HiFT CUDA Graph with batch sizes %s (max_serial_batch=%d)",
                     capture_batch_sizes,
@@ -349,24 +344,13 @@ class BatchedToken2Wav(nn.Module):
             if flow_parameter is not None and flow_parameter.device.type == "cuda":
                 estimator = self.flow.decoder.estimator
                 max_graphs = int(cfm_graph_cfg.get("max_graphs", 32))
-                max_serial_batch = int(
-                    cfm_graph_cfg.get(
-                        "max_serial_batch",
-                        os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"),
-                    )
-                )
+                max_serial_batch = int(cfm_graph_cfg.get("max_serial_batch", 4))
                 max_graph_batch_cfg = cfm_graph_cfg.get("max_graph_batch")
                 max_graph_batch = int(max_graph_batch_cfg) if max_graph_batch_cfg is not None else None
                 micro_batch_size_cfg = cfm_graph_cfg.get("micro_batch_size")
-                micro_batch_size = (
-                    int(micro_batch_size_cfg)
-                    if micro_batch_size_cfg is not None
-                    else int(os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE", "4"))
-                )
+                micro_batch_size = int(micro_batch_size_cfg) if micro_batch_size_cfg is not None else 4
                 if bool(cfm_graph_cfg.get("enable_whole_euler", True)) and self._trt_stepper is None:
                     capture_frames = cfm_graph_cfg.get("capture_frames")
-                    if capture_frames is None:
-                        capture_frames = os.getenv("VLLM_OMNI_WHOLE_EULER_QUERY_BUCKET")
                     if capture_frames is None and connector_config is not None:
                         # The steady chunk's mel width, derived like HiFTGraphWrapper's
                         # capture bucket: steady chunks run unpadded and shorter
@@ -673,9 +657,8 @@ class BatchedToken2Wav(nn.Module):
 
         The DiT keeps activations as (b, t, c), which already is NHWC for a
         height-1 image. Upstream transposes them to (b, c, t) for ``Conv1d``,
-        and cuDNN converted that to NHWC and back around every convolution
-        (``nchwToNhwc`` was ~6% of Stage-2 GPU time at 16 requests). As a
-        channels-last conv2d it reads the activations where they are. The
+        and cuDNN converts that to NHWC and back around every convolution. As
+        a channels-last conv2d it reads the activations where they are. The
         channels-last weight is converted once and reused. Other devices run
         upstream's ``Conv1d`` layout (Ascend has no channels-last format).
         """
@@ -721,8 +704,7 @@ class BatchedToken2Wav(nn.Module):
         cache, ``[current | cache]`` like upstream's. Upstream concatenates the
         whole cache behind the current keys and values, then both into the new
         cache, which the caller copied into ``kv``: four passes over Stage 2's
-        largest tensor (``torch.cat`` was ~9% of its GPU time at 16 requests).
-        Here only the current chunk is written and attention reads ``kv`` in
+        largest tensor. Here only the current chunk is written and attention reads ``kv`` in
         place. A cache that already sits behind the current chunk in ``kv``
         (Whole-Euler) is not moved; any other is copied there once. Other
         devices keep upstream's attention and copy its cache into ``kv``.
@@ -834,15 +816,13 @@ class BatchedToken2Wav(nn.Module):
     def _get_timeline(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, list[float]]:
         """The Euler timeline and its step sizes, read to the host once.
 
-        ``_fused_euler_step`` takes ``dt`` as a Python float, so reading it
+        ``_euler_step`` takes ``dt`` as a Python float, so reading it
         from the device timeline on every decode would sync once per step.
         """
         key = (device, dtype)
         cached = self._timeline_cache.get(key)
         if cached is None:
-            t = torch.linspace(0, 1, self.n_timesteps + 1, device=device, dtype=dtype)
-            timeline = (1 - torch.cos(t * 0.5 * torch.pi)).contiguous()
-            cached = (timeline, (timeline[1:] - timeline[:-1]).tolist())
+            cached = _euler_timeline(self.n_timesteps, device, dtype)
             self._timeline_cache[key] = cached
         return cached
 
@@ -877,21 +857,13 @@ class BatchedToken2Wav(nn.Module):
         else:
             offset = int(att_cache.shape[4]) if att_cache is not None else 0
         mel_frames = int(mu.shape[2])
-        graphs_active = (
-            (
-                (
-                    self._whole_euler_graph_wrapper is not None
-                    and getattr(self._whole_euler_graph_wrapper, "enabled", True)
-                    and self._trt_stepper is None
-                )
-                or (
-                    self._cfm_graph_wrapper is not None
-                    and getattr(self._cfm_graph_wrapper, "enabled", True)
-                    and self._trt_stepper is None
-                )
+        graphs_active = valid_lengths is None and (
+            self._whole_euler_active()
+            or (
+                self._cfm_graph_wrapper is not None
+                and getattr(self._cfm_graph_wrapper, "enabled", True)
+                and self._trt_stepper is None
             )
-            if valid_lengths is None
-            else False
         )
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
@@ -957,12 +929,7 @@ class BatchedToken2Wav(nn.Module):
             )
             attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
 
-        if (
-            (valid_lengths is None or self._whole_euler_ragged_active())
-            and self._trt_stepper is None
-            and self._whole_euler_graph_wrapper is not None
-            and getattr(self._whole_euler_graph_wrapper, "enabled", True)
-        ):
+        if self._whole_euler_active() and (valid_lengths is None or self._whole_euler_ragged_active()):
             whole_euler_result = self._whole_euler_graph_wrapper.replay(
                 x=x,
                 mu_cfg=mu_cfg,
@@ -1008,7 +975,7 @@ class BatchedToken2Wav(nn.Module):
                 )
                 if pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
-                x = _fused_euler_step(x, estimate, dt_steps[step], decoder.inference_cfg_rate, batch_size)
+                x = _euler_step(x, estimate, dt_steps[step], decoder.inference_cfg_rate, batch_size)
                 if pad_frames:
                     _zero_padded_frames(x, mel_frames)
                 next_cnn.append(step_cnn)

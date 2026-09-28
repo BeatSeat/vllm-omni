@@ -268,24 +268,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
         capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
-        max_serial_batch_raw = extra.get("max_serial_batch")
-        if max_serial_batch_raw is None:
-            max_serial_batch = int(os.getenv("VLLM_OMNI_MAX_GRAPH_SERIAL_BATCH", "4"))
-        else:
-            max_serial_batch = int(max_serial_batch_raw)
+        max_serial_batch = extra.get("max_serial_batch")
+        max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
             "max_serial_batch": max_serial_batch,
         }
-        enable_whole_euler_raw = extra.get("enable_whole_euler")
-        if enable_whole_euler_raw is None:
-            enable_whole_euler = os.getenv("VLLM_OMNI_ENABLE_WHOLE_EULER", "1") not in ("0", "false", "False")
-        else:
-            enable_whole_euler = bool(enable_whole_euler_raw)
+        enable_whole_euler = extra.get("enable_whole_euler")
         max_graph_batch_raw = extra.get("max_graph_batch")
         max_graph_batch = int(max_graph_batch_raw) if max_graph_batch_raw is not None else None
-        micro_batch_size_raw = extra.get("micro_batch_size", os.getenv("VLLM_OMNI_GRAPH_MICRO_BATCH_SIZE"))
+        micro_batch_size_raw = extra.get("micro_batch_size")
         if micro_batch_size_raw is not None:
             micro_batch_size = int(micro_batch_size_raw)
         else:
@@ -298,7 +291,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "capture_frames": extra.get("cfm_graph_capture_frames"),
-            "enable_whole_euler": enable_whole_euler,
+            "enable_whole_euler": enable_whole_euler is None or bool(enable_whole_euler),
             "max_serial_batch": max_serial_batch,
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,

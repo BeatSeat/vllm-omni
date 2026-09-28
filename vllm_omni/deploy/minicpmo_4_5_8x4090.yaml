@@ -38,19 +38,7 @@ connectors:
       # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
-      enable_whole_euler: true
-      # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
-      # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
-      # share one attention-cache arena of that many requests (~0.55 GiB each
-      # in fp32). Larger batches replay micro-batches; B > max_graph_batch runs
-      # eager.
-      max_graph_batch: 16
-      max_serial_batch: 4
       cfm_max_graphs: 32
-      # The capture width defaults to the steady chunk's mel width
-      # (2 x codec_chunk_frames): steady chunks run unpadded and shorter ones
-      # share its graph under a mask, so no #7416 frame padding is needed.
-      cfm_graph_bucket_frames: 0
 
 stages:
   - stage_id: 0

@@ -992,6 +992,8 @@ class WholeEulerCFMGraphWrapper:
         ``stop - start`` belong to a padded replay and keep whatever finite
         values they held: DiT rows never mix, so their output is simply dropped.
         ``lengths`` is the ragged body's per-row lengths, or one for every row.
+        Padded rows get length 0: every query width shares the buffer, and a
+        wider replay's length would index past this one's causal history.
         """
         batch_size = int(x.shape[0])
         rows = stop - start
@@ -1007,6 +1009,8 @@ class WholeEulerCFMGraphWrapper:
             if isinstance(lengths, int):
                 statics.lengths.fill_(lengths)
             else:
+                if rows < graph_batch:
+                    statics.lengths.zero_()
                 pairs.append((statics.lengths, lengths))
         for static, value in pairs:
             static.unflatten(0, (2, graph_batch))[:, :rows].copy_(value.unflatten(0, (2, batch_size))[:, start:stop])

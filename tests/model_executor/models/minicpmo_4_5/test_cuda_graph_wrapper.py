@@ -2205,6 +2205,56 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_padded_ragged_replay_after_a_wider_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A padded ragged replay is exact after a wider replay of the same graph batch.
+
+    Every graph of one batch size shares the lengths buffer. The 16-frame
+    replay leaves 16 in the padded row, past the 8-frame history the ragged
+    body gathers from.
+    """
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    estimator = _tiny_upstream_dit()
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=8,
+        micro_batch_size=4,
+        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
+    )
+    assert wrapper.replay(**_whole_euler_chunk(4, 16), cnn_cache=None, att_cache=None) is not None
+
+    lengths, width = [8, 5, 3], 8
+    assert wrapper._plan_groups(len(lengths)) == [(4, 3)]
+    chunk = _whole_euler_chunk(len(lengths), width)
+    out_x, out_cnn, out_att = wrapper.replay(
+        **chunk,
+        cnn_cache=None,
+        att_cache=None,
+        attn_mask=_ragged_mask(lengths, width, 0),
+        valid_lengths=lengths,
+    )
+    cnn_rows = _split_cfg_rows(out_cnn, len(lengths))
+    for row, length in enumerate(lengths):
+        cfg = [row, len(lengths) + row]
+        ref_x, ref_cnn, ref_att = _eager_solve_euler(
+            estimator,
+            chunk["x"][row : row + 1, :, :length],
+            chunk["mu_cfg"][cfg, :, :length],
+            chunk["speakers_cfg"][cfg],
+            chunk["cond_cfg"][cfg, :, :length],
+            None,
+            None,
+            None,
+            wrapper.timeline,
+        )
+        torch.testing.assert_close(out_x[row : row + 1, :, :length], ref_x, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(cnn_rows[row], ref_cnn, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(out_att[row], ref_att, rtol=1e-4, atol=1e-5)
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_request_caches_grow_and_update_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request's cache is allocated once, with room for the steady length, then updated in place.
 

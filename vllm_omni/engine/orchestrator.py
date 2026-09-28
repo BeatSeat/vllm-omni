@@ -1110,6 +1110,9 @@ class OrchestratorBase:
                     ):
                         await asyncio.sleep(0.001)
                         continue
+                    # Same dict pooling-output restore as the legacy poll
+                    # (StagePool._poll_stage_raw).
+                    StagePool._rehydrate_pooling_output_payloads(raw_outputs)
                     await ready_q.put(("llm", stage_id, replica_id, raw_outputs))
                     self._orch_monitor.set_dispatch_queue_size(ready_q.qsize())
             except asyncio.CancelledError:

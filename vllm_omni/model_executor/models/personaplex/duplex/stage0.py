@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.common.audio.pcm import pcm_f32le_samples
 from vllm_omni.model_executor.common.duplex.payload import decode_pcm_f32le_payload
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
     import torch
 
 _FRAME_SAMPLES = FRAME_SIZE
+
+logger = init_logger(__name__)
 
 
 class PersonaPlexStage0CapacityError(RuntimeError):
@@ -161,6 +164,7 @@ class PersonaPlexStage0DuplexRuntime:
         codec: Any | None = None,
         codec_factory: Callable[[], Any] | None = None,
         max_sessions: int = 1,
+        codec_cuda_graphs: bool = False,
         tokenizer=None,
         voice_loader=None,
     ) -> None:
@@ -171,6 +175,7 @@ class PersonaPlexStage0DuplexRuntime:
         self.device = device
         self.max_sessions = max_sessions
         self._codec_factory = codec_factory
+        self._codec_cuda_graphs = codec_cuda_graphs
         self._codec: Any | None = None
         self._free_slots: list[int] = list(reversed(range(max_sessions)))
         self._tokenizer = tokenizer
@@ -650,6 +655,15 @@ class PersonaPlexStage0DuplexRuntime:
                 device=self.device,
             )
         codec.streaming_init(self.max_sessions)
+        if self._codec_cuda_graphs:
+            # Rows are leased and recycled in place, so one graph at
+            # max_sessions with the active mask as input serves every step.
+            captured = codec.capture_cuda_graphs(encode=True, decode_frame_counts=())
+            logger.info(
+                "PersonaPlex Stage 0 Mimi encoder %s at %d rows",
+                "replays a CUDA graph" if captured else "runs eagerly",
+                self.max_sessions,
+            )
         self._codec = codec
         return codec
 

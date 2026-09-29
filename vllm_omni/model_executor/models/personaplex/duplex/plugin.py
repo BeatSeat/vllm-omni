@@ -97,6 +97,8 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
     # The Stage 0 worker reads the voice/persona from the runtime config and
     # never the session config, so no append builds or ships one.
     plans_from_session_config = False
+    # Every live session appends one 80 ms frame per tick.
+    coalesces_resumable_updates = True
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
         super().__init__(encode_audio)

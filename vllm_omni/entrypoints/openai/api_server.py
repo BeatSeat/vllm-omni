@@ -213,6 +213,7 @@ from vllm_omni.entrypoints.serve.utils.routes import (
 from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.utils.duplex_gc import apply_duplex_gc_policy
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -469,6 +470,12 @@ async def omni_run_server_worker(
             # server socket is accepting.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
+        if getattr(app.state, "openai_serving_duplex", None) is not None:
+            # VLLM_OMNI_DUPLEX_GC (off by default) applies once warm-up is over.
+            if warmup_task is None:
+                apply_duplex_gc_policy()
+            else:
+                warmup_task.add_done_callback(lambda task: None if task.cancelled() else apply_duplex_gc_policy())
         shutdown_task = await serve_http(
             _TimestampMiddleware(app),
             sock=sock,

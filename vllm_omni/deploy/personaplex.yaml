@@ -15,7 +15,8 @@
 #   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
 #     To serve more sessions, raise duplex_session.max_sessions and both stages'
 #     max_num_seqs together, and size Stage 0 gpu_memory_utilization for the KV;
-#     on a 141 GB card, 16 sessions at Stage 0 utilization 0.75 stay realtime.
+#     on a 141 GB card, 32 sessions at Stage 0 utilization 0.75 (Stage 1 0.15)
+#     stay realtime.
 pipeline: personaplex
 session_mode: duplex
 duplex_session:

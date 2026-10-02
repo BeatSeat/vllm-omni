@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from vllm_omni.core.sched.codec_deadline import (
     ChunkMeta,
     CodecDeadlineConfig,

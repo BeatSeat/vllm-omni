@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm_omni.core.sched.codec_deadline import CodecDeadlineConfig, CodecDeadlinePolicy, StreamLedger
 
 import vllm_omni.core.sched.omni_generation_scheduler as scheduler_module
 from tests.core.sched.test_generation_scheduler_restore import (
@@ -17,7 +18,6 @@ from tests.core.sched.test_generation_scheduler_restore import (
     _chunk_request,
     _make_generation_scheduler,
 )
-from vllm_omni.core.sched.codec_deadline import CodecDeadlineConfig, CodecDeadlinePolicy, StreamLedger
 from vllm_omni.core.sched.omni_generation_scheduler import (
     OmniGenerationScheduler,
     _build_codec_deadline,
@@ -197,7 +197,6 @@ def test_update_from_output_feeds_the_ledger_and_the_step_time() -> None:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
-
     from vllm_omni.core.sched.codec_deadline import seed_step_s
 
     request = Request(

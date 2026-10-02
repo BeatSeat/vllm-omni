@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.model_executor.models.personaplex.personaplex_code2wav import _MIMI_DECODE_BATCH_FRAMES
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import (
     CODEBOOKS,
     FRAME_SIZE,
@@ -196,29 +197,91 @@ def test_graph_replay_is_bitwise_equal_to_eager_across_recycle() -> None:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_multi_frame_decode_graph_matches_eager_chunks() -> None:
-    # Shared decoder rows: every call carries all rows, only some are active.
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_multi_frame_decode_graph_matches_eager_chunks(batch_size: int) -> None:
+    # Code2Wav records the first single-frame delta and the full chunk, on one
+    # B=1 decoder per session. B=3 runs the same graphs on shared rows, where
+    # every call carries all rows and only some are active.
+    chunk = _MIMI_DECODE_BATCH_FRAMES
+    partial = chunk - 2
+    assert partial not in (1, chunk)
     device = torch.device("cuda")
-    codec = _random_codec(device, batch_size=3)
+    codec = _random_codec(device, batch_size=batch_size)
     generator = torch.Generator(device="cpu").manual_seed(SEED)
-    # First frame alone, then full chunks, then a partial tail with no graph.
+    # First frame alone, full chunks, a partial chunk with no graph, then a
+    # single frame and a full chunk again on the state the eager step left.
+    frame_counts = [1, chunk, chunk, partial, 1, chunk]
+    row_masks = [(True, True, False), (True, False, True), (True, True, True), (False, True, True)]
     steps = [
-        (1, _mask(True, True, False, device=device)),
-        (3, _mask(True, False, True, device=device)),
-        (3, _mask(True, True, True, device=device)),
-        (2, _mask(False, True, True, device=device)),
+        (frames, None if batch_size == 1 else _mask(*row_masks[step % len(row_masks)], device=device))
+        for step, frames in enumerate(frame_counts)
     ]
-    chunks = [torch.randint(0, 2048, (3, CODEBOOKS, frames), generator=generator) for frames, _ in steps]
+    chunks = [torch.randint(0, 2048, (batch_size, CODEBOOKS, frames), generator=generator) for frames, _ in steps]
 
-    eager = [codec.decode_frames(chunk, active) for chunk, (_, active) in zip(chunks, steps)]
-    codec.streaming_init(3)
-    assert codec.capture_cuda_graphs(encode=False, decode_frame_counts=(1, 3)) == ["decode_f1", "decode_f3"]
-    graphed = [codec.decode_frames(chunk, active) for chunk, (_, active) in zip(chunks, steps)]
+    eager = [codec.decode_frames(chunk_codes, active) for chunk_codes, (_, active) in zip(chunks, steps)]
+    codec.streaming_init(batch_size)
+    assert codec.capture_cuda_graphs(encode=False, decode_frame_counts=(1, chunk)) == ["decode_f1", f"decode_f{chunk}"]
+    graphed = [codec.decode_frames(chunk_codes, active) for chunk_codes, (_, active) in zip(chunks, steps)]
 
-    assert codec._cuda_graphs["decode_f1"].replays == 1
-    assert codec._cuda_graphs["decode_f3"].replays == 2
-    for (_, active), expected, actual in zip(steps, eager, graphed):
-        assert torch.equal(actual[active], expected[active])
+    # The partial chunk has no graph, so it is the one step that ran eagerly.
+    assert codec._cuda_graphs["decode_f1"].replays == 2
+    assert codec._cuda_graphs[f"decode_f{chunk}"].replays == 3
+    assert f"decode_f{partial}" not in codec._cuda_graphs
+    for (frames, active), expected, actual in zip(steps, eager, graphed):
+        assert actual.shape == (batch_size, frames * FRAME_SIZE)
+        rows = slice(None) if active is None else active
+        assert torch.equal(actual[rows], expected[rows])
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_failed_capture_warns_with_the_error_and_stays_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.personaplex import personaplex_mimi_cudagraph
+
+    device = torch.device("cuda")
+    codec = _random_codec(device, batch_size=2)
+    pcm = 0.1 * torch.randn(2, FRAME_SIZE, generator=torch.Generator(device="cpu").manual_seed(SEED))
+    expected_codes = codec.encode_frame(pcm)
+    expected_pcm = codec.decode_frame(expected_codes)
+    codec.streaming_init(2)
+
+    class _FailingGraph:
+        def __init__(self) -> None:
+            raise RuntimeError("CUDA error: out of memory")
+
+    warnings: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FailingGraph)
+    monkeypatch.setattr(
+        personaplex_mimi_cudagraph.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    assert codec.capture_cuda_graphs(encode=True, decode_frame_counts=(1,)) == []
+
+    assert codec._cuda_graphs == {}
+    assert len(warnings) == 1
+    args, kwargs = warnings[0]
+    assert "requested" in args[0] and "capture failed" in args[0] and "eagerly" in args[0]
+    assert args[1:] == ("encode/decode_f1", 2)
+    assert kwargs == {"exc_info": True}
+    # The warmup frames are rolled back, so the eager codec starts a fresh stream.
+    assert torch.equal(codec.encode_frame(pcm), expected_codes)
+    assert torch.equal(codec.decode_frame(expected_codes), expected_pcm)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_capture_does_not_hide_errors_that_are_not_cuda_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    codec = _random_codec(torch.device("cuda"), batch_size=2)
+
+    def _broken(*_args, **_kwargs):
+        raise TypeError("not a capture failure")
+
+    monkeypatch.setattr(codec, "_encode_frame_eager", _broken)
+    with pytest.raises(TypeError, match="not a capture failure"):
+        codec.capture_cuda_graphs(encode=True, decode_frame_counts=())
+    assert codec._cuda_graphs == {}
 
 
 @pytest.mark.cuda

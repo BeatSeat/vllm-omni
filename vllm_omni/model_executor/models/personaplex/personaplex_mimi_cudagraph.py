@@ -76,7 +76,11 @@ def capture_mimi_frame_graphs(
     warmup_iters: int = 2,
     pool: tuple[int, int] | None = None,
 ) -> dict[str, MimiFrameGraph]:
-    """Capture the codec's encode and ``F``-frame decode steps; empty on failure or off CUDA."""
+    """Capture the codec's encode and ``F``-frame decode steps.
+
+    Returns an empty dict off CUDA. A failed capture logs a warning with the
+    traceback and also returns an empty dict, so the codec keeps running eagerly.
+    """
     from vllm_omni.model_executor.models.personaplex.personaplex_mimi import CODEBOOKS, FRAME_SIZE
 
     device = torch.device(codec.device)
@@ -119,8 +123,17 @@ def capture_mimi_frame_graphs(
                     static_output = eager(static_input, static_active)
                 torch.accelerator.synchronize(device)
                 graphs[name] = MimiFrameGraph(graph, static_input, static_active, static_output, eager)
-    except Exception as exc:
-        logger.warning("PersonaPlex Mimi CUDA graph capture failed (%s); using eager execution", exc)
+    except RuntimeError:
+        # CUDA capture errors (including out of memory) are RuntimeErrors. The
+        # codec is still correct without graphs, so keep serving eagerly, and
+        # log the traceback because eager frames are launch bound.
+        logger.warning(
+            "PersonaPlex Mimi CUDA graphs were requested (%s at batch size %d) but capture failed; "
+            "the codec runs eagerly, which lowers realtime session capacity",
+            "/".join(name for name, _, _ in specs),
+            batch_size,
+            exc_info=True,
+        )
         graphs = {}
     finally:
         # Warmup frames advanced the real streaming state; restore a fresh

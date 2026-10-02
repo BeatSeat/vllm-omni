@@ -18,9 +18,11 @@
 #     about 80 MiB on Stage 0 and 5 MiB per decoder slot on Stage 1.
 #   * Each live session holds one 3000-frame KV window (~1.5 GiB) on Stage 0.
 #     To serve more sessions, raise duplex_session.max_sessions and both stages'
-#     max_num_seqs together, and size Stage 0 gpu_memory_utilization for the KV;
-#     on a 141 GB card, 64 sessions at Stage 0 utilization 0.75 (Stage 1 0.15)
-#     stay realtime.
+#     max_num_seqs together, and size Stage 0 gpu_memory_utilization for
+#     N x 1.5 GiB of KV: on a 141 GB card, utilization 0.75 holds about 60 full
+#     windows. Measured there (Stage 1 at 0.15), 64 concurrent 30 s sessions
+#     (375 frames each) stayed realtime. Longer sessions also cost more per
+#     step as their context fills.
 pipeline: personaplex
 session_mode: duplex
 duplex_session:

@@ -458,8 +458,9 @@ class PersonaPlexMimiCodec(nn.Module):
         real streaming state, which is then reset in place, so the codec is
         fresh afterwards. ``pool`` is a CUDA graph memory pool to share with
         other codecs replayed on the same stream; by default the codec gets a
-        private one. Returns the captured graph names; on a non-CUDA device, or
-        if capture fails, the codec stays eager.
+        private one. Returns the captured graph names; on a non-CUDA device the
+        codec stays eager, and so it does if capture fails with a CUDA error,
+        which is logged as a warning with its traceback.
         """
         from vllm_omni.model_executor.models.personaplex.personaplex_mimi_cudagraph import (
             capture_mimi_frame_graphs,

@@ -68,4 +68,3 @@ stages:
           breaker_window: 50
           breaker_late_frac: 0.1
           breaker_cooloff_s: 10.0
-          stats: false

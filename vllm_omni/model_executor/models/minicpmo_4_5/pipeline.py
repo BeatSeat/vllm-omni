@@ -21,23 +21,6 @@ MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
 _CODEC_EOS_TOKEN_ID = 6561  # tts_config.num_audio_tokens - 1
 
 
-def _talker_stop_token_ids() -> list[int]:
-    """Stage 1's default stop id: the codec EOS of the one-frame head.
-
-    The deploy config that arms the multi-frame decode (stage 1's
-    ``speculative_config``, under ``platforms.npu``) collapses the vLLM-level
-    head to the two-wide continue/stop row, where the codec EOS can never
-    appear; that same config adds the stop marker (1) through its
-    ``default_sampling_params``, and ``merge_sampling_constraints`` unions both
-    lists. The marker therefore travels with the block that needs it, and this
-    default covers every deployment without one.
-
-    A deployment that keeps the marker here instead ends every one-frame
-    request on the first ordinary codec id 1.
-    """
-    return [_CODEC_EOS_TOKEN_ID]
-
-
 MINICPMO_4_5_PIPELINE = PipelineConfig(
     model_type="minicpmo_4_5",
     default_deploy_config_name="minicpmo_4_5.yaml",
@@ -89,10 +72,10 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             supports_native_mrv2_data_plane=True,
             sampling_constraints={
                 "detokenize": False,
-                # The stop id has to be one the vLLM-level head can actually
-                # emit, and that head changes shape when the K-frame loop is
-                # armed -- see _talker_stop_token_ids.
-                "stop_token_ids": _talker_stop_token_ids(),
+                # The one-frame head's codec EOS. A multi-frame deploy config
+                # adds its stop marker (1) via default_sampling_params; keeping
+                # it here would end every one-frame request on codec id 1.
+                "stop_token_ids": [_CODEC_EOS_TOKEN_ID],
             },
         ),
         StagePipelineConfig(

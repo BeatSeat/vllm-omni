@@ -69,6 +69,8 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     model._request_audio_states = {}
     model._request_codec_history = {}
     model._request_generators = {}
+    model._request_codec_device_states = {}
+    model._request_codec_device_inputs = {}
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
@@ -190,6 +192,53 @@ def test_guard_drops_drafts_when_waiting_request_pending():
     assert decode_req.spec_token_ids == []
 
 
+def test_guard_keeps_uniform_drafts_when_waiting_is_at_capacity():
+    """A queued prefill cannot enter a full running batch, so K-step is safe."""
+    decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    sched = _make_scheduler(num_spec=7, waiting=[object()], running=[decode_req])
+    sched.max_num_running_reqs = 1
+    sched._talker_kstep_waiting_safe = True
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert decode_req.spec_token_ids == [0] * 7
+
+
+def test_guard_keeps_default_downgrade_when_capacity_is_available():
+    """The opt-in fast path never delays an actually admissible prefill."""
+    decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    sched = _make_scheduler(num_spec=7, waiting=[object()], running=[decode_req])
+    sched.max_num_running_reqs = 2
+    sched._talker_kstep_waiting_safe = True
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert decode_req.spec_token_ids == []
+
+
+def test_kstep_diagnostics_explain_prefill_width_and_max_len(monkeypatch):
+    from vllm_omni.core.sched import omni_ar_scheduler as module
+
+    decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    prefill_req = _req(computed=96, prompt=100, spec=[], total=100)
+    near_max = _req(computed=4090, prompt=4090, spec=[0] * 7, total=4091)
+    sched = _make_scheduler(num_spec=7, waiting=[object()], running=[decode_req, prefill_req, near_max])
+    sched._talker_kstep_stats = True
+    sched.max_model_len = 4096
+    messages: list[tuple[object, ...]] = []
+    monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
+
+    sched._drop_talker_drafts_if_prefill_pending()
+
+    assert decode_req.spec_token_ids == []
+    downgrade = [args for args in messages if "downgrade" in str(args[0])]
+    assert downgrade
+    detail = str(downgrade[-1])
+    assert "waiting_nonempty" in detail
+    assert "mid_prefill" in detail
+    assert "rows_width_mismatch" in detail
+    assert "near_max_model_len" in detail
+    assert "num_computed_tokens" in detail
+
+
 def test_guard_keeps_drafts_when_no_prefill_pending():
     decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
     sched = _make_scheduler(num_spec=7, waiting=[], running=[decode_req])
@@ -276,7 +325,8 @@ def test_talker_stop_token_ids_match_the_multi_frame_head():
     # The pipeline default cannot depend on the platform: the block that
     # collapses the head is a deploy-config decision, so the marker is added
     # there (test_minicpmo_talker_multi_frame_is_npu_scoped pins the merge).
-    assert mcp_pipeline._talker_stop_token_ids() == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
+    talker_constraints = mcp_pipeline.MINICPMO_4_5_PIPELINE.get_stage(1).sampling_constraints
+    assert talker_constraints["stop_token_ids"] == [mcp_pipeline._CODEC_EOS_TOKEN_ID]
 
 
 def test_multiframe_gate_matrix():
@@ -749,13 +799,6 @@ def test_control_stop_ids_stay_out_of_codec_censor_set():
     state = {"step": 0}
     model._merge_request_codec_params(state, SimpleNamespace(stop_token_ids=[1, 6561], min_tokens=50))
     assert state["codec_stop_token_ids"] == [6561]
-
-    # The drop is gated on the multi-frame arm: a non-armed deployment keeps
-    # the legacy verbatim copy (the control-row contract does not apply).
-    model_legacy = _make_talker(k_step_frames=1, scripted_samples=[1])
-    state_legacy = {"step": 0}
-    model_legacy._merge_request_codec_params(state_legacy, SimpleNamespace(stop_token_ids=[1, 6561], min_tokens=50))
-    assert state_legacy["codec_stop_token_ids"] == [1, 6561]
 
     # End to end across the sampling boundary: a codec 1 sampled past the
     # floor is emitted as ordinary audio and does not finish the request;

@@ -744,6 +744,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
         if method != "ngram":
             return 0
+        if not current_omni_platform.is_npu():
+            # The in-model sampler and two-wide stop/continue head are the NPU
+            # runner's contract. On CUDA the same speculative_config drives
+            # talker_kstep.py, which keeps this single-frame
+            # codec head and vLLM's sampler.
+            return 0
         frames = int(num_spec) + 1
         if frames < 2:
             # K=1 degenerates to the ordinary one-frame path; treat it as off
@@ -1141,11 +1147,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # which defers this ``.item()`` EOS check to make_omni_output.
         k_last = state.get("last_code") if isinstance(state, dict) else None
         if isinstance(k_last, int) and k_last >= 0:
-            code = torch.tensor(
-                [k_last],
-                dtype=torch.long,
-                device=self.emb_code[0].weight.device,
-            )
+            code = index_to_device([k_last], self.emb_code[0].weight.device)
             # k_last is already the host int this tensor was built from;
             # .item() would only sync it right back.
             code_id = k_last
@@ -2172,12 +2174,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     audio = torch.tensor([[code_id]], dtype=torch.long, device="cpu")
             empty_speech = bool(state.get("finished"))
             if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                codec_deltas[index] = audio.to(device=hidden.device, dtype=torch.long).reshape(-1, 1)
+                # The ids are read on the host from ``audio`` itself when it is
+                # a host tensor; the device copy and the history never wait.
+                delta_ids = audio.reshape(-1).tolist() if audio.device.type == "cpu" else None
+                if delta_ids is not None:
+                    codec_deltas[index] = index_to_device(delta_ids, hidden.device).reshape(-1, 1)
+                else:
+                    codec_deltas[index] = audio.to(device=hidden.device, dtype=torch.long).reshape(-1, 1)
+                    delta_ids = codec_deltas[index].cpu().reshape(-1).tolist()
                 state["step"] = int(state.get("step", 0)) + 1
                 # ``audio`` is the id sampled last step, i.e. exactly the
                 # history the logits computed below are scored against.
                 recent = state.get("recent_codes")
-                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].cpu().reshape(-1).tolist()
+                recent = (recent if isinstance(recent, list) else []) + delta_ids
                 state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
             recent_codes = state.get("recent_codes")
             if recent_codes:

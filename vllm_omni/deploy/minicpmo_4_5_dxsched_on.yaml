@@ -7,7 +7,6 @@
 base_config: minicpmo_4_5_dxsched.yaml
 duplex_session:
   max_sessions: 16
-  abort_on_model_listen: true
   barge_cut_on_model_yield: true
   barge_arm_min_silence_s: 0.6
   barge_arm_min_speech_s: 0.4
@@ -21,7 +20,6 @@ duplex_session:
     critical_stall_s: 0.05
     fire_grid_ms: 250
     idle_grid: true
-    stats: false
 
 connectors:
   connector_of_shared_memory:

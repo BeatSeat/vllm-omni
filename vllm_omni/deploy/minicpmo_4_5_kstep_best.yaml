@@ -3,4 +3,4 @@
 # VLLM_OMNI_CODEC_ONSET_MERGE=1, VLLM_OMNI_DUPLEX_GC=1 and the H7 Stage-2 connector extras.
 base_config: minicpmo_4_5_kstep.yaml
 duplex_session:
-  abort_on_model_listen: true
+  max_sessions: 16

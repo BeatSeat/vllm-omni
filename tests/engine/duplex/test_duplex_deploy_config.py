@@ -41,7 +41,6 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
     assert deploy.duplex_session.server_vad_model_path is None
-    assert deploy.duplex_session.abort_on_model_listen is False
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -110,6 +109,7 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
         ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
         ("minicpmo_4_5_dxsched.yaml", 16),
         ("minicpmo_4_5_dxsched_on.yaml", 16),
+        ("minicpmo_4_5_h100.yaml", 20),
     ],
 )
 def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, expected: int) -> None:
@@ -127,7 +127,6 @@ def test_dxsched_profile_keeps_the_inherited_switches_and_adds_the_omp_caps() ->
     # duplex_session and stage env / hf_overrides are replaced, not merged, by
     # resolve_deploy_yaml: the profile has to restate what it inherits.
     raw = resolve_deploy_yaml(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
-    assert raw["duplex_session"]["abort_on_model_listen"] is True
     stage0, stage1, stage2 = (_stage(raw, stage_id) for stage_id in (0, 1, 2))
     assert stage0["hf_overrides"]["duplex_audio_encoder_pinned_h2d"] is True
     assert stage0["hf_overrides"]["duplex_fbank_stats"] is False
@@ -143,7 +142,6 @@ def test_dxsched_profile_keeps_the_inherited_switches_and_adds_the_omp_caps() ->
     assert "connector_get_sleep_s" in connector["extra"]
 
     deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
-    assert deploy.duplex_session.abort_on_model_listen is True
     assert deploy.duplex_session.pacing == DuplexPacingConfig()
     assert deploy.duplex_session.barge_cut_on_model_yield is False
     # Code2Wav bucket switches are listed off.
@@ -202,7 +200,7 @@ def test_duplex_session_rejects_invalid_dxsched_values(tmp_path, body: str, matc
 
 
 def test_dxsched_profile_passes_codec_deadline_to_stage2_with_the_code_defaults() -> None:
-    from vllm_omni.core.sched.codec_deadline import CodecDeadlineConfig
+    from vllm_omni.model_executor.models.minicpmo_4_5.codec_deadline import CodecDeadlineConfig
 
     deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
     stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
@@ -213,7 +211,7 @@ def test_dxsched_profile_passes_codec_deadline_to_stage2_with_the_code_defaults(
 
 
 def test_dxsched_on_profile_turns_on_the_measured_switches_only() -> None:
-    from vllm_omni.core.sched.codec_deadline import CodecDeadlineConfig
+    from vllm_omni.model_executor.models.minicpmo_4_5.codec_deadline import CodecDeadlineConfig
 
     raw = resolve_deploy_yaml(_DEPLOY_DIR / "minicpmo_4_5_dxsched_on.yaml")
     base = resolve_deploy_yaml(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
@@ -243,10 +241,24 @@ def test_dxsched_on_profile_turns_on_the_measured_switches_only() -> None:
 
     deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_dxsched_on.yaml")
     session = deploy.duplex_session
-    assert session.abort_on_model_listen is True
     assert session.barge_cut_on_model_yield is True
     assert session.pacing == DuplexPacingConfig(
         enabled=True, onset_lead_max_s=0.9, onset_skip_response_wait=True, fire_grid_ms=250, idle_grid=True
     )
     codec = next(stage for stage in deploy.stages if stage.stage_id == 2).engine_extras["additional_config"]
     assert CodecDeadlineConfig.from_additional_config(codec) == CodecDeadlineConfig(enabled=True)
+
+
+def test_h100_profile_has_all_multimodal_and_scheduling_optimizations() -> None:
+    raw = resolve_deploy_yaml(_DEPLOY_DIR / "minicpmo_4_5_h100.yaml")
+    stage0 = _stage(raw, 0)
+    assert stage0["hf_overrides"]["vision_cuda_graph"] is True
+    assert stage0["hf_overrides"]["vision_fused_layers"] is True
+    assert stage0["hf_overrides"]["duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions"] is True
+    assert stage0["hf_overrides"]["duplex_audio_encoder_resident_slots"] == 20
+    assert stage0["hf_overrides"]["duplex_incremental_fbank"] is True
+    assert raw["duplex_session"]["max_sessions"] == 20
+    assert raw["duplex_session"]["barge_cut_on_model_yield"] is True
+    assert raw["duplex_session"]["pacing"]["enabled"] is True
+    stage2 = _stage(raw, 2)
+    assert stage2["engine_extras"]["additional_config"]["codec_deadline"]["enabled"] is True

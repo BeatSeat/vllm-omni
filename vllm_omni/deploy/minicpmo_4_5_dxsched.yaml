@@ -8,7 +8,6 @@
 base_config: minicpmo_4_5_pipe.yaml
 duplex_session:
   max_sessions: 16                 # restated from minicpmo_4_5.yaml
-  abort_on_model_listen: true      # restated from kstep_best
   barge_cut_on_model_yield: false
   barge_arm_min_silence_s: 0.6
   barge_arm_min_speech_s: 0.4      # backchannel floor
@@ -22,7 +21,6 @@ duplex_session:
     critical_stall_s: 0.05
     fire_grid_ms: 0                # 250 when on
     idle_grid: false
-    stats: false
 
 connectors:
   connector_of_shared_memory:

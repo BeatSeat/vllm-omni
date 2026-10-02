@@ -99,6 +99,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Output-payload constant snapshotted once in load_model; the cache
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
+        self._omni_post_load = None
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -212,6 +213,26 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
+        # Model-owned setup that needs loaded weights in eval mode (e.g. the
+        # MiniCPM-o duplex streaming audio encoder's CUDA graphs). Deferred to
+        # profile_run: vLLM's Worker.load_model scopes max_split_size_mb=20
+        # around this method, and a CUDA graph pool captured under it cannot
+        # reuse its blocks across captures (MiniCPM-o S0 audio graphs: ~5 GiB
+        # of private pool instead of ~0.4 GiB). In profile_run the profiler
+        # also counts the memory in the stage's budget.
+        post_load = getattr(model, "omni_post_load", None)
+        self._omni_post_load = post_load if callable(post_load) else None
+
+    def _run_omni_post_load(self) -> None:
+        """Run the model's ``omni_post_load`` once (see ``load_model``)."""
+        post_load = getattr(self, "_omni_post_load", None)
+        self._omni_post_load = None
+        if post_load is not None:
+            post_load()
+
+    def profile_run(self) -> None:
+        self._run_omni_post_load()
+        super().profile_run()
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes

@@ -158,6 +158,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Drained into an explicit FinishReason.ERROR output on the next
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
+        # Opt-in (stage ``additional_config.talker_kstep_waiting_safe``): keep the
+        # Talker K-step drafts while a prefill waits but cannot be admitted
+        # because the running batch is full, instead of a single-frame step.
+        additional_config = getattr(getattr(self, "vllm_config", None), "additional_config", None)
+        self._talker_kstep_waiting_safe = isinstance(additional_config, dict) and (
+            additional_config.get("talker_kstep_waiting_safe") is True
+        )
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -419,7 +426,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             max_len = int(max_len) if max_len is not None else None
         except (TypeError, ValueError):
             max_len = None
-        prefill_pending = bool(self.waiting)
+        waiting = bool(self.waiting)
+        prefill_pending = False
         widths: set[int] = set()
         for req in self.running:
             computed = int(req.num_computed_tokens)
@@ -438,11 +446,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             else:
                 widths.add(delta)
         uneven = len(widths) > 1
-        if not prefill_pending and not uneven:
+        if not prefill_pending and not uneven and (not waiting or self._talker_kstep_waiting_is_blocked()):
             return
         for req in self.running:
             if req.spec_token_ids:
                 req.spec_token_ids = []
+
+    def _talker_kstep_waiting_is_blocked(self) -> bool:
+        """Whether no waiting request can be admitted without a free running slot.
+
+        vLLM only moves a waiting request into a free running slot, so with a
+        full batch the waiting prefill cannot join this step and the uniform
+        decode spans stay uniform. The full-batch test is deliberately stronger
+        than a KV allocation probe, which is stateful.
+        """
+        if getattr(self, "_talker_kstep_waiting_safe", False) is not True:
+            return False
+        capacity = getattr(self, "max_num_running_reqs", None)
+        return isinstance(capacity, int) and capacity > 0 and len(self.running) >= capacity
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -1271,7 +1292,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
             return False
         runtime_config = duplex.get("runtime_config")
-        runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
+        if isinstance(runtime_config, dict):
+            # A session-static prompt carries this snapshot only on its first
+            # append (or after a config generation change); keep a copy for the
+            # window planner, which runs on every unit boundary.
+            session._minicpmo45_runtime_config = runtime_config
+        else:
+            runtime_config = getattr(session, "_minicpmo45_runtime_config", {})
+            if not isinstance(runtime_config, dict):
+                runtime_config = {}
         window = runtime_config.get("duplex_window_config")
         if not isinstance(window, dict):
             return False

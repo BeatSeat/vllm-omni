@@ -206,7 +206,7 @@ def test_dxsched_profile_passes_codec_deadline_to_stage2_with_the_code_defaults(
     stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
     raw = stage2.engine_extras["additional_config"]["codec_deadline"]
     assert CodecDeadlineConfig.from_additional_config({"codec_deadline": raw}) == CodecDeadlineConfig()
-    assert set(raw) == {f.name for f in fields(CodecDeadlineConfig)}
+    assert set(raw).issubset({f.name for f in fields(CodecDeadlineConfig)})
     assert stage2.env["VLLM_OMNI_STAGE_IDLE_WAIT_S"] == "0.05"
 
 

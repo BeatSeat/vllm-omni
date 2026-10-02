@@ -28,17 +28,20 @@ connectors:
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
-      # A future initial_codec_chunk_frames shape will use lazy capture unless
-      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      # The smaller first payload (initial_codec_chunk_frames) rides the lazy
+      # capture path unless HiFTGraphWrapper.derive_capture_bucket_size
+      # explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
       # Whole-Euler CUDA graphs exist for batch 1, 2, 4, ... up to
-      # micro_batch_size, which defaults to Stage 2 max_num_seqs: all graphs
-      # share one attention-cache arena of that many requests (~0.6 GiB each
-      # in fp32, 10 GiB at 16). Larger batches replay micro-batches;
-      # B > max_graph_batch runs eager.
-      max_graph_batch: 16
+      # micro_batch_size, which follows Stage 2 max_num_seqs (the old
+      # micro_batch_size / max_graph_batch overrides are no longer read). All
+      # graphs share one attention-cache arena of that many requests (~0.6 GiB
+      # each in fp32, 10 GiB at 16); larger batches replay micro-batches.
       cfm_max_graphs: 32
+      # Opt-in, lossless memory experiments. Keep disabled for the baseline:
+      # cfm_prompt_att_sharing: true
+      # cfm_arena_rows_from_graph_grid: true
 
 stages:
   - stage_id: 0

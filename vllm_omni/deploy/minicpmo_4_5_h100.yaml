@@ -1,0 +1,63 @@
+# H100 single-GPU duplex profile.
+#
+# This overlay contains the H7 graph path plus scheduling and host-runtime
+# settings. The fused DiT body is the measured near-fp32 H7 path (mel 72.8 dB,
+# same quality tier as SDPA). TF32 flow is retained for comparison with H7
+# (mel shift 0.67-1.41 dB); replace it after opt-num validates its alternative.
+#
+# MPS is started by the existing private daemon integration.  It requires the
+# default ``parallel_stage_init: false`` so physical-GPU initialization locks
+# serialize the three local EngineCore processes.
+base_config: minicpmo_4_5_kstep.yaml
+cuda_mps: true
+
+duplex_session:
+  max_sessions: 20
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # H7's precapture buckets; graph shape selection is arithmetic-neutral.
+      cfm_max_graphs: 128
+      cfm_graph_capture_frames: [50, 56, 150, 156]
+      # H7 fused DiT body (tf32x3 attention) and resident attention-cache
+      # slots.  Slot pooling is blockwise equivalent to the arena path and
+      # requires the fused body on SM80+ (including H100 SM90).
+      cfm_fused_body: true
+      cfm_slot_pool: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 20
+    env:
+      # Stage host work is small and must not create an OpenMP team that
+      # competes with the API process.  The API process caps torch threads in
+      # DuplexOmniEngine after the stages are ready.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+
+  - stage_id: 1
+    max_num_seqs: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+
+  - stage_id: 2
+    max_num_seqs: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      MINICPMO_CODE2WAV_TF32: "flow"
+      # Keep the H7 Whole-Euler graph buckets stable across runs.  This env is
+      # stage-scoped, so it reaches only Code2Wav's process.
+      VLLM_OMNI_CFM_GRAPH_GRID: "1,4,8,16,20"
+
+platforms:
+  cuda:
+    stages:
+      # Keep the KV reservations used by the H7 capacity profile explicit;
+      # MPS does not change the per-stage memory reservation contract.
+      - stage_id: 0
+        kv_cache_memory_bytes: 17179869184  # 16 GiB
+      - stage_id: 1
+        kv_cache_memory_bytes: 8589934592  # 8 GiB

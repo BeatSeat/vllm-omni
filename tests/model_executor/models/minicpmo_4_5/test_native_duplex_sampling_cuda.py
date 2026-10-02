@@ -19,9 +19,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 def _on_cuda(build):
     def build_cuda():
         model, states, md = build()
-        md.generators = {
-            row: torch.Generator(device="cuda").manual_seed(100 + row) for row in md.generators
-        }
+        md.generators = {row: torch.Generator(device="cuda").manual_seed(100 + row) for row in md.generators}
         md.temperature, md.top_k, md.top_p = (t.cuda() for t in (md.temperature, md.top_k, md.top_p))
         model._minicpmo45_duplex_row_sampling_host = {
             row: (float(md.temperature[row].cpu()), int(md.top_k[row].cpu()), float(md.top_p[row].cpu()))

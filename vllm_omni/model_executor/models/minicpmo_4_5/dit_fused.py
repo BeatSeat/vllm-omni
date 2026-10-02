@@ -175,7 +175,6 @@ def _conv_taps_weight(conv: nn.Conv1d) -> torch.Tensor:
     )
 
 
-
 def _conv_history(
     old_cache: torch.Tensor | None, rows: int, width: int, frames: int, channels: int, like: torch.Tensor
 ) -> torch.Tensor:

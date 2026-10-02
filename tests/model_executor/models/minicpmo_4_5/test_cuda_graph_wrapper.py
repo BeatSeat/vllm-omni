@@ -1176,7 +1176,11 @@ def test_whole_euler_shared_prompt_cache_is_bit_exact(monkeypatch: pytest.Monkey
         )
         result = wrapper.replay(**inputs, cnn_cache=None, att_cache=[att_cache], att_keep=(12, 4))
         assert result is not None
-        return result[0], result[1], result[2][0].materialize() if isinstance(result[2][0], SharedPromptAttCache) else result[2][0]
+        return (
+            result[0],
+            result[1],
+            result[2][0].materialize() if isinstance(result[2][0], SharedPromptAttCache) else result[2][0],
+        )
 
     tensor_result = run(prompt)
     shared_result = run(shared)

@@ -121,7 +121,6 @@ def test_fused_body_first_chunk_without_caches(device: str) -> None:
         torch.testing.assert_close(got, want, rtol=1e-5, atol=2e-5)
 
 
-
 def test_modulation_table_layout() -> None:
     estimator = _upstream_dit("cpu")
     embedding = estimator.t_embedder(torch.tensor([0.3])).unsqueeze(1)

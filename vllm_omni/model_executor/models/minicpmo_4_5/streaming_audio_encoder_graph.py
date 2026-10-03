@@ -89,8 +89,8 @@ class StreamingAudioGraphEncoder:
         *,
         unit_frames: int,
         pool_step: int,
-        batch_sizes: Sequence[int] = DEFAULT_GRAPH_BATCH_SIZES,
-        cache_buckets: Sequence[int] = DEFAULT_GRAPH_CACHE_BUCKETS,
+        batch_sizes: Sequence[int] | None = None,
+        cache_buckets: Sequence[int] | None = None,
         page_positions: int = DEFAULT_KV_PAGE_POSITIONS,
         pinned_h2d: bool = False,
     ) -> None:
@@ -109,7 +109,8 @@ class StreamingAudioGraphEncoder:
         self.pooled_length = min(nominal_pooled, self.unit_length // self.pool_step)
         if self.unit_length <= 0 or self.pooled_length <= 0:
             raise ValueError(f"unit_frames={unit_frames} pool_step={pool_step} leaves no steady unit output")
-        self.batch_sizes, self.cache_buckets = normalize_buckets(batch_sizes), normalize_buckets(cache_buckets)
+        self.batch_sizes = normalize_buckets(batch_sizes or DEFAULT_GRAPH_BATCH_SIZES)
+        self.cache_buckets = normalize_buckets(cache_buckets or DEFAULT_GRAPH_CACHE_BUCKETS)
         if not self.batch_sizes or not self.cache_buckets:
             raise ValueError("StreamingAudioGraphEncoder needs at least one batch size and one cache bucket")
         self.max_batch, self.max_cache_bucket = max(self.batch_sizes), max(self.cache_buckets)
@@ -171,8 +172,7 @@ class StreamingAudioGraphEncoder:
             residual = hidden
             normed = layer.self_attn_layer_norm(hidden)
             query = attention.q_proj(normed) * attention.scaling
-            key = attention.k_proj(normed)
-            value = attention.v_proj(normed)
+            key, value = attention.k_proj(normed), attention.v_proj(normed)
             cache[layer_index, 0, :, cache_len : cache_len + self.unit_length, :].copy_(key)
             cache[layer_index, 1, :, cache_len : cache_len + self.unit_length, :].copy_(value)
             q = query.view(batch, self.unit_length, self.num_heads, head_dim).transpose(1, 2)

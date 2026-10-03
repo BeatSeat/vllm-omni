@@ -2,16 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Incremental Stage-0 streaming fbank (HF override ``duplex_incremental_fbank``, default off).
 
-The remote ``StreamingMelProcessorExact._extract_full`` recomputes the CPU
-Whisper log-mel over the whole streaming buffer (up to its 30 s slide) on
-every unit. This keeps the ``|STFT|^2`` rows already computed and recomputes
-only the right edge (frames whose window reaches new samples or the reflect
-pad) and, after a slide, the new left edge. The mel projection, log, dynamic
-range and scaling still run over the whole buffer with the original's shapes
-and memory layout, so the features stay bitwise equal: the mel GEMM is not row
-independent (MKL's remainder kernel), and an STFT batch's last frames may take
-a remainder path, so recomputes start on ``_ALIGN_FRAMES`` boundaries and
-their last ``_ALIGN_FRAMES`` frames are not kept.
+The remote ``StreamingMelProcessorExact._extract_full`` recomputes the CPU Whisper log-mel over the whole
+streaming buffer (up to its 30 s slide) on every unit. This keeps the ``|STFT|^2`` rows already computed and
+recomputes only the right edge (frames whose window reaches new samples or the reflect pad) and, after a slide,
+the new left edge. The mel projection, log, dynamic range and scaling still run over the whole buffer with the
+original's shapes and memory layout, so the features stay bitwise equal: the mel GEMM is not row independent
+(MKL's remainder kernel), and an STFT batch's last frames may take a remainder path, so recomputes start on
+``_ALIGN_FRAMES`` boundaries and their last ``_ALIGN_FRAMES`` frames are not kept.
 """
 
 from __future__ import annotations

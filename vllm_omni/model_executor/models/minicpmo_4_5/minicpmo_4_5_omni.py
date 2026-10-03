@@ -339,8 +339,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             if force_listen and segment_key in force_listen_segments:
                 continue
             if force_listen:
-                # fill_ keeps the scalars on the host; assigning one element
-                # copies a host scalar tensor and waits for the device.
+                # fill_ keeps the scalars on the host; an element assignment copies a scalar tensor and syncs.
                 logits[row_idx].fill_(float("-inf"))
                 logits[row_idx].narrow(0, listen_id, 1).fill_(0.0)
                 force_listen_segments.add(segment_key)
@@ -567,12 +566,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         del device
         if self.model_stage != "llm":
             return
-        appends = []
-        for req_id in req_ids:
-            info = model_intermediate_buffer.get(req_id)
-            duplex = info.get("duplex") if isinstance(info, dict) else None
-            if isinstance(duplex, dict) and duplex.get("data_plane") is True:
-                appends.append(duplex)
+        infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]
+        duplexes = [info.get("duplex") for info in infos if isinstance(info, dict)]
+        appends = [duplex for duplex in duplexes if isinstance(duplex, dict) and duplex.get("data_plane") is True]
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         frame_appends = [d for d in appends if isinstance(d.get("payload"), dict) and d["payload"].get("video_frames")]
         if len(frame_appends) >= 2:
@@ -590,10 +586,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         for duplex in appends:
             session_id = str(duplex.get("session_id") or "")
             payload = duplex.get("payload")
-            if not session_id or not isinstance(payload, dict) or session_id in seen:
-                seen.add(session_id)  # a second append of one session keeps its order: preprocess
-                continue
+            repeated = session_id in seen
             seen.add(session_id)
+            if not session_id or not isinstance(payload, dict) or repeated:
+                continue  # a second append of one session keeps its order: preprocess
             kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
             if helper.needs_prefill(helper.sessions.get(session_id), kwargs["epoch"], kwargs["seq"]):
                 candidates.append((session_id, duplex, payload, kwargs))
@@ -792,9 +788,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                     if isinstance(key, str) and isinstance(value, int) and value >= 0
                 }
                 if special_keys:
-                    # Host tensors: every consumer reads these back on the host, and a
-                    # pageable host->device copy per row and key would wait for the
-                    # whole forward, serializing the step.
+                    # Host tensors: every consumer reads them on the host, and a pageable
+                    # host->device copy per row and key would wait for the whole forward.
                     multimodal_outputs["meta"] = {
                         key: [
                             torch.tensor([int(value)], dtype=torch.long)
@@ -921,8 +916,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         chunk_terminators = self._minicpmo45_chunk_terminator_token_ids(token_ids)
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
-        # The runner's host copies of the sampling parameters, else one device
-        # read per parameter for the whole batch.
         num_rows = logits.shape[0]
         row_params = self._minicpmo45_duplex_row_params(sampling_metadata, num_rows)
 
@@ -959,15 +952,20 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         sampling_metadata: SamplingMetadata,
         num_rows: int,
     ) -> list[tuple[float, float, float]]:
-        """Every row's (temperature, top_k, top_p), preferring host copies when present."""
+        """Every row's (temperature, top_k, top_p): host copies when present, else one device read per parameter."""
         host = getattr(self, "_minicpmo45_duplex_row_sampling_host", None) or {}
         columns = []
         for column, (name, default) in enumerate((("temperature", 0.7), ("top_k", 100), ("top_p", 0.8))):
             value = getattr(sampling_metadata, name, None)
-            if isinstance(value, torch.Tensor) and value.numel() == num_rows and host.keys() >= set(range(num_rows)):
+            if not isinstance(value, torch.Tensor):
+                columns.append([self._sampling_metadata_value(sampling_metadata, name, 0, default)] * num_rows)
+            elif value.numel() == num_rows and host.keys() >= set(range(num_rows)):
                 columns.append([float(host[row][column]) for row in range(num_rows)])
+            elif value.numel() == 0:
+                columns.append([default] * num_rows)
             else:
-                columns.append(self._sampling_metadata_rows(sampling_metadata, name, num_rows, default))
+                flat = [float(v) for v in value.reshape(-1).tolist()]
+                columns.append([flat[min(row, len(flat) - 1)] for row in range(num_rows)])
         return list(zip(*columns, strict=True))
 
     def _minicpmo45_policy_limit(self, name: str, default: int) -> int:
@@ -988,11 +986,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def _minicpmo45_duplex_cut_tables(self, token_ids: dict[str, int], vocab: int, device):
         """Per-token decoded length and "never cut" mask for ``_maybe_cut_minicpmo45_native_duplex_text_chunk``.
 
-        Byte-level decoding is additive after a prefix that ends on a
-        character boundary, so ``len(decode(chunk + [t]))`` is
-        ``len(decode(chunk)) + length[t]``. Returns None (no device cut) when
-        the tokenizer can not guarantee that: no batch decode, or the
-        whitespace clean-up that rewrites across token boundaries.
+        Byte-level decoding is additive after a prefix ending on a character boundary:
+        ``len(decode(chunk + [t])) == len(decode(chunk)) + length[t]``. None (no device cut) without batch
+        decode, or with the whitespace clean-up that rewrites across token boundaries.
         """
         key = (vocab, str(device))
         cache = getattr(self, "_minicpmo45_duplex_cut_tables_cache", None)
@@ -1024,14 +1020,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         row_idxs: list[int],
         recent_tokens_by_row: dict[int, list[int]],
         token_ids: dict[str, int],
+        max_chars: int,
     ) -> list[int] | None:
         """Each row's decoded current-chunk length (-1: never cut), or None when a row needs the host decode.
 
         A chunk ending in U+FFFD may end inside a character the next token's bytes complete: not additive.
         """
-        max_chars = self._minicpmo45_policy_limit(
-            "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
-        )
         decode = getattr(self._minicpmo45_tokenizer(), "decode", None)
         if max_chars <= 0 or not callable(decode):
             return [-1] * len(row_idxs)
@@ -1053,27 +1047,17 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     ) -> dict[int, list[int]]:
         """Each row's accepted output tokens (the current chunk's history), placeholders dropped."""
         output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
-        return {
-            row_idx: [
-                int(t)
-                for t in (output_token_ids[row_idx] if row_idx < len(output_token_ids) else ())
-                if isinstance(t, int) and t >= 0
-            ]
-            for row_idx in row_idxs
-        }
+        rows = {row_idx: output_token_ids[row_idx] if row_idx < len(output_token_ids) else () for row_idx in row_idxs}
+        return {row: [int(t) for t in tokens if isinstance(t, int) and t >= 0] for row, tokens in rows.items()}
 
     def _minicpmo45_duplex_capped_rows(self, row_idxs: list[int], recent: dict[int, list[int]]) -> set[int]:
         """Rows at their per-chunk speak-length cap: chunk_eos without sampling anything."""
         limit = self._minicpmo45_policy_limit(
             "max_new_speak_tokens_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
         )
-        capped = set()
-        for row_idx in row_idxs:
-            request_max = self._minicpmo45_duplex_row_request_max_tokens(row_idx)
-            row_limit = limit if request_max is None else min(limit, request_max)
-            if len(recent[row_idx]) >= max(1, row_limit - 1):
-                capped.add(row_idx)
-        return capped
+        request_max = {row_idx: self._minicpmo45_duplex_row_request_max_tokens(row_idx) for row_idx in row_idxs}
+        row_limit = {row: limit if request is None else min(limit, request) for row, request in request_max.items()}
+        return {row for row, row_cap in row_limit.items() if len(recent[row]) >= max(1, row_cap - 1)}
 
     def _minicpmo45_duplex_boundary_hits(
         self, logits: torch.Tensor, rows: list[int], chunk_eos_id: int, sampling_metadata: SamplingMetadata
@@ -1133,18 +1117,29 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             for pos, local_idx in enumerate(greedy):
                 samples[local_idx] = greedy_sample[pos : pos + 1]
         drawn = [local_idx for local_idx in range(len(rows)) if samples[local_idx] is None]
+        # Candidate-space sampling: one batched top-k per (top_k, top_p) group,
+        # then a multinomial over ~top_k candidates with the row's generator.
+        groups: dict[tuple[int, float], list[int]] = {}
+        for local_idx in drawn:
+            _temperature, top_k, top_p = row_params[rows[local_idx]]
+            groups.setdefault((int(top_k), float(top_p)), []).append(local_idx)
+        candidates: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         if drawn:
-            # Candidate-space sampling: one batched top-k per parameter group,
-            # then a multinomial over ~top_k candidates with the row's generator.
-            cand_probs, cand_indices = self._duplex_stage2_candidate_probs(
-                stage2_logits[index_to_device(drawn, device)], [row_params[rows[local_idx]] for local_idx in drawn]
-            )
-            for pos, local_idx in enumerate(drawn):
-                generator = generators.get(rows[local_idx])
-                if rewinds is not None:
-                    rewinds[local_idx] = _generator_rewind(generator)
-                draw = torch.multinomial(cand_probs[pos], num_samples=1, generator=generator)
-                samples[local_idx] = cand_indices[pos].gather(0, draw)
+            temps = torch.tensor([float(row_params[row_idx][0]) for row_idx in rows], dtype=stage2_logits.dtype)
+            temps = to_device_nonblocking(temps, device).view(-1, 1)
+            for (top_k, top_p), members in groups.items():
+                # Device-side row gathers: a python-list index would stage a
+                # pageable host copy and block the host on queued GPU work.
+                members_t = index_to_device(members, device)
+                group_logits = stage2_logits[members_t] / temps[members_t]
+                cand_probs, cand_indices = self._duplex_top_k_top_p_candidates(group_logits, top_k=top_k, top_p=top_p)
+                candidates.update((local_idx, (cand_probs[i], cand_indices[i])) for i, local_idx in enumerate(members))
+        for local_idx in drawn:
+            generator = generators.get(rows[local_idx])
+            if rewinds is not None:
+                rewinds[local_idx] = _generator_rewind(generator)
+            probs, indices = candidates[local_idx]
+            samples[local_idx] = indices.gather(0, torch.multinomial(probs, num_samples=1, generator=generator))
         return torch.cat(samples)  # type: ignore[arg-type]
 
     def _sample_minicpmo45_native_duplex_rows(
@@ -1207,21 +1202,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         recent = self._minicpmo45_duplex_recent_tokens(sampling_metadata, row_idxs)
         capped = self._minicpmo45_duplex_capped_rows(row_idxs, recent) if has_chunk_eos else set()
         stage2_rows = [row_idx for row_idx in row_idxs if row_idx not in capped]
-        if any(
-            generators.get(row_idx) is None and not (all_greedy or float(row_params[row_idx][0]) <= 0)
-            for row_idx in stage2_rows
-        ):
+        drawn_rows = [row_idx for row_idx in stage2_rows if not (all_greedy or float(row_params[row_idx][0]) <= 0)]
+        if any(generators.get(row_idx) is None for row_idx in drawn_rows):
             return None
         cut = None
         if has_chunk_eos and stage2_rows:
-            bases = self._minicpmo45_duplex_cut_bases(stage2_rows, recent, token_ids)
+            max_chars = self._minicpmo45_policy_limit(
+                "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
+            )
+            bases = self._minicpmo45_duplex_cut_bases(stage2_rows, recent, token_ids, max_chars)
             if bases is None:
                 return None
             if any(base >= 0 for base in bases):
                 tables = self._minicpmo45_duplex_cut_tables(token_ids, vocab, device)
                 if tables is None:
                     return None
-                cut = (tables, bases)
+                cut = (tables, bases, max_chars)
 
         final = torch.full((len(row_idxs),), max(chunk_eos_id, 0), dtype=torch.long, device=device)
         position = {row_idx: pos for pos, row_idx in enumerate(row_idxs)}
@@ -1233,21 +1229,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 if has_chunk_eos
                 else torch.zeros(len(stage2_rows), dtype=torch.bool, device=device)
             )
+            rewinds_into = rewinds if has_chunk_eos else None
             raw = self._minicpmo45_duplex_stage2_draws(
-                logits,
-                stage2_rows,
-                recent,
-                token_ids,
-                row_params,
-                sampling_metadata,
-                rewinds if has_chunk_eos else None,
+                logits, stage2_rows, recent, token_ids, row_params, sampling_metadata, rewinds_into
             )
             token = raw
             if cut is not None:
-                (lengths, never_cut), bases = cut
-                max_chars = self._minicpmo45_policy_limit(
-                    "max_speak_chars_per_chunk", MiniCPMO45DuplexPolicy.DEFAULT_MAX_SPEAK_CHARS_PER_CHUNK
-                )
+                (lengths, never_cut), bases, max_chars = cut
                 base_t = index_to_device(bases, device)
                 cut_t = (base_t >= 0) & ~never_cut[raw] & (base_t + lengths[raw].long() >= max_chars)
                 token = torch.where(cut_t, torch.full_like(raw, chunk_eos_id), raw)
@@ -1313,11 +1301,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         try:
             for pos, row_idx in enumerate(pending.row_idxs):
                 _final, raw, hit = values[pos]
-                if not pending.stage2[pos]:
-                    continue
-                if hit:
+                if pending.stage2[pos] and hit:
                     pending.rewinds.get(pos, lambda: None)()
-                else:
+                elif pending.stage2[pos]:
                     self._record_minicpmo45_duplex_generation_token(row_idx, int(raw))
             for pos, row_idx in enumerate(pending.row_idxs):
                 self._record_minicpmo45_duplex_terminator(row_idx, int(values[pos][0]), pending.token_ids)
@@ -1585,23 +1571,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             tokenizer_special_ids=getattr(tokenizer, "all_special_ids", []) if tokenizer is not None else [],
         )
 
-    @classmethod
-    def _sampling_metadata_rows(
-        cls,
-        sampling_metadata: SamplingMetadata,
-        name: str,
-        num_rows: int,
-        default: float,
-    ) -> list[float]:
-        """``_sampling_metadata_value`` for rows ``0..num_rows-1`` with a single device read."""
-        value = getattr(sampling_metadata, name, None)
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return [default] * num_rows
-            flat = [float(v) for v in value.reshape(-1).tolist()]
-            return [flat[min(row, len(flat) - 1)] for row in range(num_rows)]
-        return [cls._sampling_metadata_value(sampling_metadata, name, 0, default)] * num_rows
-
     @staticmethod
     def _sampling_metadata_value(
         sampling_metadata: SamplingMetadata,
@@ -1663,30 +1632,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             probs = probs / probs.sum(dim=-1, keepdim=True)
         return probs, indices
 
-    def _duplex_stage2_candidate_probs(
-        self,
-        rows_logits: torch.Tensor,
-        row_params: list[tuple[float, float, float]],
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Per-row ``(candidate probs, candidate ids)`` of the stage-2 draw, one top-k per ``(top_k, top_p)``."""
-        groups: dict[tuple[int, float], list[int]] = {}
-        for pos, (_temperature, top_k, top_p) in enumerate(row_params):
-            groups.setdefault((int(top_k), float(top_p)), []).append(pos)
-        temps = torch.tensor([float(p[0]) for p in row_params], dtype=rows_logits.dtype)
-        temps = to_device_nonblocking(temps, rows_logits.device).view(-1, 1)
-        probs: list[torch.Tensor] = [torch.empty(0)] * len(row_params)
-        indices: list[torch.Tensor] = [torch.empty(0, dtype=torch.long)] * len(row_params)
-        for (top_k, top_p), members in groups.items():
-            # Device-side row gathers: a python-list index would stage a
-            # pageable host copy and block the host on queued GPU work.
-            members_t = index_to_device(members, rows_logits.device)
-            rows = rows_logits[members_t] / temps[members_t]
-            cand_probs, cand_indices = self._duplex_top_k_top_p_candidates(rows, top_k=top_k, top_p=top_p)
-            for row, pos in enumerate(members):
-                probs[pos] = cand_probs[row]
-                indices[pos] = cand_indices[row]
-        return probs, indices
-
     @staticmethod
     def _duplex_boundary_chunk_eos_probs(logits: torch.Tensor, chunk_eos_id: int) -> torch.Tensor:
         """Per-row ``softmax(logits)[:, chunk_eos_id]`` as ``exp(l_eos - logsumexp(l))``."""
@@ -1726,8 +1671,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     def omni_post_load(self) -> None:
         """Runner hook at the start of the profile run, weights loaded and in eval mode.
 
-        Captures the duplex Stage-0 streaming audio encoder's CUDA graphs on the
-        thinker's device; their runtime is built in ``__init__``, before the encoder loads.
+        Captures the duplex Stage-0 streaming audio encoder's CUDA graphs on the thinker's device.
         """
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         build = getattr(helper, "build_audio_cuda_graph", None)

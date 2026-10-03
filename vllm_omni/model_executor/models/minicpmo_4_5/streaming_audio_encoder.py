@@ -23,9 +23,8 @@ _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 class StreamingAudioKVCache:
     """One session's streaming-encoder self-attention cache, written in place.
 
-    Layout ``[layers, 2 (key/value), capacity, embed_dim]``: token-major, so
-    appending a unit is one contiguous copy per layer and attention reads a
-    strided ``[1, heads, length, head_dim]`` view without materializing it.
+    Layout ``[layers, 2 (key/value), capacity, embed_dim]``: token-major, so appending a unit is one contiguous
+    copy per layer and attention reads a strided ``[1, heads, length, head_dim]`` view without materializing it.
     Capacity grows in ``page_positions`` steps up to ``max_positions``.
     """
 
@@ -218,8 +217,7 @@ def encode_streaming_audio_batch(
     weight = encoder.conv1.weight
     dtype, device = weight.dtype, weight.device
     max_positions = int(encoder.embed_positions.weight.shape[0])
-    embed_dim = int(encoder.config.d_model)
-    num_heads = int(encoder.config.encoder_attention_heads)
+    embed_dim, num_heads = int(encoder.config.d_model), int(encoder.config.encoder_attention_heads)
 
     outputs: list[torch.Tensor | None] = [None] * len(chunks)
     caches: list[StreamingAudioKVCache | None] = [chunk.cache for chunk in chunks]
@@ -260,8 +258,7 @@ def encode_streaming_audio_batch(
     max_frames = int(mel.shape[-1])
     for slot, row in enumerate(rows):
         if row.frames < max_frames:
-            # conv2 must see zeros past each row's end, as its own padding
-            # would in the per-session call.
+            # conv2 must see zeros past each row's end, as its own padding would in the per-session call.
             hidden[slot, :, row.frames :].zero_()
     hidden = nn.functional.gelu(encoder.conv2(hidden)).permute(0, 2, 1)
     pieces = [hidden[slot, row.start : row.start + row.length] for slot, row in enumerate(rows)]
@@ -274,16 +271,14 @@ def encode_streaming_audio_batch(
     lengths = [row.length for row in rows]
     total_rows = sum(lengths)
     head_dim = embed_dim // num_heads
-    # The per-session path passes an all-zero additive mask; keep it so each
-    # row dispatches to the same attention kernel.
+    # The per-session path passes an all-zero additive mask; keep it for the same attention kernel.
     masks = [torch.zeros((1, 1, row.length, row.total), dtype=dtype, device=device) for row in rows]
     for layer_index, layer in enumerate(encoder.layers):
         attention = layer.self_attn
         residual = hidden
         normed = layer.self_attn_layer_norm(hidden)
         query = attention.q_proj(normed) * attention.scaling
-        key = attention.k_proj(normed)
-        value = attention.v_proj(normed)
+        key, value = attention.k_proj(normed), attention.v_proj(normed)
         destinations = [view[0][layer_index] for view in views] + [view[1][layer_index] for view in views]
         torch._foreach_copy_(destinations, [*key.split(lengths), *value.split(lengths)])
         queries = query.view(1, total_rows, num_heads, head_dim).transpose(1, 2).split(lengths, dim=2)

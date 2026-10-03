@@ -18,6 +18,7 @@
 # limitations under the License.
 
 import inspect
+import itertools
 import math
 import os
 import warnings
@@ -136,6 +137,8 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder as streaming_audio
+from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder_graph as streaming_audio_graph
 from vllm_omni.model_executor.models.minicpmo_4_5.vision_fused import (
     VisionGraphEncoder,
     encode_packed_fused,
@@ -406,21 +409,6 @@ class MiniCPMOConfig(Qwen2Config):
         self.patch_size = self.vision_config.patch_size
 
         super().__init__(**kwargs)
-
-
-def _resolve_vision_attention_implementation(vision_config: Any, model_config: Any) -> str:
-    """The SigLIP attention kernel: a legacy engine override, else the vision config, else SDPA.
-
-    SDPA is the eager math without the ``(B, H, L, L)`` scores; ``hf_overrides``
-    can set ``vision_config._attn_implementation`` to ``"eager"`` or ``"flash_attention_2"``.
-    """
-    implementation = getattr(model_config, "_attn_implementation", None)
-    if implementation is None:
-        implementation = getattr(vision_config, "_attn_implementation", None) or "sdpa"
-    if implementation == "flash_attention_2" and not is_flash_attn_2_available():
-        logger.warning("flash_attention_2 requested for the MiniCPM-o vision tower but unavailable; using sdpa")
-        return "sdpa"
-    return implementation
 
 
 # ============== Image Processing Classes ==============
@@ -1157,20 +1145,11 @@ class SiglipAttention(nn.Module):
 
         ``seq_groups`` holds contiguous ``(start_token, num_items, seq_len)`` runs of unpadded items.
         """
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        attn_output = torch.empty_like(query_states)
+        states = [projection(hidden_states) for projection in (self.q_proj, self.k_proj, self.v_proj)]
+        attn_output = torch.empty_like(states[0])
         for start, num_items, seq_len in seq_groups:
-            end = start + num_items * seq_len
-            shape = (num_items, seq_len, self.num_heads, self.head_dim)
-            attn_output[start:end].view(shape).copy_(
-                self._attend_unpadded(
-                    query_states[start:end].view(shape),
-                    key_states[start:end].view(shape),
-                    value_states[start:end].view(shape),
-                )
-            )
+            end, shape = start + num_items * seq_len, (num_items, seq_len, self.num_heads, self.head_dim)
+            attn_output[start:end].view(shape).copy_(self._attend_unpadded(*(x[start:end].view(shape) for x in states)))
         return self.out_proj(attn_output)
 
 
@@ -1185,30 +1164,18 @@ class SiglipSdpaAttention(SiglipAttention):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if output_attentions:
             return super().forward(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions)
-
         batch_size, q_len, _ = hidden_states.size()
         shape = (batch_size, q_len, self.num_heads, self.head_dim)
-        query_states = self.q_proj(hidden_states).view(shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(shape).transpose(1, 2)
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-            scale=self.scale,
-        )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, q_len, self.embed_dim)
-        return self.out_proj(attn_output), None
+        states = [projection(hidden_states).view(shape) for projection in (self.q_proj, self.k_proj, self.v_proj)]
+        attn_output = self._attend_unpadded(*states, attn_mask=attention_mask)
+        return self.out_proj(attn_output.reshape(batch_size, q_len, self.embed_dim)), None
 
-    def _attend_unpadded(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    def _attend_unpadded(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        query, key, value = (x.transpose(1, 2) for x in (query, key, value))
         return F.scaled_dot_product_attention(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            dropout_p=self.dropout if self.training else 0.0,
-            scale=self.scale,
+            query, key, value, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, scale=self.scale
         ).transpose(1, 2)
 
 
@@ -1455,12 +1422,8 @@ class SiglipEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        if self._use_flash_attention_2:
-            self.self_attn = SiglipFlashAttention2(config)
-        elif config._attn_implementation == "sdpa":
-            self.self_attn = SiglipSdpaAttention(config)
-        else:
-            self.self_attn = SiglipAttention(config)
+        attention_classes = {"flash_attention_2": SiglipFlashAttention2, "sdpa": SiglipSdpaAttention}
+        self.self_attn = attention_classes.get(config._attn_implementation, SiglipAttention)(config)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -1687,8 +1650,8 @@ class SiglipEncoder(nn.Module):
 class SiglipVisionTransformer(SiglipPreTrainedModel):
     config_class = SiglipVisionConfig
     main_input_name = "pixel_values"
-    # Transformers 5 spells the flash flag ``_supports_flash_attn``; SDPA is
-    # the default vision kernel (see _resolve_vision_attention_implementation).
+    # Transformers 5 spells the flash flag ``_supports_flash_attn``; SDPA is the
+    # default vision kernel (see MiniCPMO45OmniLLMForConditionalGeneration).
     _supports_flash_attn = True
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -1785,9 +1748,8 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
     def forward_packed(self, pixel_values: torch.Tensor, layouts: Sequence[tuple[int, int, int]]) -> torch.Tensor:
         """The padded ``forward`` per item, without padding, over items packed along the patch axis.
 
-        ``pixel_values`` is ``(1, C, patch, tokens * patch)``, every item's strip
-        in order (the stride-``patch`` embedding cuts at item boundaries);
-        ``layouts`` lists ``(h, w, count)`` runs of equal grids. Returns ``(tokens, embed)``.
+        ``pixel_values`` is ``(1, C, patch, tokens * patch)``, every item's strip in order (the stride-``patch``
+        embedding cuts at item boundaries); ``layouts`` lists ``(h, w, count)`` runs. Returns ``(tokens, embed)``.
         """
         embeddings = self.embeddings
         device = embeddings.position_embedding.weight.device
@@ -1800,13 +1762,10 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
 
         seq_groups: list[tuple[int, int, int]] = []
         start = 0
-        for height, width, count in layouts:
-            seq_len = height * width
-            if seq_groups and seq_groups[-1][2] == seq_len:
-                # Equal-length grids share one attention call.
-                seq_groups[-1] = (seq_groups[-1][0], seq_groups[-1][1] + count, seq_len)
-            else:
-                seq_groups.append((start, count, seq_len))
+        # Adjacent equal-length grids share one attention call.
+        for seq_len, runs in itertools.groupby(layouts, key=lambda layout: layout[0] * layout[1]):
+            count = sum(run[2] for run in runs)
+            seq_groups.append((start, count, seq_len))
             start += count * seq_len
 
         if self.fused_layers and hidden_states.is_cuda and supports_fused_layers(self):
@@ -2003,20 +1962,13 @@ class Resampler(nn.Module):
 
     def supports_packed(self) -> bool:
         attn = self.attn
-        return (
-            not attn.batch_first
-            and attn._qkv_same_embed_dim
-            and attn.in_proj_weight is not None
-            and attn.bias_k is None
-            and attn.bias_v is None
-            and not attn.add_zero_attn
-        )
+        plain = not attn.batch_first and attn._qkv_same_embed_dim and attn.in_proj_weight is not None
+        return plain and attn.bias_k is None and attn.bias_v is None and not attn.add_zero_attn
 
     def forward_packed(self, x: torch.Tensor, layouts: Sequence[tuple[int, int, int]]) -> torch.Tensor:
         """``forward`` without key padding for packed ``(tokens, kv_dim)`` features; returns ``(B, Q, D)``.
 
-        Each ``(h, w, count)`` run of equal grids attends in one mask-free call;
-        grids are host ints, so no device sync.
+        Each ``(h, w, count)`` run of equal grids attends in one mask-free call (host ints: no device sync).
         """
         max_h = max(height for height, _, _ in layouts)
         max_w = max(width for _, width, _ in layouts)
@@ -2032,16 +1984,12 @@ class Resampler(nn.Module):
         for height, width, count in layouts:
             end = start + count * height * width
             pos_embed = self.pos_embed[:height, :width, :].reshape(height * width, -1).to(x.dtype)
-            torch.add(
-                x[start:end].view(count, height * width, -1),
-                pos_embed,
-                out=key_input[start:end].view(count, height * width, -1),
-            )
+            shape = (count, height * width, -1)
+            torch.add(x[start:end].view(shape), pos_embed, out=key_input[start:end].view(shape))
             start = end
 
         attn = self.attn
-        num_heads = attn.num_heads
-        head_dim = self.embed_dim // num_heads
+        num_heads, head_dim = attn.num_heads, self.embed_dim // attn.num_heads
         w_q, w_k, w_v = attn.in_proj_weight.chunk(3)
         b_q, b_k, b_v = attn.in_proj_bias.chunk(3) if attn.in_proj_bias is not None else (None, None, None)
         query = F.linear(self.ln_q(self.query), w_q, b_q)
@@ -2056,8 +2004,8 @@ class Resampler(nn.Module):
         for height, width, count in layouts:
             seq_len = height * width
             end = start + count * seq_len
-            key_heads = keys[start:end].view(count, seq_len, num_heads, head_dim).transpose(1, 2)
-            value_heads = values[start:end].view(count, seq_len, num_heads, head_dim).transpose(1, 2)
+            shape = (count, seq_len, num_heads, head_dim)
+            key_heads, value_heads = (t[start:end].view(shape).transpose(1, 2) for t in (keys, values))
             q = query_heads.unsqueeze(0).expand(count, -1, -1, -1).contiguous()
             if eager:
                 # Mirrors nn.MultiheadAttention's need_weights path used by ``forward``.
@@ -2088,11 +2036,9 @@ def _packed_vision_layouts(
             return None
         height, width = int(size[0]), int(size[1])
         if (
-            height <= 0
-            or width <= 0
+            min(height, width) <= 0
             or pixels.ndim != 3
-            or pixels.shape[-2] != patch_size
-            or pixels.shape[-1] != height * width * patch_size
+            or pixels.shape[-2:] != (patch_size, height * width * patch_size)
         ):
             return None
         layouts.append((height, width))
@@ -2110,14 +2056,8 @@ def _plan_packed_vision_chunks(
     chunks: list[tuple[list[int], list[tuple[int, int, int]]]] = []
     for begin in range(0, len(order), max(1, max_items)):
         indices = order[begin : begin + max(1, max_items)]
-        runs: list[tuple[int, int, int]] = []
-        for index in indices:
-            height, width = layouts[index]
-            if runs and runs[-1][:2] == (height, width):
-                runs[-1] = (height, width, runs[-1][2] + 1)
-            else:
-                runs.append((height, width, 1))
-        chunks.append((indices, runs))
+        grids = itertools.groupby(layouts[index] for index in indices)
+        chunks.append((indices, [(height, width, len(list(run))) for (height, width), run in grids]))
     return chunks
 
 
@@ -2137,15 +2077,10 @@ def _encode_vision_packed(
     outputs: list[torch.Tensor] = []
     packed_order: list[int] = []
     for indices, runs in _plan_packed_vision_chunks(layouts, max_items):
-        pixels = (
-            torch.cat([pixel_values[index] for index in indices], dim=-1)
-            if len(indices) > 1
-            else pixel_values[indices[0]]
-        )
+        parts = [pixel_values[index] for index in indices]
+        pixels = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         pixels = pixels.to(device=weight.device, dtype=weight.dtype).unsqueeze(0)
-        out = None
-        if graph_encoder is not None and len(runs) == 1:
-            out = graph_encoder.encode(pixels, *runs[0])
+        out = graph_encoder.encode(pixels, *runs[0]) if graph_encoder is not None and len(runs) == 1 else None
         if out is None:
             out = resampler.forward_packed(vpm.forward_packed(pixels, runs), runs)
         outputs.append(out)
@@ -4237,10 +4172,16 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
         # Initialize vision encoder (SigLIP)
         if multimodal_config.get_limit_per_prompt("image"):
-            config.vision_config._attn_implementation = _resolve_vision_attention_implementation(
-                config.vision_config,
-                getattr(vllm_config, "model_config", None),
-            )
+            # Set attention implementation
+            # (an engine override, else the vision config, else SDPA: eager math without the (B, H, L, L) scores)
+            if getattr(getattr(vllm_config, "model_config", None), "_attn_implementation", None) is not None:
+                config.vision_config._attn_implementation = vllm_config.model_config._attn_implementation
+            else:
+                vision_implementation = getattr(config.vision_config, "_attn_implementation", None)
+                config.vision_config._attn_implementation = vision_implementation or "sdpa"
+            if config.vision_config._attn_implementation == "flash_attention_2" and not is_flash_attn_2_available():
+                logger.warning("flash_attention_2 requested for the MiniCPM-o vision tower but unavailable; using sdpa")
+                config.vision_config._attn_implementation = "sdpa"
 
             self.vpm = SiglipVisionTransformer(config.vision_config)
             # Drop last layer if configured
@@ -4295,12 +4236,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.resampler.attn_implementation = config.vision_config._attn_implementation
         else:
             self.resampler = None
-        # Unpadded, grid-grouped vision encoding (see _encode_vision_packed);
-        # False keeps the padded batch (the parity tests' reference).
+        # Unpadded, grid-grouped vision encoding (_encode_vision_packed); False keeps the padded batch.
         self.vision_packed_encode = True
-        # Fused packed SigLIP layers and CUDA graphs of single-grid chunks
-        # (vision_fused.py). Off unless HF config vision_fused_layers /
-        # vision_cuda_graph (``--hf-overrides``) turn them on.
+        # Fused packed SigLIP layers and CUDA graphs of single-grid chunks (vision_fused.py),
+        # off unless the HF config's vision_fused_layers / vision_cuda_graph turn them on.
         if self.vpm is not None:
             self.vpm.fused_layers = bool(getattr(config, "vision_fused_layers", False))
         self.vision_cuda_graph = bool(getattr(config, "vision_cuda_graph", False))
@@ -4579,12 +4518,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         tgt_sizes = data["tgt_sizes"]
 
         vpm = self.vpm
-        if (
-            getattr(self, "vision_packed_encode", False)
-            and hasattr(vpm, "forward_packed")
-            and hasattr(self.resampler, "forward_packed")
-            and self.resampler.supports_packed()
-        ):
+        packed = getattr(self, "vision_packed_encode", False) and hasattr(vpm, "forward_packed")
+        if packed and hasattr(self.resampler, "forward_packed") and self.resampler.supports_packed():
             layouts = _packed_vision_layouts(pixel_values, tgt_sizes, vpm.embeddings.patch_size)
             if layouts is not None:
                 graph_encoder = None
@@ -4861,9 +4796,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             device=wavforms.device,
         )
 
-        # The final layer is ``last_hidden_state`` (the same tensor as
-        # ``hidden_states[-1]``); asking for every layer's output only to pick
-        # the last one keeps 25 activations alive per unit (as in #5587).
+        # As in get_audio_embedding: every layer's output only to pick the last one keeps 25 activations alive.
         selects_final_layer = self.audio_encoder_layer == -1
         audio_outputs = self.apm(
             wavforms,
@@ -4888,8 +4821,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_embeds = audio_embeds.transpose(1, 2)
 
         _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
-        # One host read of the lengths (free when they stay on the host)
-        # instead of a device sync per slice bound.
+        # One host read of the lengths instead of a device sync per slice bound.
         pooled_lens = feature_lens_after_pooling.tolist()
         final_audio_embeds: list[list[torch.Tensor]] = []
         idx = 0
@@ -4905,14 +4837,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         """Whether ``get_audio_embedding_streaming_batch`` can serve this encoder."""
         if self.apm is None or self.audio_projection_layer is None or self.audio_avg_pooler is None:
             return False
-        from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import (
-            streaming_batch_unsupported_reason,
-        )
-
         requested = getattr(self.config, "duplex_audio_encoder_batching", None)
         if requested is not None and not bool(requested):
             return False
-        reason = streaming_batch_unsupported_reason(self.apm, audio_encoder_layer=self.audio_encoder_layer)
+        reason = streaming_audio.streaming_batch_unsupported_reason(
+            self.apm, audio_encoder_layer=self.audio_encoder_layer
+        )
         if reason is not None:
             logger.info("MiniCPM-o streaming audio encoder stays per-session: %s", reason)
             return False
@@ -4921,36 +4851,27 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
     def build_streaming_audio_graph_encoder(self, *, unit_frames: int) -> bool:
         """Capture CUDA graphs of the streaming encoder's steady unit. Failures stay eager."""
         self._duplex_audio_cuda_graph_encoder = None
-        if not self.supports_streaming_audio_batch():
-            return False
-        if not bool(getattr(self.config, "duplex_audio_encoder_cuda_graph", True)):
+        config = self.config
+        enabled = bool(getattr(config, "duplex_audio_encoder_cuda_graph", True))
+        if not self.supports_streaming_audio_batch() or not enabled:
             return False
         if self.apm.conv1.weight.device.type != "cuda":
             logger.info("MiniCPM-o streaming audio encoder CUDA graph needs a CUDA device; staying eager")
             return False
-        from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder_graph import (
-            DEFAULT_GRAPH_BATCH_SIZES,
-            DEFAULT_GRAPH_CACHE_BUCKETS,
-            StreamingAudioGraphEncoder,
-            batch_sizes_for_sessions,
-        )
-
-        config = self.config
         batch_sizes = getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes", None)
         if getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions", False) is True:
             # Overrides the explicit list: the grid follows duplex max_sessions.
-            batch_sizes = batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
+            batch_sizes = streaming_audio_graph.batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
         allocated = torch.accelerator.memory_allocated(self.apm.conv1.weight.device)
         try:
-            wrapper = StreamingAudioGraphEncoder(
+            wrapper = streaming_audio_graph.StreamingAudioGraphEncoder(
                 self.apm,
                 self.audio_projection_layer,
                 self.audio_avg_pooler,
                 unit_frames=int(unit_frames),
                 pool_step=int(config.audio_pool_step),
-                batch_sizes=batch_sizes or DEFAULT_GRAPH_BATCH_SIZES,
-                cache_buckets=getattr(config, "duplex_audio_encoder_cuda_graph_cache_buckets", None)
-                or DEFAULT_GRAPH_CACHE_BUCKETS,
+                batch_sizes=batch_sizes,
+                cache_buckets=getattr(config, "duplex_audio_encoder_cuda_graph_cache_buckets", None),
                 page_positions=self._duplex_audio_kv_page_positions(),
                 pinned_h2d=getattr(config, "duplex_audio_encoder_pinned_h2d", False) is True,
             )
@@ -4975,12 +4896,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         chunks: Sequence[Any],
     ) -> tuple[list[torch.Tensor | None], list[Any]]:
         """Batched ``get_audio_embedding_streaming`` (embeddings, updated caches); graphs take steady rows."""
-        from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import encode_streaming_audio_batch
-
         graph = getattr(self, "_duplex_audio_cuda_graph_encoder", None)
         if graph is not None:
             return graph.encode(chunks)
-        return encode_streaming_audio_batch(
+        return streaming_audio.encode_streaming_audio_batch(
             self.apm,
             self.audio_projection_layer,
             self.audio_avg_pooler,
@@ -4990,9 +4909,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         )
 
     def _duplex_audio_kv_page_positions(self) -> int:
-        from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import DEFAULT_KV_PAGE_POSITIONS
-
-        return int(getattr(self.config, "duplex_audio_kv_page_positions", None) or DEFAULT_KV_PAGE_POSITIONS)
+        page_positions = getattr(self.config, "duplex_audio_kv_page_positions", None)
+        return int(page_positions or streaming_audio.DEFAULT_KV_PAGE_POSITIONS)
 
     def _process_audio_input(
         self,

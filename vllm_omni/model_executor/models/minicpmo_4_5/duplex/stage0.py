@@ -151,23 +151,19 @@ class MiniCPMO45Stage0DuplexRuntime:
         self._incremental_fbank = (
             getattr(getattr(stage_model, "config", None), "duplex_incremental_fbank", False) is True
         )
-        # The runtime is built with the model, before its weights load and
-        # before the loader switches it to eval mode: the streaming encoder's
-        # CUDA graphs are captured later, by build_audio_cuda_graph().
+        # Built with the model, before its weights load and it switches to eval mode:
+        # the streaming encoder's CUDA graphs are captured later, by build_audio_cuda_graph().
         self._audio_graph_attempted = False
 
     def build_audio_cuda_graph(self) -> bool:
         """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent; failures stay eager).
 
-        The steady unit's mel-frame count comes from a probe processor
-        configured like a session's (exact mode, the stage's chunk_ms /
-        first_chunk_ms): the shared processor's default chunk is no model unit
-        (H100: 10 frames, rejected by the graph), and a first unit has its own size.
+        The steady unit's mel-frame count comes from a probe processor configured like a session's: the
+        shared processor's default chunk is no model unit, and a first unit has its own size.
         """
-        if self._audio_graph_attempted:
-            return False
-        self._audio_graph_attempted = True
-        if not bool(getattr(getattr(self.thinker, "config", None), "duplex_audio_encoder_cuda_graph", True)):
+        config = getattr(self.thinker, "config", None)
+        attempted, self._audio_graph_attempted = self._audio_graph_attempted, True
+        if attempted or not bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)):
             return False
         apm = getattr(self.thinker, "apm", None)
         if getattr(apm, "training", False) is True and callable(getattr(apm, "eval", None)):
@@ -335,14 +331,10 @@ class MiniCPMO45Stage0DuplexRuntime:
 
     def needs_prefill(self, state: _MiniCPMO45Stage0SessionState | None, epoch: int | None, seq: int | None) -> bool:
         """Whether an append has not been built (or attempted) for this session yet."""
-        if seq is None:
-            return False
-        if state is None:
-            return True
-        identity = (epoch, seq)
-        if state.prepared_append_identity == identity and state.prepared_inputs_embeds is not None:
-            return False
-        return state.attempted_append_identity != identity
+        if seq is None or state is None:
+            return seq is not None
+        built = state.prepared_append_identity == (epoch, seq) and state.prepared_inputs_embeds is not None
+        return not built and state.attempted_append_identity != (epoch, seq)
 
     def stage_prefill_batch(
         self,
@@ -985,10 +977,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         self,
         requests: list[_MiniCPMO45AudioEncodeRequest],
     ) -> list[torch.Tensor | None]:
-        """Encode one unit per request (distinct sessions); those the batched encoder takes share one pass.
-
-        Others (per-session transformers cache, not one single-audio log-mel chunk) stay per-session.
-        """
+        """Encode one unit per request (distinct sessions); those the batched encoder takes share one pass."""
         results: list[torch.Tensor | None] = [None] * len(requests)
         encoder = self._batched_audio_encoder()
         batched: list[tuple[int, _MiniCPMO45AudioEncodeRequest, Any]] = []
@@ -1031,8 +1020,7 @@ class MiniCPMO45Stage0DuplexRuntime:
             return None
         feature = request.batch_feature
         try:
-            features = feature["audio_features"]
-            lengths = feature["audio_feature_lens"]
+            features, lengths = feature["audio_features"], feature["audio_feature_lens"]
         except (KeyError, TypeError):
             return None
         if not isinstance(features, torch.Tensor) or features.ndim != 3 or features.shape[0] != 1:
@@ -1051,10 +1039,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         )
 
     def _audio_feature_to_device(self, batch_feature: Any) -> Any:  # Any: transformers BatchFeature
-        """Move one unit's log-mel features to the encoder without a host sync.
-
-        Integer lengths stay on the host: ``get_audio_embedding_streaming`` reads them as slice bounds.
-        """
+        """Move one unit's log-mel features to the encoder without a host sync; integer lengths stay on the host."""
         import torch
 
         from vllm_omni.utils.device_copy import to_device_nonblocking
@@ -1367,11 +1352,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             return [1]
         return [2] + [1] * (frame_count - 1)
 
-    def _encode_processed_vision_batch(
-        self,
-        processed_frames: list[Any],  # Any: BatchFeature, one per frame
-    ) -> list[list[torch.Tensor]] | None:
-        """Encode every slice of ``processed_frames`` in one vision-tower call."""
+    def _encode_processed_vision_batch(self, processed: list[Any]) -> list[list[torch.Tensor]] | None:  # BatchFeature
+        """Encode every slice of the ``processed`` frames in one vision-tower call."""
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
             if target is None:
@@ -1388,9 +1370,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 flat_pixels: list[torch.Tensor] = []
                 flat_tgt: list[torch.Tensor] = []
                 slices_per_frame: list[int] = []
-                for processed in processed_frames:
+                for frame in processed:
                     num_slices = 0
-                    for image_slices, image_tgt in zip(processed["pixel_values"], processed["tgt_sizes"]):
+                    for image_slices, image_tgt in zip(frame["pixel_values"], frame["tgt_sizes"]):
                         for slice_pixels in image_slices:
                             flat_pixels.append(slice_pixels.to(device=device, dtype=dtype))
                             num_slices += 1
@@ -1408,47 +1390,46 @@ class MiniCPMO45Stage0DuplexRuntime:
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
             embed_dtype = self._token_embedding_dtype()
-            blocks: list[torch.Tensor] = []
+            out: list[torch.Tensor] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
                     return None
                 if embed_dtype is not None and block_2d.dtype != embed_dtype:
                     block_2d = block_2d.to(dtype=embed_dtype)
-                blocks.append(block_2d)
-            if len(blocks) != sum(slices_per_frame):
+                out.append(block_2d)
+            if len(out) != sum(slices_per_frame):
                 return None
-            out: list[list[torch.Tensor]] = []
-            offset = 0
-            for num_slices in slices_per_frame:
-                out.append(blocks[offset : offset + num_slices])
-                offset += num_slices
-            return out
+            blocks = iter(out)
+            return [[next(blocks) for _ in range(num_slices)] for num_slices in slices_per_frame]
         return None
 
-    def _preprocess_frames(self, frames: list[Image.Image]) -> list[Any] | None:  # Any: BatchFeature
-        """CPU slicing of each frame with its official ``max_slice_nums``; ``None`` on failure.
+    def _stage_vision_embeddings(self, frames: list[Image.Image]) -> list[list[torch.Tensor]] | None:
+        """Encode camera frames for omni duplex via the loaded vision tower.
 
+        Official ``streaming_prefill`` encodes each ``frame_list`` entry as its
+        own image (source + optional HD slices) and never stacks audio: the
+        unit still carries one second of soundtrack. A stacked pair uses
+        ``max_slice_nums=[2, 1]`` so the current frame keeps the elevator
+        display readable and the composite stays a single 448-normalized tile.
         Frames are processed one at a time because ``process_image([a, b])``
         packs both PILs into one batch item.
         """
+        processed = self._preprocess_frames(frames)
+        return None if processed is None else self._encode_processed_vision_batch(processed)
+
+    def _preprocess_frames(self, frames: list[Image.Image]) -> list[Any] | None:  # Any: BatchFeature
+        """The CPU half of ``_stage_vision_embeddings``: each frame's processed slices; ``None`` on failure."""
         process_image = getattr(self.processor, "process_image", None)
         if not callable(process_image):
             return None
-        processed: list[Any] = []
+        out: list[Any] = []
         for frame, max_slices in zip(frames, self._official_max_slice_nums(len(frames))):
             try:
-                processed.append(process_image([frame], max_slice_nums=max_slices))
+                out.append(process_image([frame], max_slice_nums=max_slices))
             except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
-        return processed
-
-    def _stage_vision_embeddings(self, frames: list[Image.Image]) -> list[list[torch.Tensor]] | None:
-        """Encode camera frames via the loaded vision tower; all slices share one encoder call."""
-        processed = self._preprocess_frames(frames)
-        if processed is None:
-            return None
-        return self._encode_processed_vision_batch(processed)
+        return out
 
     def frame_kwargs(self, duplex: dict[str, Any], payload: dict[str, object]) -> dict[str, Any]:
         """``encoded_frames`` prefetched for this append, else its decoded ``video_frames`` (``ValueError``)."""
@@ -1478,13 +1459,8 @@ class MiniCPMO45Stage0DuplexRuntime:
             if key is None or not isinstance(frames, list) or not frames:
                 continue
             state = self.sessions.get(key[0])
-            if (
-                state is not None
-                and state.prepared_append_identity == key[1:]
-                and state.prepared_inputs_embeds is not None
-            ):
-                continue  # already built; preprocess replays the cached append
-            jobs.append((key, tuple(frames)))
+            if state is None or state.prepared_append_identity != key[1:] or state.prepared_inputs_embeds is None:
+                jobs.append((key, tuple(frames)))  # else already built: preprocess replays the cached append
         if not jobs or not callable(getattr(self.processor, "process_image", None)):
             return
 
@@ -1510,13 +1486,11 @@ class MiniCPMO45Stage0DuplexRuntime:
             # Submit the next chunk before this chunk's encode so they overlap.
             following = start(chunks[index + 1]) if index + 1 < len(chunks) else []
             ready = [(job, processed) for job, processed in zip(chunk, finish(started)) if processed is not None]
-            encoded = (
-                self._encode_processed_vision_batch([item for _, items in ready for item in items]) if ready else None
-            )
-            offset = 0
+            items = [item for _, processed in ready for item in processed]
+            encoded = self._encode_processed_vision_batch(items) if ready else None
+            blocks = iter(encoded or ())
             for (key, frames), processed in ready if encoded is not None else ():
-                self._prefetched_vision[key] = (frames, encoded[offset : offset + len(processed)])
-                offset += len(processed)
+                self._prefetched_vision[key] = (frames, [next(blocks) for _ in processed])
             started = following
 
     def _vision_prefetch_chunk_size(self) -> int:

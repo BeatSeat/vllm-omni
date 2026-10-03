@@ -82,6 +82,14 @@ def _mlp_up(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     return mlp.activation_fn(fc1(hidden))
 
 
+def _add_norm(residual: torch.Tensor, norm: nn.Module, y=None, y_bias=None, residual_out=None) -> torch.Tensor:
+    """``norm(residual + y + y_bias)`` for a ``(tokens, E)`` ``y``, the sum also written to ``residual_out``."""
+    y = None if y is None else y.unsqueeze(0)
+    return residual_layer_norm(
+        residual, y, y_bias=y_bias, weight=norm.weight, bias=norm.bias, eps=norm.eps, residual_out=residual_out
+    )
+
+
 def encode_packed_fused(
     vpm: nn.Module, hidden_states: torch.Tensor, seq_groups: Sequence[tuple[int, int, int]]
 ) -> torch.Tensor:
@@ -92,34 +100,17 @@ def encode_packed_fused(
     """
     layers = vpm.encoder.layers
     residual = hidden_states.contiguous().unsqueeze(0)
-    first = layers[0].layer_norm1
-    normed = residual_layer_norm(residual, weight=first.weight, bias=first.bias, eps=first.eps)
+    normed = _add_norm(residual, layers[0].layer_norm1)
     for index, layer in enumerate(layers):
-        attn = layer.self_attn
+        attn, mlp = layer.self_attn, layer.mlp
         qkv_weight, qkv_bias = packed_qkv(attn)
         attended = _attend(attn, F.linear(normed[0], qkv_weight, qkv_bias), seq_groups)
-        norm = layer.layer_norm2
-        normed = residual_layer_norm(
-            residual,
-            F.linear(attended, attn.out_proj.weight).unsqueeze(0),
-            y_bias=attn.out_proj.bias,
-            weight=norm.weight,
-            bias=norm.bias,
-            eps=norm.eps,
-            residual_out=residual,
-        )
-        mlp = layer.mlp
+        y = F.linear(attended, attn.out_proj.weight)
+        normed = _add_norm(residual, layer.layer_norm2, y, attn.out_proj.bias, residual_out=residual)
         last = index + 1 == len(layers)
         norm = vpm.post_layernorm if last else layers[index + 1].layer_norm1
-        normed = residual_layer_norm(
-            residual,
-            F.linear(_mlp_up(mlp, normed[0]), mlp.fc2.weight).unsqueeze(0),
-            y_bias=mlp.fc2.bias,
-            weight=norm.weight,
-            bias=norm.bias,
-            eps=norm.eps,
-            residual_out=None if last else residual,
-        )
+        y = F.linear(_mlp_up(mlp, normed[0]), mlp.fc2.weight)
+        normed = _add_norm(residual, norm, y, mlp.fc2.bias, residual_out=None if last else residual)
     return normed[0]
 
 

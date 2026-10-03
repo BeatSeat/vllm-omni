@@ -44,7 +44,7 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from vllm_omni.model_executor.models.common.ops import residual_layer_norm
+from .ops import residual_layer_norm
 
 logger = init_logger(__name__)
 

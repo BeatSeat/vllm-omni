@@ -4,15 +4,22 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
 
 import pytest
 
+import vllm_omni
 from tests.helpers.stage_config import get_deploy_duplex_max_sessions
 from vllm_omni.config.stage_config import (
+    DuplexPacingConfig,
     DuplexSessionRuntimeConfig,
     load_deploy_config,
+    resolve_deploy_yaml,
 )
+
+_DEPLOY_DIR = Path(vllm_omni.__file__).parent / "deploy"
+_OMP_CAPS = {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OMP_WAIT_POLICY": "PASSIVE"}
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -34,6 +41,7 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
     assert deploy.duplex_session.server_vad_model_path is None
+    assert deploy.duplex_session.abort_on_model_listen is False
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -100,6 +108,7 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
         ("minicpmo_4_5_duplex_h200.yaml", 16),
         ("minicpmo_4_5_8x4090.yaml", 1),
         ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
+        ("minicpmo_4_5_dxsched.yaml", 16),
     ],
 )
 def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, expected: int) -> None:
@@ -107,3 +116,94 @@ def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, e
     # or an overlay inheriting one from its base must surface here rather than
     # as another nightly duplex admission timeout.
     assert get_deploy_duplex_max_sessions(deploy_yaml) == expected
+
+
+def _stage(raw: dict, stage_id: int) -> dict:
+    return next(stage for stage in raw["stages"] if stage["stage_id"] == stage_id)
+
+
+def test_dxsched_profile_keeps_the_inherited_switches_and_adds_the_omp_caps() -> None:
+    # duplex_session and stage env / hf_overrides are replaced, not merged, by
+    # resolve_deploy_yaml: the profile has to restate what it inherits.
+    raw = resolve_deploy_yaml(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
+    assert raw["duplex_session"]["abort_on_model_listen"] is True
+    stage0, stage1, stage2 = (_stage(raw, stage_id) for stage_id in (0, 1, 2))
+    assert stage0["hf_overrides"]["duplex_audio_encoder_pinned_h2d"] is True
+    assert stage0["hf_overrides"]["duplex_fbank_stats"] is False
+    assert stage2["async_scheduling"] is False
+    assert stage2["env"]["VLLM_OMNI_STAGE_IDLE_WAIT_S"] == "0.05"
+    for stage in (stage0, stage1, stage2):
+        assert {key: stage["env"][key] for key in _OMP_CAPS} == _OMP_CAPS
+    # connectors are deep-merged: the base connector definition survives.
+    connector = raw["connectors"]["connector_of_shared_memory"]
+    assert connector["name"] == "SharedMemoryConnector"
+    assert connector["extra"]["hift_graph_codec_chunk_frames"] == [25, 75]
+    assert "connector_get_sleep_s" in connector["extra"]
+
+    deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
+    assert deploy.duplex_session.abort_on_model_listen is True
+    assert deploy.duplex_session.pacing == DuplexPacingConfig()
+    assert deploy.duplex_session.barge_cut_on_model_yield is False
+    # Code2Wav bucket switches are listed off.
+    assert connector["extra"]["code2wav_bucket_stats"] is False
+    assert connector["extra"]["cfm_cross_turn_buckets"] is False
+
+
+def test_dxsched_profile_values_match_the_code_defaults() -> None:
+    raw = resolve_deploy_yaml(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")["duplex_session"]
+    runtime_defaults = DuplexSessionRuntimeConfig()
+    barge_names = {name for name in raw if name.startswith("barge_")}
+    assert barge_names == {f.name for f in fields(DuplexSessionRuntimeConfig) if f.name.startswith("barge_")}
+    for name in barge_names:
+        assert raw[name] == getattr(runtime_defaults, name), name
+    pacing_defaults = DuplexPacingConfig()
+    assert set(raw["pacing"]) == {f.name for f in fields(DuplexPacingConfig)}
+    for name, value in raw["pacing"].items():
+        assert value == getattr(pacing_defaults, name), name
+
+
+def test_duplex_session_pacing_parses_from_a_mapping(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  pacing:\n    enabled: true\n    onset_lead_max_s: 0.9\n    fire_grid_ms: 250\nstages: []\n",
+        encoding="utf-8",
+    )
+    pacing = load_deploy_config(deploy_path).duplex_session.pacing
+    assert isinstance(pacing, DuplexPacingConfig)
+    assert pacing.enabled is True and pacing.onset_lead_max_s == 0.9 and pacing.fire_grid_ms == 250
+    with pytest.raises(FrozenInstanceError):
+        pacing.enabled = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("body", "match"),
+    [
+        ("pacing:\n    onset_lead_max_s: 1.0", "onset_lead_max_s must be < 1.0"),
+        ("pacing:\n    onset_lead_max_s: -0.1", "onset_lead_max_s must be a non-negative number"),
+        ("pacing:\n    critical_stall_s: -1", "critical_stall_s must be a non-negative number"),
+        ("pacing:\n    fire_grid_ms: 300", "fire_grid_ms must be 0 or a positive divisor of 1000"),
+        ("pacing:\n    fire_grid_ms: -250", "fire_grid_ms must be 0 or a positive divisor of 1000"),
+        ("pacing:\n    enabled: 1", "pacing.enabled must be a boolean"),
+        ("pacing:\n    client_prebuffer_s: 0.5", "client_prebuffer_s"),
+        ("pacing: 3", "pacing must be a mapping"),
+        ("barge_cut_on_model_yield: 1", "barge_cut_on_model_yield must be a boolean"),
+        ("barge_arm_min_silence_s: -0.5", "barge_arm_min_silence_s must be a non-negative number"),
+        ("barge_arm_min_speech_s: -0.1", "barge_arm_min_speech_s must be a non-negative number"),
+    ],
+)
+def test_duplex_session_rejects_invalid_dxsched_values(tmp_path, body: str, match: str) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(f"duplex_session:\n  {body}\nstages: []\n", encoding="utf-8")
+    with pytest.raises((ValueError, TypeError), match=match):
+        load_deploy_config(deploy_path)
+
+
+def test_dxsched_profile_passes_codec_deadline_to_stage2_with_the_code_defaults() -> None:
+    from vllm_omni.core.sched.codec_deadline import CodecDeadlineConfig
+
+    deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5_dxsched.yaml")
+    stage2 = next(stage for stage in deploy.stages if stage.stage_id == 2)
+    raw = stage2.engine_extras["additional_config"]["codec_deadline"]
+    assert CodecDeadlineConfig.from_additional_config({"codec_deadline": raw}) == CodecDeadlineConfig()
+    assert set(raw) == {f.name for f in fields(CodecDeadlineConfig)}
+    assert stage2.env["VLLM_OMNI_STAGE_IDLE_WAIT_S"] == "0.05"

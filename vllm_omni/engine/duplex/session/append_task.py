@@ -130,6 +130,8 @@ class AppendAttempt:
         if model_state.pending_silence_task is done:
             model_state.pending_silence_task = None
             model_state.pending_silence_owner_id = None
+        if done in model_state.pending_silence_tasks:
+            model_state.pending_silence_tasks.remove(done)
 
     # ------------------------------------------------------------------ #
     # Running                                                            #

@@ -20,8 +20,6 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
-from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
 logger = init_logger(__name__)
 
@@ -211,10 +209,14 @@ def _resolve_scheduler(
     For other execution types, async_scheduling is not used.
     """
     if execution_type == StageExecutionType.LLM_AR:
+        from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
+
         if not async_scheduling:
             return OmniARScheduler
         return OmniARAsyncScheduler
     if execution_type == StageExecutionType.LLM_GENERATION:
+        from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
         return OmniGenerationScheduler
     # Diffusion currently returns None here.
     return None
@@ -526,6 +528,48 @@ class StageDeployConfig:
 
 
 @dataclass(frozen=True)
+class DuplexPacingConfig:
+    """Opt-in duplex output pacing (``duplex_session.pacing``); every field off by default.
+
+    A client that went quiet after its commit may have the silence
+    continuations of its reply submitted up to ``onset_lead_max_s`` ahead of
+    the nominal 1 s cadence (``onset_lead_target_s`` minus the reply's first
+    chunk length once that is known), so a short first audio chunk no longer
+    turns into a structural stall at the second unit.
+    ``onset_skip_response_wait`` lets that second unit go before its response
+    opens; a stall above ``critical_stall_s`` raises the lead to its maximum
+    until two clean chunks. ``fire_grid_ms`` snaps paced continuations onto a
+    shared grid so units of different sessions reach Stage 0 together;
+    ``idle_grid`` rounds the continuations after a non-terminal listen up to it.
+    """
+
+    enabled: bool = False
+    onset_lead_max_s: float = 0.0
+    onset_lead_target_s: float = 1.1
+    onset_skip_response_wait: bool = False
+    critical_stall_s: float = 0.05
+    fire_grid_ms: int = 0
+    idle_grid: bool = False
+    stats: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "onset_skip_response_wait", "idle_grid", "stats"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"duplex_session.pacing.{name} must be a boolean")
+        for name in ("onset_lead_max_s", "onset_lead_target_s", "critical_stall_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+                raise ValueError(f"duplex_session.pacing.{name} must be a non-negative number")
+        # The lead must stay below one model unit: UNIT_DEPTH=2 then bounds the
+        # synthesized silence ahead of the wall clock to a single unit.
+        if self.onset_lead_max_s >= 1.0:
+            raise ValueError("duplex_session.pacing.onset_lead_max_s must be < 1.0 (one model unit)")
+        grid = self.fire_grid_ms
+        if isinstance(grid, bool) or not isinstance(grid, int) or grid < 0 or (grid and 1000 % grid):
+            raise ValueError("duplex_session.pacing.fire_grid_ms must be 0 or a positive divisor of 1000")
+
+
+@dataclass(frozen=True)
 class DuplexSessionRuntimeConfig:
     """Server-owned lifecycle and per-session buffering limits."""
 
@@ -552,8 +596,50 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Opt-in route-M recovery: when the native model decides to listen while
+    # an assistant response is active, abort the old epoch's stage requests
+    # and let the next input append open a fresh epoch.  The default preserves
+    # the historical draining behavior.
+    abort_on_model_listen: bool = False
+    # Opt-in playback cut: a new user utterance over audible assistant audio
+    # (``barge_arm_min_silence_s`` of non-speech appends, then at least
+    # ``barge_arm_min_speech_s`` of speech, starting at least
+    # ``barge_arm_min_playback_s`` after the reply's first audio) cancels the
+    # reply once the model yields (listens or ends its turn) while the client
+    # still holds ``barge_cut_min_unplayed_s`` of unplayed audio. The speech
+    # floor keeps short backchannels ("mm") from cutting the reply.
+    barge_cut_on_model_yield: bool = False
+    barge_arm_min_silence_s: float = 0.6
+    barge_arm_min_speech_s: float = 0.4
+    barge_arm_min_playback_s: float = 1.0
+    barge_cut_min_unplayed_s: float = 0.15
+    # Mapping in YAML; coerced to ``DuplexPacingConfig`` (all off by default).
+    pacing: DuplexPacingConfig = field(default_factory=DuplexPacingConfig)
 
     def __post_init__(self) -> None:
+        pacing = self.pacing
+        if pacing is None:
+            pacing = DuplexPacingConfig()
+        elif isinstance(pacing, Mapping):
+            pacing = DuplexPacingConfig(**pacing)
+        elif not isinstance(pacing, DuplexPacingConfig):
+            raise ValueError("duplex_session.pacing must be a mapping")
+        object.__setattr__(self, "pacing", pacing)
+
+        if not isinstance(self.abort_on_model_listen, bool):
+            raise ValueError("duplex_session.abort_on_model_listen must be a boolean")
+        if not isinstance(self.barge_cut_on_model_yield, bool):
+            raise ValueError("duplex_session.barge_cut_on_model_yield must be a boolean")
+        for name in (
+            "barge_arm_min_silence_s",
+            "barge_arm_min_speech_s",
+            "barge_arm_min_playback_s",
+            "barge_cut_min_unplayed_s",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
+                raise ValueError(f"duplex_session.{name} must be a non-negative number")
+
         positive = {
             "disconnect_grace_s": self.disconnect_grace_s,
             "reaper_interval_s": self.reaper_interval_s,
@@ -1261,7 +1347,7 @@ def merge_pipeline_deploy(
             engine_args.get("async_scheduling", True),
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
-            engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
+            engine_args["async_scheduling"] = getattr(sched_cls, "__name__", "") == "OmniARAsyncScheduler"
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:

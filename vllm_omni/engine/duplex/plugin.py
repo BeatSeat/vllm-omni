@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -147,6 +147,12 @@ class DuplexModelSessionState(ABC):
     # continuation deadline. A real (non-silence) input resets the chain.
     last_native_submit_monotonic: float | None
     silence_deadline_monotonic: float | None
+    # In-flight silence continuations, oldest first (VLLM_OMNI_DUPLEX_UNIT_DEPTH).
+    pending_silence_tasks: list[asyncio.Task[bool]]
+    # Bumped per accepted real append: continuations planned before it are stale.
+    native_input_generation: int
+    # Accepted silence appends: bounds sibling submissions a planned unit may see.
+    silence_append_seq: int
 
     @abstractmethod
     def retain_committed_audio(
@@ -192,6 +198,9 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     # continuation deadline. A real (non-silence) input resets the chain.
     last_native_submit_monotonic: float | None = None
     silence_deadline_monotonic: float | None = None
+    pending_silence_tasks: list[asyncio.Task[bool]] = field(default_factory=list)
+    native_input_generation: int = 0
+    silence_append_seq: int = 0
 
     def retain_committed_audio(
         self,
@@ -220,6 +229,9 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
         self.pending_silence_owner_id = None
         self.last_native_submit_monotonic = None
         self.silence_deadline_monotonic = None
+        self.pending_silence_tasks.clear()
+        self.native_input_generation = 0
+        self.silence_append_seq = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +304,11 @@ class DuplexModelPlugin(ABC):
     projects_intermediate_outputs: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
+    #: If true, the model consumes session/runtime append configuration on the
+    #: first append of a request and keeps it in its own session state.  The
+    #: engine still sends the snapshots when the config generation changes.
+    #: Plugins that inspect configuration on every append leave this false.
+    append_configs_are_session_static: bool = False
     #: Samples per silence unit the runner appends to keep a model turn going.
     silence_continuation_samples: int = 16000
     #: Sample rate of that unit: the runner submits it through ``plan_append``
@@ -363,6 +380,34 @@ class DuplexModelPlugin(ABC):
         segment_output_metadata: dict[str, object],
         output: object,
     ) -> DuplexOutputDecision | None: ...
+
+    def stage0_starts_response_handoff(
+        self,
+        *,
+        segment_finished: bool,
+        segment_token_ids: tuple[int, ...],
+        segment_output_metadata: Mapping[str, object],
+        output: object,
+    ) -> bool:
+        """Whether a Stage-0 segment has admitted downstream speech work.
+
+        Native plugins may use this to distinguish a resident Stage-0 request
+        from an in-flight Stage-1/Stage-2 response before its first audio.
+        """
+        del segment_finished, segment_token_ids, segment_output_metadata, output
+        return False
+
+    def stage0_naturally_ended(
+        self,
+        *,
+        segment_finished: bool,
+        segment_token_ids: tuple[int, ...],
+        segment_output_metadata: Mapping[str, object],
+        output: object,
+    ) -> bool:
+        """Whether Stage 0 emitted the model's natural response-end marker."""
+        del segment_finished, segment_token_ids, segment_output_metadata, output
+        return False
 
     def project_intermediate_output(
         self,

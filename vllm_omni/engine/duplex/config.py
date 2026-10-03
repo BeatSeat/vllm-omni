@@ -11,10 +11,29 @@ accepts a ``DuplexSessionConfig`` (or the equivalent OpenAI Realtime
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, cast
+
+
+def duplex_continue_on_stop_token() -> bool:
+    """``VLLM_OMNI_DUPLEX_CONTINUE_ON=stop_token``: plan a spoken unit's next
+    silence continuation when Stage 0 finishes its segment instead of after its
+    audio is emitted (default ``audio``), so Stage 0's next unit overlaps Stage
+    1/2 of the previous one. Cadence and client emission order are unchanged."""
+    value = os.environ.get("VLLM_OMNI_DUPLEX_CONTINUE_ON", "")
+    return value.strip().lower() in ("stop_token", "stop-token", "stoptoken")
+
+
+def duplex_unit_depth() -> int:
+    """``VLLM_OMNI_DUPLEX_UNIT_DEPTH``: silence continuations of one session that
+    may be scheduled or submitting at once (default 1 = single flight), in [1, 8]."""
+    try:
+        return max(1, min(int(os.environ.get("VLLM_OMNI_DUPLEX_UNIT_DEPTH", "1")), 8))
+    except ValueError:
+        return 1
 
 
 class DuplexConfigError(ValueError):
@@ -198,6 +217,12 @@ class DuplexCapabilities:
         if has_video and not has_audio and not self.allows_video_without_audio():
             return "This duplex model requires audio; video-only append is not allowed"
         return None
+
+
+#: Audio a duplex client buffers before it plays the first chunk of a session,
+#: then playing each chunk on arrival (the ``duplex_rt`` rule). The API pacing
+#: mirror and Stage-2 deadline batching model the same client with it.
+DUPLEX_CLIENT_PREBUFFER_S = 0.5
 
 
 @dataclass

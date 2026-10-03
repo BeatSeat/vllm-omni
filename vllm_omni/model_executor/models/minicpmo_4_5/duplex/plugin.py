@@ -535,6 +535,11 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
     """MiniCPM-owned sampling policy, append planning, session state and output projection."""
 
     plugin_id = "minicpmo45"
+    # Stage 0 builds the session context once and keeps it in its per-session
+    # state.  Re-sending the conversation and reference-audio base64 on every
+    # one-second unit only adds host/IPC work; ModelChannel resends it when a
+    # request starts or the session config generation changes.
+    append_configs_are_session_static = True
     private_runtime_config_keys = PRIVATE_RUNTIME_CONFIG_KEYS
     silence_continuation_samples = 16000
 
@@ -639,14 +644,6 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
         if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
             return None
-        unit_ids = max(
-            (token_ids, _coerce_int_list(getattr(completion, "cumulative_token_ids", None)), list(segment_token_ids)),
-            key=len,
-        )
-        if MiniCPMO45DuplexPolicy.speech_unit_closed_by_listen(unit_ids, special_token_ids):
-            # The unit's final speech and <|turn_eos|> must reach the Talker,
-            # or the response never ends.
-            return None
 
         metadata = dict(output_metadata)
         for key, value in special_token_ids.items():
@@ -662,6 +659,74 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         return DuplexOutputDecision(
             action=DuplexOutputAction.DIRECT_RESPONSE,
             metadata=metadata,
+        )
+
+    @staticmethod
+    def _stage0_signal_token_ids(
+        segment_token_ids: tuple[int, ...], segment_output_metadata: Mapping[str, object], output: object
+    ) -> tuple[set[int], dict[str, int]]:
+        output_metadata = _multimodal_output(output, _first_completion(output))
+        special_token_ids = _special_token_ids(segment_output_metadata)
+        special_token_ids.update(_special_token_ids(output_metadata))
+        completion = _first_completion(output)
+        token_ids = set(segment_token_ids)
+        token_ids.update(_completion_token_ids(completion))
+        return token_ids, special_token_ids
+
+    def stage0_starts_response_handoff(
+        self,
+        *,
+        segment_finished: bool,
+        segment_token_ids: tuple[int, ...],
+        segment_output_metadata: Mapping[str, object],
+        output: object,
+    ) -> bool:
+        if not segment_finished:
+            return False
+        token_ids, special_token_ids = self._stage0_signal_token_ids(segment_token_ids, segment_output_metadata, output)
+        handoff_ids = {
+            special_token_ids.get("speak_token_id", -1),
+            special_token_ids.get("tts_bos_token_id", -1),
+        }
+        if token_ids.intersection(handoff_ids):
+            return True
+        output_metadata = _multimodal_output(output, _first_completion(output))
+        return any(
+            isinstance(output_metadata.get(key), str) and bool(output_metadata.get(key))
+            for key in (
+                "native_duplex_segment_text",
+                "llm_output_text",
+                "meta.native_duplex_segment_text",
+                "meta.llm_output_text",
+            )
+        )
+
+    def stage0_naturally_ended(
+        self,
+        *,
+        segment_finished: bool,
+        segment_token_ids: tuple[int, ...],
+        segment_output_metadata: Mapping[str, object],
+        output: object,
+    ) -> bool:
+        if not segment_finished:
+            return False
+        token_ids, special_token_ids = self._stage0_signal_token_ids(segment_token_ids, segment_output_metadata, output)
+        natural_end_ids = {
+            special_token_ids.get("turn_eos_token_id", -1),
+            special_token_ids.get("tts_eos_token_id", -1),
+        }
+        if token_ids.intersection(natural_end_ids):
+            return True
+        output_metadata = _multimodal_output(output, _first_completion(output))
+        return any(
+            _coerce_int(value) == 1
+            for value in (
+                output_metadata.get("turn_end"),
+                output_metadata.get("end_of_turn"),
+                output_metadata.get("meta.turn_end"),
+                output_metadata.get("meta.end_of_turn"),
+            )
         )
 
     # ---- session policy ----

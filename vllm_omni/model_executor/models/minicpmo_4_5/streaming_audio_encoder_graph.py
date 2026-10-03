@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -56,22 +58,16 @@ def steady_unit_length(unit_frames: int) -> int:
     return conv_length - trim
 
 
-def steady_pooled_length(unit_frames: int, unit_length: int, pool_step: int) -> int:
-    nominal_cap = ((unit_frames - 1) // 2 + 1 - pool_step) // pool_step + 1
-    return min(nominal_cap, unit_length // pool_step)
-
-
 def row_is_steady(chunk: StreamingAudioChunk, *, expected_frames: int) -> bool:
-    if chunk.cache is None or not chunk.use_extra_context:
-        return False
-    if int(chunk.prefix_extra_frames) != STEADY_PREFIX_EXTRA_FRAMES:
-        return False
-    if int(chunk.suffix_extra_frames) != STEADY_SUFFIX_EXTRA_FRAMES:
-        return False
     frames = int(chunk.features.shape[-1])
-    if frames != expected_frames:
-        return False
-    return chunk.feature_length is None or int(chunk.feature_length) == frames
+    return (
+        chunk.cache is not None
+        and chunk.use_extra_context
+        and (int(chunk.prefix_extra_frames), int(chunk.suffix_extra_frames))
+        == (STEADY_PREFIX_EXTRA_FRAMES, STEADY_SUFFIX_EXTRA_FRAMES)
+        and frames == expected_frames
+        and (chunk.feature_length is None or int(chunk.feature_length) == frames)
+    )
 
 
 @dataclass(slots=True)
@@ -98,70 +94,35 @@ class StreamingAudioGraphEncoder:
         page_positions: int = DEFAULT_KV_PAGE_POSITIONS,
         pinned_h2d: bool = False,
     ) -> None:
-        weight = encoder.conv1.weight
+        weight, config = encoder.conv1.weight, encoder.config
         if weight.device.type != "cuda":
             raise ValueError("StreamingAudioGraphEncoder requires a CUDA encoder")
-        self.encoder = encoder
-        self.projection = projection
-        self.pooler = pooler
-        self.device = weight.device
-        self.dtype = weight.dtype
-        self.pool_step = int(pool_step)
-        self.page_positions = int(page_positions)
-        self.pinned_h2d = bool(pinned_h2d)
-        self.num_layers = len(encoder.layers)
-        self.embed_dim = int(encoder.config.d_model)
-        self.num_heads = int(encoder.config.encoder_attention_heads)
-        self.num_mels = int(encoder.config.num_mel_bins)
+        self.encoder, self.projection, self.pooler = encoder, projection, pooler
+        self.device, self.dtype = weight.device, weight.dtype
+        self.pool_step, self.page_positions, self.pinned_h2d = int(pool_step), int(page_positions), bool(pinned_h2d)
+        self.embed_dim, self.num_heads = int(config.d_model), int(config.encoder_attention_heads)
         self.max_positions = int(encoder.embed_positions.weight.shape[0])
-        self.implementation = getattr(encoder.config, "_attn_implementation", None) or "eager"
+        self.implementation = getattr(config, "_attn_implementation", None) or "eager"
         self.unit_frames = int(unit_frames)
         self.unit_length = steady_unit_length(self.unit_frames)
-        if self.unit_length <= 0:
-            raise ValueError(f"unit_frames={unit_frames} is too small for the steady prefix/suffix trim")
-        self.pooled_length = steady_pooled_length(self.unit_frames, self.unit_length, self.pool_step)
-        if self.pooled_length <= 0:
-            raise ValueError(
-                f"unit_frames={unit_frames} pool_step={pool_step} leaves no pooled output for the steady unit"
-            )
-        self.batch_sizes = normalize_buckets(batch_sizes)
-        self.cache_buckets = normalize_buckets(cache_buckets)
+        nominal_pooled = ((self.unit_frames - 1) // 2 + 1 - self.pool_step) // self.pool_step + 1
+        self.pooled_length = min(nominal_pooled, self.unit_length // self.pool_step)
+        if self.unit_length <= 0 or self.pooled_length <= 0:
+            raise ValueError(f"unit_frames={unit_frames} pool_step={pool_step} leaves no steady unit output")
+        self.batch_sizes, self.cache_buckets = normalize_buckets(batch_sizes), normalize_buckets(cache_buckets)
         if not self.batch_sizes or not self.cache_buckets:
             raise ValueError("StreamingAudioGraphEncoder needs at least one batch size and one cache bucket")
-        self.max_batch = max(self.batch_sizes)
-        self.max_cache_bucket = max(self.cache_buckets)
-        self.max_total = self.max_cache_bucket + self.unit_length
-        self._graphs: dict[tuple[int, int], CUDAGraph] = {}
-        self._pooled: dict[tuple[int, int], torch.Tensor] = {}
-        self._mel_storage: torch.Tensor | None = None
-        self._cache_storage: torch.Tensor | None = None
-        self._mask_storage: torch.Tensor | None = None
-        self._position_ids_storage: torch.Tensor | None = None
-
-    def _allocate_storage(self) -> None:
-        self._mel_storage = torch.zeros(
-            (self.max_batch, self.num_mels, self.unit_frames), dtype=self.dtype, device=self.device
-        )
-        self._cache_storage = torch.zeros(
-            (self.num_layers, 2, self.max_batch, self.max_total, self.embed_dim),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self._mask_storage = torch.zeros(
-            (self.max_batch, 1, self.unit_length, self.max_total), dtype=self.dtype, device=self.device
-        )
-        self._position_ids_storage = torch.zeros(
-            (self.max_batch, self.unit_length), dtype=torch.long, device=self.device
-        )
+        self.max_batch, self.max_cache_bucket = max(self.batch_sizes), max(self.cache_buckets)
+        # (batch, cache length) -> (graph, pooled output); every graph reads prefix views of one storage.
+        self._graphs: dict[tuple[int, int], tuple[CUDAGraph, torch.Tensor]] = {}
 
     def _views(self, batch: int, cache_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        assert self._cache_storage is not None
         total = cache_len + self.unit_length
         return (
-            self._mel_storage[:batch],
-            self._cache_storage[:, :, :batch, :total, :],
-            self._mask_storage[:batch, :, :, :total],
-            self._position_ids_storage[:batch],
+            self._mel[:batch],
+            self._cache[:, :, :batch, :total, :],
+            self._mask[:batch, :, :, :total],
+            self._position_ids[:batch],
         )
 
     def capture(self) -> None:
@@ -169,33 +130,25 @@ class StreamingAudioGraphEncoder:
             raise RuntimeError("cannot capture the streaming audio encoder graph mid-capture")
         from vllm.platforms import current_platform
 
-        self._allocate_storage()
+        batch, total = self.max_batch, self.max_cache_bucket + self.unit_length
+        zeros = functools.partial(torch.zeros, dtype=self.dtype, device=self.device)
+        self._mel = zeros((batch, int(self.encoder.config.num_mel_bins), self.unit_frames))
+        self._cache = zeros((len(self.encoder.layers), 2, batch, total, self.embed_dim))
+        self._mask = zeros((batch, 1, self.unit_length, total))
+        self._position_ids = torch.zeros((batch, self.unit_length), dtype=torch.long, device=self.device)
         pool = current_platform.get_global_graph_pool()
-        for batch in self.batch_sizes:
-            for cache_len in self.cache_buckets:
-                self._capture_one(batch, cache_len, pool)
-
-    def _capture_one(self, batch: int, cache_len: int, pool: object) -> None:
-        key = (batch, cache_len)
-        mel, cache, mask, position_ids = self._views(batch, cache_len)
-
-        def forward():
-            return self._forward(mel, cache, mask, position_ids, cache_len)
-
         current_stream = torch.cuda.current_stream(self.device)
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream), torch.inference_mode():
-            for _ in range(3):
-                warmup = forward()
-        current_stream.wait_stream(warmup_stream)
-        del warmup
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
-            pooled = forward()
-        self._graphs[key] = graph
-        self._pooled[key] = pooled
+        for key in itertools.product(self.batch_sizes, self.cache_buckets):
+            views = self._views(*key)
+            warmup_stream = torch.cuda.Stream(device=self.device)
+            warmup_stream.wait_stream(current_stream)
+            with torch.cuda.stream(warmup_stream), torch.inference_mode():
+                for _ in range(3):
+                    self._forward(*views, key[1])
+            current_stream.wait_stream(warmup_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
+                self._graphs[key] = (graph, self._forward(*views, key[1]))
 
     def _forward(
         self,
@@ -242,53 +195,30 @@ class StreamingAudioGraphEncoder:
         outputs: list[torch.Tensor | None] = [None] * len(chunks)
         caches: list[StreamingAudioKVCache | None] = [chunk.cache for chunk in chunks]
         steady: list[_Group] = []
-        eager_indices: list[int] = []
+        eager: list[int] = []
         for index, chunk in enumerate(chunks):
-            if not row_is_steady(chunk, expected_frames=self.unit_frames):
-                eager_indices.append(index)
-                continue
             cache_in = chunk.cache
-            assert cache_in is not None
-            reset = cache_in.length + self.unit_length >= self.max_positions
-            past = 0 if reset else cache_in.length
-            if past > self.max_cache_bucket:
-                eager_indices.append(index)
+            reset = cache_in is not None and cache_in.length + self.unit_length >= self.max_positions
+            past = 0 if reset or cache_in is None else cache_in.length
+            if not row_is_steady(chunk, expected_frames=self.unit_frames) or past > self.max_cache_bucket:
+                eager.append(index)
                 continue
-            cache_out = (
-                StreamingAudioKVCache(
-                    num_layers=self.num_layers,
-                    embed_dim=self.embed_dim,
-                    num_heads=self.num_heads,
-                    max_positions=self.max_positions,
-                    page_positions=self.page_positions,
-                )
-                if reset
-                else cache_in
-            )
-            steady.append(_Group(index=index, cache_in=cache_in, cache_out=cache_out, past=past))
-
+            cache_out = StreamingAudioKVCache.for_encoder(self.encoder, self.page_positions) if reset else cache_in
+            steady.append(_Group(index, cache_in, cache_out, past))
         for start in range(0, len(steady), self.max_batch):
             self._replay(steady[start : start + self.max_batch], chunks, outputs, caches)
-
-        if eager_indices:
-            sub_outputs, sub_caches = encode_streaming_audio_batch(
+        if eager:
+            eager_outputs, eager_caches = encode_streaming_audio_batch(
                 self.encoder,
                 self.projection,
                 self.pooler,
-                [chunks[i] for i in eager_indices],
+                [chunks[i] for i in eager],
                 pool_step=self.pool_step,
                 page_positions=self.page_positions,
             )
-            for local, index in enumerate(eager_indices):
-                outputs[index] = sub_outputs[local]
-                caches[index] = sub_caches[local]
+            for index, output, cache in zip(eager, eager_outputs, eager_caches, strict=True):
+                outputs[index], caches[index] = output, cache
         return outputs, caches
-
-    def _stage_mel(self, dst: torch.Tensor, feature: torch.Tensor) -> None:
-        if self.pinned_h2d and feature.device.type == "cpu":
-            dst.copy_(feature.to(dtype=self.dtype).pin_memory(), non_blocking=True)
-        else:
-            dst.copy_(feature.to(device=self.device, dtype=self.dtype))
 
     @torch.inference_mode()
     def _replay(
@@ -301,7 +231,6 @@ class StreamingAudioGraphEncoder:
         batch = select_bucket(len(group), self.batch_sizes)
         cache_len = select_bucket(max((row.past for row in group), default=0), self.cache_buckets)
         assert batch is not None and cache_len is not None
-        key = (batch, cache_len)
         mel, cache, mask, position_ids = self._views(batch, cache_len)
         mask.fill_(0.0)
         if len(group) < batch:
@@ -309,34 +238,22 @@ class StreamingAudioGraphEncoder:
             position_ids[len(group) :].copy_(torch.arange(self.unit_length, device=self.device))
         for slot, row in enumerate(group):
             feature = chunks[row.index].features
-            if feature.ndim == 3:
-                feature = feature[0]
-            self._stage_mel(mel[slot], feature)
+            feature = (feature[0] if feature.ndim == 3 else feature).to(dtype=self.dtype)
+            if self.pinned_h2d and feature.device.type == "cpu":
+                mel[slot].copy_(feature.pin_memory(), non_blocking=True)
+            else:
+                mel[slot].copy_(feature.to(device=self.device))
             pad = cache_len - row.past
             if pad:
                 mask[slot, :, :, :pad].fill_(_NEG_INF)
             if row.past:
                 cache[:, :, slot, pad:cache_len, :].copy_(row.cache_in.history(row.past))
             position_ids[slot].copy_(torch.arange(row.past, row.past + self.unit_length, device=self.device))
-        self._graphs[key].replay()
-        pooled = self._pooled[key]
+        graph, pooled = self._graphs[(batch, cache_len)]
+        graph.replay()
         for slot, row in enumerate(group):
             outputs[row.index] = pooled[slot, : self.pooled_length].clone()
             row.cache_out.reserve(row.past + self.unit_length, dtype=self.dtype, device=self.device)
             row.cache_out.commit(row.past, cache[:, :, slot, cache_len : cache_len + self.unit_length, :])
             row.cache_out.length = row.past + self.unit_length
             caches[row.index] = row.cache_out
-
-
-__all__ = [
-    "DEFAULT_GRAPH_BATCH_SIZES",
-    "DEFAULT_GRAPH_CACHE_BUCKETS",
-    "STEADY_PREFIX_EXTRA_FRAMES",
-    "STEADY_SUFFIX_EXTRA_FRAMES",
-    "StreamingAudioGraphEncoder",
-    "normalize_buckets",
-    "row_is_steady",
-    "select_bucket",
-    "steady_pooled_length",
-    "steady_unit_length",
-]

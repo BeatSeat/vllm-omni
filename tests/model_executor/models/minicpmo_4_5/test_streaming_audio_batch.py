@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -84,7 +85,7 @@ def _legacy_layer(cache, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
 # 22 frames at chunk 0 and 24 later mirror 1020 ms / 1040 ms at 1/10 scale; the
 # odd lengths make conv2 read a padded column and 25 frames give an 11-position
 # unit that the pooler cannot divide. max_positions=40 forces a reset per cycle.
-_SCHEDULE = [
+_SCHEDULE: list[list[int | None]] = [
     [22, 22, 23, 21],
     [24, None, 24, 25],
     [24, 24, None, 24],
@@ -97,7 +98,7 @@ _SCHEDULE = [
 def test_batched_rounds_match_sequential_sessions() -> None:
     thinker = _Thinker(attn_implementation="sdpa")
     sessions = len(_SCHEDULE[0])
-    legacy_caches: list[object | None] = [None] * sessions
+    legacy_caches: list[Any] = [None] * sessions
     batched_caches: list[StreamingAudioKVCache | None] = [None] * sessions
     chunk_index = [0] * sessions
     resets = 0
@@ -118,7 +119,7 @@ def test_batched_rounds_match_sequential_sessions() -> None:
             active.append(session)
             chunk_index[session] += 1
 
-        idle = {s: (batched_caches[s], batched_caches[s].length if batched_caches[s] else 0) for s in range(sessions)}
+        idle = {s: (cache, cache.length if cache else 0) for s, cache in enumerate(batched_caches)}
         outputs, caches = thinker.get_audio_embedding_streaming_batch(chunks)
 
         for session, output, cache, reference in zip(active, outputs, caches, expected, strict=True):
@@ -127,12 +128,11 @@ def test_batched_rounds_match_sequential_sessions() -> None:
             if cache is not batched_caches[session] and batched_caches[session] is not None:
                 resets += 1
             batched_caches[session] = cache
-            legacy_length = legacy_caches[session].self_attention_cache.get_seq_length()
-            assert cache.length == legacy_length
+            legacy = legacy_caches[session]
+            assert cache.length == legacy.self_attention_cache.get_seq_length()
             for layer in range(len(thinker.apm.layers)):
-                keys, values = _legacy_layer(legacy_caches[session], layer)
-                torch.testing.assert_close(cache.head_view(cache.keys(layer)[: cache.length]), keys)
-                torch.testing.assert_close(cache.head_view(cache.values(layer)[: cache.length]), values)
+                for got, want in zip(_legacy_layer(cache.to_legacy_cache(), layer), _legacy_layer(legacy, layer)):
+                    torch.testing.assert_close(got, want)
         for session in set(range(sessions)) - set(active):
             # Not in the batch: the same cache object, the same committed length.
             cache, length = idle[session]

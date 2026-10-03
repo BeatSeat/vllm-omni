@@ -34,15 +34,10 @@ def supports_fused_layers(vpm: nn.Module) -> bool:
         return False
     if getattr(getattr(vpm, "config", None), "_attn_implementation", None) == "eager":
         return False
-    layer = layers[0]
-    attn = getattr(layer, "self_attn", None)
-    mlp = getattr(layer, "mlp", None)
-    return (
-        attn is not None
-        and mlp is not None
-        and all(getattr(attn, name, None) is not None for name in ("q_proj", "k_proj", "v_proj", "out_proj"))
-        and getattr(mlp.config, "hidden_act", None) in ("gelu_pytorch_tanh", "gelu")
-    )
+    attn, mlp = getattr(layers[0], "self_attn", None), getattr(layers[0], "mlp", None)
+    return all(
+        getattr(attn, name, None) is not None for name in ("q_proj", "k_proj", "v_proj", "out_proj")
+    ) and getattr(getattr(mlp, "config", None), "hidden_act", None) in ("gelu_pytorch_tanh", "gelu")
 
 
 def packed_qkv(attn: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -128,13 +123,6 @@ def encode_packed_fused(
     return normed[0]
 
 
-def _bucket(count: int, sizes: Sequence[int]) -> int | None:
-    for size in sizes:
-        if count <= size:
-            return size
-    return None
-
-
 class VisionGraphEncoder:
     """CUDA graphs of the packed SigLIP tower + resampler for single-grid chunks."""
 
@@ -142,17 +130,15 @@ class VisionGraphEncoder:
         self.vpm = vpm
         self.resampler = resampler
         self.batch_sizes = tuple(sorted({int(b) for b in batch_sizes if int(b) > 0}))
-        self._graphs: OrderedDict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]] = (
-            OrderedDict()
-        )
+        # (h, w, bucket) -> (static pixels, static output, graph), least recently used first.
+        self._graphs: OrderedDict[tuple[int, int, int], tuple] = OrderedDict()
         self._failed: set[tuple[int, int, int]] = set()
         self._seen: dict[tuple[int, int, int], int] = {}
-        self.enabled = True
 
     def encode(self, pixels: torch.Tensor, height: int, width: int, count: int) -> torch.Tensor | None:
-        if not self.enabled or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
             return None
-        bucket = _bucket(count, self.batch_sizes)
+        bucket = min((size for size in self.batch_sizes if count <= size), default=None)
         if bucket is None:
             return None
         key = (int(height), int(width), bucket)

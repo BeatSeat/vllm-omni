@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -19,6 +19,7 @@ _SUPPORTED_ATTENTION = ("sdpa", "eager")
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
+@dataclass(eq=False, slots=True)
 class StreamingAudioKVCache:
     """One session's streaming-encoder self-attention cache, written in place.
 
@@ -28,26 +29,24 @@ class StreamingAudioKVCache:
     Capacity grows in ``page_positions`` steps up to ``max_positions``.
     """
 
-    __slots__ = ("_buffer", "embed_dim", "length", "max_positions", "num_heads", "num_layers", "page_positions")
+    num_layers: int
+    embed_dim: int
+    num_heads: int
+    max_positions: int
+    page_positions: int = DEFAULT_KV_PAGE_POSITIONS
+    length: int = field(default=0, init=False)
+    _buffer: torch.Tensor | None = field(default=None, init=False, repr=False)
 
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        embed_dim: int,
-        num_heads: int,
-        max_positions: int,
-        page_positions: int = DEFAULT_KV_PAGE_POSITIONS,
-    ) -> None:
-        if min(num_layers, embed_dim, num_heads, max_positions, page_positions) <= 0:
+    def __post_init__(self) -> None:
+        if min(self.num_layers, self.embed_dim, self.num_heads, self.max_positions, self.page_positions) <= 0:
             raise ValueError("streaming audio KV cache dimensions must be positive")
-        self.num_layers = num_layers
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.max_positions = max_positions
-        self.page_positions = page_positions
-        self.length = 0
-        self._buffer: torch.Tensor | None = None
+
+    @classmethod
+    def for_encoder(cls, encoder: nn.Module, page_positions: int) -> StreamingAudioKVCache:
+        config, positions = encoder.config, int(encoder.embed_positions.weight.shape[0])
+        return cls(
+            len(encoder.layers), int(config.d_model), int(config.encoder_attention_heads), positions, page_positions
+        )
 
     @property
     def capacity(self) -> int:
@@ -64,21 +63,6 @@ class StreamingAudioKVCache:
             buffer[:, :, : self.length].copy_(self._buffer[:, :, : self.length])
         self._buffer = buffer
 
-    def keys(self, layer: int) -> torch.Tensor:
-        """``[capacity, embed_dim]`` key rows of ``layer``."""
-        assert self._buffer is not None
-        return self._buffer[layer, 0]
-
-    def values(self, layer: int) -> torch.Tensor:
-        """``[capacity, embed_dim]`` value rows of ``layer``."""
-        assert self._buffer is not None
-        return self._buffer[layer, 1]
-
-    def head_view(self, rows: torch.Tensor) -> torch.Tensor:
-        """``[positions, embed_dim]`` rows as a ``[1, heads, positions, head_dim]`` view."""
-        positions = int(rows.shape[0])
-        return rows.view(positions, self.num_heads, self.embed_dim // self.num_heads).transpose(0, 1).unsqueeze(0)
-
     def history(self, length: int) -> torch.Tensor:
         """``[layers, 2, length, embed_dim]`` rows ``[0, length)``, every layer at once."""
         assert self._buffer is not None
@@ -91,12 +75,8 @@ class StreamingAudioKVCache:
         self._buffer[:, :, offset : offset + positions].copy_(new_kv)
 
     def layer_views(self, start: int, end: int) -> tuple[tuple[torch.Tensor, ...], ...]:
-        """Per-layer views of positions ``[start, end)``, built with a few ops for all layers.
-
-        Returns ``(key_rows, value_rows, key_heads, value_heads)``: per layer the
-        ``[end - start, embed_dim]`` rows (write targets) and the
-        ``[1, heads, end, head_dim]`` attention inputs over ``[0, end)``.
-        """
+        """Per layer, ``(key_rows, value_rows, key_heads, value_heads)``: the ``[end - start, embed_dim]``
+        write targets and the ``[1, heads, end, head_dim]`` attention inputs over ``[0, end)``."""
         assert self._buffer is not None
         head_dim = self.embed_dim // self.num_heads
         heads = (
@@ -114,12 +94,9 @@ class StreamingAudioKVCache:
 
         self_attention = DynamicCache()
         if self.length:
+            _, _, keys, values = self.layer_views(0, self.length)
             for layer in range(self.num_layers):
-                self_attention.update(
-                    self.head_view(self.keys(layer)[: self.length]).contiguous(),
-                    self.head_view(self.values(layer)[: self.length]).contiguous(),
-                    layer,
-                )
+                self_attention.update(keys[layer].contiguous(), values[layer].contiguous(), layer)
         return EncoderDecoderCache(self_attention, DynamicCache())
 
 
@@ -183,18 +160,8 @@ def streaming_batch_unsupported_reason(encoder: nn.Module, *, audio_encoder_laye
     return None
 
 
-def _attend(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask: torch.Tensor,
-    implementation: str,
-) -> torch.Tensor:
-    """Whisper self-attention of one row, exactly as the per-session path calls it.
-
-    The query already carries ``scaling`` (Whisper scales after ``q_proj``), so
-    the kernel runs with ``scale=1``. Returns ``[1, heads, positions, head_dim]``.
-    """
+def _attend(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor, implementation: str):
+    """Whisper self-attention as the per-session path calls it; ``query`` already carries ``scaling``."""
     if implementation == "sdpa":
         return torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=mask, dropout_p=0.0, scale=1.0
@@ -251,7 +218,6 @@ def encode_streaming_audio_batch(
     weight = encoder.conv1.weight
     dtype, device = weight.dtype, weight.device
     max_positions = int(encoder.embed_positions.weight.shape[0])
-    num_layers = len(encoder.layers)
     embed_dim = int(encoder.config.d_model)
     num_heads = int(encoder.config.encoder_attention_heads)
 
@@ -276,24 +242,8 @@ def encode_streaming_audio_batch(
         pooled_length = ((feature_length - 1) // 2 + 1 - pool_step) // pool_step + 1
         cache = chunk.cache
         if cache is None or cache.length + length >= max_positions:
-            cache = StreamingAudioKVCache(
-                num_layers=num_layers,
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                max_positions=max_positions,
-                page_positions=page_positions,
-            )
-        rows.append(
-            _Row(
-                index=index,
-                frames=frames,
-                start=prefix,
-                length=length,
-                pooled_length=pooled_length,
-                cache=cache,
-                past=cache.length,
-            )
-        )
+            cache = StreamingAudioKVCache.for_encoder(encoder, page_positions)
+        rows.append(_Row(index, frames, prefix, length, pooled_length, cache, past=cache.length))
         features.append(feature)
     if not rows:
         return outputs, caches
@@ -304,7 +254,7 @@ def encode_streaming_audio_batch(
         offset += row.length
         row.cache.reserve(row.total, dtype=dtype, device=device)
 
-    # --- CNN front end on the zero-padded batch -------------------------------
+    # CNN front end on the zero-padded batch, transformer layers on the packed rows.
     mel = _stack_features(rows, features, device).to(dtype=dtype)
     hidden = nn.functional.gelu(encoder.conv1(mel))
     max_frames = int(mel.shape[-1])
@@ -318,7 +268,6 @@ def encode_streaming_audio_batch(
     hidden = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
     hidden = hidden + _position_rows(encoder, rows)
 
-    # --- Transformer layers on the packed rows --------------------------------
     # Every per-row view is built once here, not per layer: at batch sizes
     # that matter the host cost of view ops, not the GPU, bounds this loop.
     views = [row.cache.layer_views(row.past, row.total) for row in rows]
@@ -349,8 +298,6 @@ def encode_streaming_audio_batch(
         hidden = layer.activation_fn(layer.fc1(layer.final_layer_norm(hidden)))
         hidden = residual + layer.fc2(hidden)
     hidden = encoder.layer_norm(hidden)
-
-    # --- Projection and pooling ------------------------------------------------
     embeds = projection(hidden)
     if all(row.length % pool_step == 0 for row in rows):
         pooled = pooler(embeds.transpose(0, 1).unsqueeze(0)).squeeze(0).transpose(0, 1)
@@ -368,12 +315,3 @@ def encode_streaming_audio_batch(
         row.cache.length = row.total
         caches[row.index] = row.cache
     return outputs, caches
-
-
-__all__ = [
-    "DEFAULT_KV_PAGE_POSITIONS",
-    "StreamingAudioChunk",
-    "StreamingAudioKVCache",
-    "encode_streaming_audio_batch",
-    "streaming_batch_unsupported_reason",
-]

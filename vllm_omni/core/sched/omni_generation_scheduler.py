@@ -3,9 +3,7 @@
 
 from __future__ import annotations
 
-import math
 import os
-import queue
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -24,6 +22,13 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.codec_deadline import (
+    ChunkMeta,
+    CodecDeadlinePolicy,
+    DeadlinePlan,
+    ReadyChunk,
+    build_codec_deadline_policy,
+)
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
@@ -51,6 +56,74 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
     return bool(audio)
 
 
+def _codec_deadline_policy(scheduler: object) -> CodecDeadlinePolicy | None:
+    """The scheduler's deadline policy (``additional_config.codec_deadline``), or None."""
+    policy = getattr(scheduler, "_codec_deadline", None)
+    return policy if isinstance(policy, CodecDeadlinePolicy) else None
+
+
+def _build_codec_deadline(scheduler: OmniGenerationScheduler) -> CodecDeadlinePolicy | None:
+    try:
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.base import stage_idle_wait_s
+
+        idle_wait_s = stage_idle_wait_s()
+    except (ImportError, AttributeError):
+        raw = os.environ.get("VLLM_OMNI_STAGE_IDLE_WAIT_S", "")
+        try:
+            idle_wait_s = float(raw) if raw else 0.0
+        except ValueError:
+            idle_wait_s = 0.0
+
+    policy = build_codec_deadline_policy(
+        getattr(scheduler.vllm_config, "additional_config", None),
+        async_scheduling=bool(getattr(scheduler.scheduler_config, "async_scheduling", False)),
+        native_data_plane=bool(getattr(scheduler, "_native_data_plane", False)),
+        idle_wait_s=idle_wait_s,
+    )
+    if policy is not None and (scheduler._batch_window or scheduler._first_chunk_express):
+        logger.warning(
+            "Codec deadline batching is on: VLLM_OMNI_CODEC_BATCH_WINDOW_MS / VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS "
+            "only act on the native data plane and are ignored here"
+        )
+    return policy
+
+
+def _codec_deadline_plan(scheduler: OmniGenerationScheduler, now: float) -> DeadlinePlan | None:
+    """Which ready chunks this step holds back, or None without a deadline policy.
+
+    Ready: a live request with unscheduled prompt tokens, no batch in flight
+    and (with a chunk adapter) a loaded chunk. A held request stays queued and
+    keeps its ready mark, so it is offered again next step. A live request
+    without any prompt token yet is a stream waiting for its first chunk.
+    """
+    policy = _codec_deadline_policy(scheduler)
+    if policy is None:
+        return None
+    adapter = getattr(scheduler, "chunk_transfer_adapter", None)
+    ready_marks = getattr(adapter, "requests_with_ready_chunks", None) if adapter is not None else None
+    ready: list[ReadyChunk] = []
+    onset_pending = False
+    for request in (*scheduler.running, *scheduler.waiting):
+        request_id = request.request_id
+        if request_id not in scheduler.requests or request.num_in_flight_tokens > 0:
+            continue
+        prompt_len = len(request.prompt_token_ids or ())
+        if prompt_len == 0:
+            onset_pending = True
+            continue
+        if prompt_len <= request.num_computed_tokens:
+            continue
+        if ready_marks is not None and request_id not in ready_marks:
+            continue
+        info = getattr(request, "additional_information", None)
+        if not isinstance(info, dict):
+            info = deserialize_additional_information(info)
+        ready.append(ReadyChunk(request_id, ChunkMeta.from_info(info)))
+    plan = policy.plan(ready, now, onset_pending=onset_pending)
+    plan.metas = {chunk.request_id: chunk.meta for chunk in ready}
+    return plan
+
+
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
 
@@ -60,48 +133,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._init_omni_io_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._pending_finish_reqs: list[Request] = []
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        extra = (
-            connector_config.get("extra", connector_config)
-            if isinstance(connector_config, dict)
-            else getattr(connector_config, "extra", None)
-        ) or {}
-        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
-        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
-        self._generation_coalescing_policy = extra.get("generation_coalescing_policy", "fixed")
-        self._generation_max_regular_batch = int(extra.get("generation_max_regular_batch", 0) or 0)
-        if self._generation_max_regular_batch < 0:
-            raise ValueError("generation_max_regular_batch must be nonnegative")
-        if self._generation_coalescing_policy not in ("fixed", "idle_wait"):
-            raise ValueError("generation_coalescing_policy must be fixed or idle_wait")
-        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
-            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
-        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
-            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
-        if self._generation_max_wait_s and self._generation_min_batch_size > 1:
-            parallel = self.vllm_config.parallel_config
-            if not self._native_data_plane:
-                # CUDA-oriented profiles can inherit a platform's V1 runner.
-                # Their connector extras survive that override, but batching
-                # must revert to the fallback runner's default scheduling.
-                logger.warning(
-                    "Generation batch waiting and regular-batch limit ignored: "
-                    "requires native MRV2; using default generation scheduling."
-                )
-                self._generation_min_batch_size = 1
-                self._generation_max_wait_s = 0.0
-                self._generation_max_regular_batch = 0
-            elif not (
-                self._retains_state_across_chunks
-                and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
-            ):
-                raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
-            else:
-                logger.info(
-                    "Generation input coalescing: target batch=%d, max wait=%.3f ms",
-                    self._generation_min_batch_size,
-                    self._generation_max_wait_s * 1000,
-                )
         self._first_chunk_express = os.environ.get("VLLM_OMNI_CODEC_FIRST_CHUNK_EXPRESS") == "1"
         self._last_step_express = False
         # Streams that already had a chunk scheduled; the rest await their first.
@@ -114,106 +145,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # request id -> [monotonic time of first emitted audio, emitted seconds]
         self._stream_audio: dict[str, list[float]] = {}
         self._express_skipped_for_slack = 0
+        # Optional batching window for stateful codecs: a decode call costs
+        # about the same for one stream as for many, so a ready continuation
+        # chunk may wait up to this long for more streams unless its stream is
+        # about to run out of audio. First chunks never wait.
+        self._batch_window_s = float(os.environ.get("VLLM_OMNI_CODEC_BATCH_WINDOW_MS", "0") or 0) / 1000.0
+        self._batch_window = self._batch_window_s > 0
+        self._batch_min_slack_s = float(os.environ.get("VLLM_OMNI_CODEC_BATCH_MIN_SLACK_S", "0.3") or 0)
+        # request id -> when its current chunk was first seen ready
+        self._ready_since: dict[str, float] = {}
+        # request id -> when the client runs out of audio if it plays each chunk on arrival
+        self._play_end: dict[str, float] = {}
         if self._first_chunk_express:
             logger.info(
                 "Generation scheduler decodes first chunks in express steps (min continuation slack %.2f s)",
                 self._express_min_slack_s,
             )
-
-    def _drain_omni_connector_outputs(self):
-        self._generation_defer_batch = False
-        outputs = super()._drain_omni_connector_outputs()
-        max_wait = getattr(self, "_generation_max_wait_s", 0)
-        target = getattr(self, "_generation_min_batch_size", 1)
-        coordinator = self.input_coordinator
-        if not max_wait or target <= 1 or coordinator is None or self._pause_state != PauseState.UNPAUSED:
-            return outputs
-
-        # Count distinct runnable streams, not notifications, padding rows, or
-        # chunks whose previous execution still owns their state. Waiting here
-        # precedes allocation and metadata replacement. Do not schedule a batch
-        # and then discard it to try to accumulate more input.
-        ready = set(coordinator.requests_with_ready_chunks)
-        terminal = set(coordinator.finished_requests) | set(coordinator.input_terminal_req_ids)
-        deadline = getattr(self, "_generation_batch_deadline", None)
-        if deadline is None:
-            deadline = time.monotonic() + max_wait
-        in_flight = any(
-            not request.is_finished() and request.num_in_flight_tokens > 0 for request in self.requests.values()
-        )
-        new_outputs = outputs
-        waited_without_input = False
-        while True:
-            for output in new_outputs:
-                ready.update(output.chunk_ready_req_ids)
-                terminal.update(output.chunk_finished_req_ids)
-                terminal.update(
-                    req_id for req_id, metadata in output.request_metadata.items() if metadata.get("input_terminal")
-                )
-            runnable = {
-                req_id
-                for req_id in ready | terminal
-                if (request := self.requests.get(req_id)) is not None
-                and not request.is_finished()
-                and request.num_in_flight_tokens == 0
-            }
-            if runnable and waited_without_input:
-                # Idle waiting must not eat the ready batch's coalescing budget.
-                # Start that budget at its first arrival, once only. The two
-                # bounded windows can delay control processing by at most 2W.
-                deadline = time.monotonic() + max_wait
-                waited_without_input = False
-            # A first/final chunk participates in the same bounded window.
-            # At high concurrency almost every batch contains one; bypassing
-            # the entire batch in that case defeats coalescing. Low concurrency
-            # still dispatches immediately, including single-request tails.
-            if not runnable:
-                # With no output to retire and all receivers already parked,
-                # a wakeable inbox wait avoids repeatedly executing empty steps.
-                # Admission/registration/terminal work must reach the runner
-                # first; waiting for a not-yet-registered receiver would stall it.
-                can_wait_idle = (
-                    getattr(self, "_generation_coalescing_policy", "fixed") == "idle_wait"
-                    and not in_flight
-                    and bool(self.requests)
-                    and not getattr(coordinator, "pending_chunk_registrations", ())
-                    and not getattr(coordinator, "pending_input_registrations", ())
-                    and not getattr(self, "_pending_data_plane_terminal_req_ids", ())
-                    and all(request.status == RequestStatus.WAITING_FOR_CHUNK for request in self.requests.values())
-                )
-                if not can_wait_idle:
-                    break
-                waited_without_input = True
-            elif len(runnable) >= target or len(self.requests) < target:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if in_flight:
-                # Let EngineCore retire the prior output before waiting for
-                # more input. Blocking this thread also blocks the in-flight
-                # fence that makes those streams eligible for the next batch.
-                # Emit a normal empty scheduler step (including connector and
-                # cancellation bookkeeping), never discard an allocated step.
-                self._generation_defer_batch = True
-                self._generation_batch_deadline = deadline
-                return outputs
-            try:
-                output = self._omni_connector_output_inbox.get(timeout=remaining)
-            except queue.Empty:
-                break
-            outputs.append(output)
-            new_outputs = [output]
-            # Drain a burst before re-evaluating, retaining notification order.
-            while True:
-                try:
-                    output = self._omni_connector_output_inbox.get_nowait()
-                except queue.Empty:
-                    break
-                outputs.append(output)
-                new_outputs.append(output)
-        self._generation_batch_deadline = None
-        return outputs
+        # Opt-in deadline batching (additional_config.codec_deadline); None keeps every path below.
+        self._codec_deadline = _build_codec_deadline(self)
 
     def _build_generation_scheduler_output(
         self,
@@ -395,13 +344,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_aborted_queued_requests()
         self._requeue_completed_native_chunks()
         self._process_pending_omni_inputs(model_mode="generation")
-        if getattr(self, "_generation_defer_batch", False):
-            token_budget = 0
-        max_regular = getattr(self, "_generation_max_regular_batch", 0)
-        if max_regular:
-            execution_batch_size = min(execution_batch_size, max_regular)
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        deadline_plan = _codec_deadline_plan(self, scheduled_timestamp)
         async_chunk_transport = self._async_chunk_transport_enabled()
         native_chunks = bool(getattr(self, "_native_data_plane", False) and async_chunk_transport)
         # Parking releases an execution slot, but stateful codecs retain their
@@ -432,6 +377,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             express = False
         if first_chunk_express:
             self._last_step_express = express
+        if (
+            getattr(self, "_batch_window", False) is True
+            and native_chunks
+            and self._hold_for_batch(scheduled_timestamp)
+        ):
+            token_budget = 0
         while (
             not express
             and req_index < len(self.running)
@@ -444,6 +395,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter is None and request.status == RequestStatus.FINISHED_STOPPED
             ):
                 already_finished_reqs.add(request)
+                req_index += 1
+                continue
+
+            if deadline_plan is not None and request.request_id in deadline_plan.held:
+                # Deadline batching: this stream can wait for a fuller step.
                 req_index += 1
                 continue
 
@@ -515,6 +471,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             request = self.waiting.peek_request()
             if express and request.request_id in self._chunk_started:
+                self.waiting.pop_request()
+                skipped_waiting_requests.add_request(request)
+                continue
+            if deadline_plan is not None and request.request_id in deadline_plan.held:
                 self.waiting.pop_request()
                 skipped_waiting_requests.add_request(request)
                 continue
@@ -591,6 +551,13 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if first_chunk_express:
             self._chunk_started.update(num_scheduled_tokens)
+        if deadline_plan is not None:
+            policy = _codec_deadline_policy(self)
+            for req_id in num_scheduled_tokens:
+                policy.on_scheduled(req_id, deadline_plan.metas.get(req_id), scheduled_timestamp)
+        if getattr(self, "_batch_window", False) is True:
+            for req_id in num_scheduled_tokens:
+                self._ready_since.pop(req_id, None)
 
         # Return skipped waiting requests
         if skipped_waiting_requests:
@@ -687,6 +654,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return self._wrap_omni_scheduler_output(scheduler_output)
 
+    def next_release_in(self) -> float | None:
+        """Seconds until a held chunk is due (deadline batching), None when nothing is held."""
+        policy = _codec_deadline_policy(self)
+        return None if policy is None else policy.next_release_in(time.monotonic())
+
     def _continuations_have_slack(self) -> bool:
         """Whether every started stream with a chunk ready to decode can wait one express step."""
         now = time.monotonic()
@@ -710,22 +682,73 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 return False
         return True
 
-    def _record_stream_audio(self, request_id: str, mm_output: Any) -> None:
-        """Accumulate the seconds of audio each stream has emitted (``model_outputs`` at ``sr``)."""
+    def _hold_for_batch(self, now: float) -> bool:
+        """Whether to decode nothing this step so more ready streams share the next call.
+
+        Holds while fewer chunks are ready than one step can take, the oldest
+        has waited less than the window, and every ready stream still has more
+        than the window plus ``_batch_min_slack_s`` of unplayed audio. A stream
+        with no emitted audio yet (its first chunk) is never held.
+        """
+        ready = [
+            request.request_id
+            for request in (*self.running, *self.waiting)
+            if request.num_in_flight_tokens == 0
+            and len(request.prompt_token_ids) > request.num_computed_tokens
+            and request.request_id in self.requests
+        ]
+        for req_id in [req_id for req_id in self._ready_since if req_id not in ready]:
+            del self._ready_since[req_id]
+        if not ready:
+            return False
+        for req_id in ready:
+            self._ready_since.setdefault(req_id, now)
+        if len(ready) >= self.max_num_running_reqs:
+            return False
+        if now - min(self._ready_since[req_id] for req_id in ready) >= self._batch_window_s:
+            return False
+        for req_id in ready:
+            play_end = self._play_end.get(req_id)
+            if play_end is None or play_end - now < self._batch_window_s + self._batch_min_slack_s:
+                return False
+        return True
+
+    @staticmethod
+    def _audio_seconds(mm_output: Any) -> float | None:
+        """Seconds of mono audio in ``mm_output`` (``model_outputs`` at ``sr``), if unambiguous."""
         if not isinstance(mm_output, dict):
-            return
+            return None
         audio = mm_output.get("model_outputs")
         rate = mm_output.get("sr")
         # Only mono sample vectors have an unambiguous duration here.
         # Unknown/multichannel layouts earn no slack credit.
         if not isinstance(audio, torch.Tensor) or audio.ndim != 1 or audio.numel() == 0:
-            return
+            return None
         if isinstance(rate, torch.Tensor):
             rate = int(rate.reshape(-1)[0]) if rate.numel() else 0
         if not isinstance(rate, int) or rate <= 0:
+            return None
+        return audio.numel() / rate
+
+    def _record_stream_audio(self, request_id: str, mm_output: Any) -> None:
+        """Accumulate the seconds of audio each stream has emitted (``model_outputs`` at ``sr``)."""
+        seconds = self._audio_seconds(mm_output)
+        if seconds is None:
             return
         entry = self._stream_audio.setdefault(request_id, [time.monotonic(), 0.0])
-        entry[1] += audio.numel() / rate
+        entry[1] += seconds
+
+    def _record_playback(self, request_id: str, mm_output: Any) -> None:
+        """Advance a stream's playback end as if the client plays each chunk on arrival.
+
+        Unlike ``_stream_audio`` it restarts after a gap (a duplex session that
+        listened before speaking again), so a pause never reads as a deficit.
+        """
+        seconds = self._audio_seconds(mm_output)
+        if seconds is None:
+            return
+        now = time.monotonic()
+        self._play_end[request_id] = max(self._play_end.get(request_id, now), now) + seconds
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -733,6 +756,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if getattr(self, "_first_chunk_express", False):
             self._chunk_started.discard(request.request_id)
             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
+        if getattr(self, "_batch_window", False) is True:
+            self._ready_since.pop(request.request_id, None)
+            self._play_end.pop(request.request_id, None)
+        deadline_policy = _codec_deadline_policy(self)
+        if deadline_policy is not None:
+            deadline_policy.forget(request.request_id)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -758,6 +787,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
 
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+        deadline_policy = _codec_deadline_policy(self)
 
         # Every GPU write enqueued by this and earlier steps has completed, so
         # it is safe to return deferred-free blocks to the pool. This is the
@@ -822,7 +852,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # instead of decrementing num_output_placeholders (which the
             # discard zeroed) and underflowing the upstream assert.
             output_is_stale = False
-            if request is not None and request.num_stale_output_tokens > 0:
+            if request is not None and getattr(request, "num_stale_output_tokens", 0) > 0:
                 output_is_stale = True
                 request.num_stale_output_tokens -= num_tokens_scheduled
                 assert request.num_stale_output_tokens >= 0
@@ -880,6 +910,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             if getattr(self, "_express_min_slack_s", 0) > 0 and self._first_chunk_express:
                 self._record_stream_audio(req_id, mm_output)
+            if getattr(self, "_batch_window", False) is True:
+                self._record_playback(req_id, mm_output)
+            if deadline_policy is not None:
+                deadline_policy.on_output(req_id, self._audio_seconds(mm_output), time.monotonic())
             status_before_stop = request.status
             finish_reason = None
             is_segment_finished = False
@@ -1074,6 +1108,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._capture_omni_connector_output(model_runner_output)
 
+        if deadline_policy is not None:
+            deadline_policy.observe_step(len(num_scheduled_tokens), time.monotonic())
         return engine_core_outputs
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:

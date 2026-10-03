@@ -4941,13 +4941,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         return final_audio_embeds
 
     def supports_streaming_audio_batch(self) -> bool:
-        """Whether ``get_audio_embedding_streaming_batch`` can serve this encoder.
-
-        ``duplex_audio_encoder_batching`` on the HF config (``--hf-overrides``)
-        forces it on (``true``) or off (``false``, every session keeps the
-        per-session ``EncoderDecoderCache`` path). Unset, it is on for CUDA and
-        CPU, the devices its attention layout has been checked on.
-        """
+        """Whether ``get_audio_embedding_streaming_batch`` can serve this encoder."""
         if self.apm is None or self.audio_projection_layer is None or self.audio_avg_pooler is None:
             return False
         from vllm_omni.model_executor.models.minicpmo_4_5.streaming_audio_encoder import (
@@ -4964,25 +4958,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         return requested is not None or self.apm.conv1.weight.device.type in ("cuda", "cpu")
 
     def build_streaming_audio_graph_encoder(self, *, unit_frames: int) -> bool:
-        """Capture CUDA graphs of the streaming encoder's steady unit of ``unit_frames`` mel frames.
-
-        Called once after the weights load, in eval mode (the Stage-0 duplex
-        runtime's ``build_audio_cuda_graph``, from the runner's
-        ``omni_post_load`` hook at the start of its profile run). HF config
-        ``duplex_audio_encoder_cuda_graph`` (default on, ~3 GiB at batch 32)
-        gates it; ``duplex_audio_encoder_cuda_graph_batch_sizes`` /
-        ``..._cache_buckets`` override the buckets, and
-        ``duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions: true``
-        (default off) derives the batch grid from duplex ``max_sessions``
-        instead (powers of two below it plus the cap itself).
-        ``duplex_audio_encoder_pinned_h2d`` (default off) stages the host mel
-        through pinned memory instead of a blocking copy.
-        ``duplex_audio_encoder_resident_slots`` (default unset = off) keeps up to
-        that many sessions' streaming caches resident in a slot pool the graphs
-        read and write in place, instead of a shared copy-in storage plus
-        per-session paged buffers; size it to ``duplex_session.max_sessions``.
-        Never raises: on any failure the batched encoder stays eager.
-        """
+        """Capture CUDA graphs of the streaming encoder's steady unit. Failures stay eager."""
         self._duplex_audio_cuda_graph_encoder = None
         if not self.supports_streaming_audio_batch():
             return False
@@ -5017,7 +4993,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 cache_buckets=[int(c) for c in cache_buckets] if cache_buckets else DEFAULT_GRAPH_CACHE_BUCKETS,
                 page_positions=int(page) if page else DEFAULT_KV_PAGE_POSITIONS,
                 pinned_h2d=getattr(self.config, "duplex_audio_encoder_pinned_h2d", False) is True,
-                resident_slots=int(getattr(self.config, "duplex_audio_encoder_resident_slots", None) or 0),
             )
             wrapper.capture()
         except Exception:
@@ -5026,12 +5001,11 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         self._duplex_audio_cuda_graph_encoder = wrapper
         logger.info(
             "Captured MiniCPM-o streaming audio encoder CUDA graphs: unit_frames=%d batch_sizes=%s "
-            "cache_buckets=%s pinned_h2d=%s resident_slots=%d, took %.2f GiB",
+            "cache_buckets=%s pinned_h2d=%s, took %.2f GiB",
             unit_frames,
             wrapper.batch_sizes,
             wrapper.cache_buckets,
             wrapper.pinned_h2d,
-            wrapper.resident_slots,
             (torch.accelerator.memory_allocated(self.apm.conv1.weight.device) - allocated) / (1 << 30),
         )
         return True

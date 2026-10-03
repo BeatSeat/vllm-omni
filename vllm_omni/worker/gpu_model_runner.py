@@ -213,13 +213,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
-        # Model-owned setup that needs loaded weights in eval mode (e.g. the
-        # MiniCPM-o duplex streaming audio encoder's CUDA graphs). Deferred to
-        # profile_run: vLLM's Worker.load_model scopes max_split_size_mb=20
-        # around this method, and a CUDA graph pool captured under it cannot
-        # reuse its blocks across captures (MiniCPM-o S0 audio graphs: ~5 GiB
-        # of private pool instead of ~0.4 GiB). In profile_run the profiler
-        # also counts the memory in the stage's budget.
+        # Model-owned setup that needs loaded weights in eval mode (CUDA graphs).
+        # Deferred to profile_run so capture is not under load_model's 20 MiB split.
         post_load = getattr(model, "omni_post_load", None)
         self._omni_post_load = post_load if callable(post_load) else None
 

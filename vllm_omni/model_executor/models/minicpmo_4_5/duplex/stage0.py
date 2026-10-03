@@ -5,10 +5,8 @@ from __future__ import annotations
 
 import base64
 import copy
-import os
 import time
 from collections.abc import Callable, Generator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from threading import Lock
@@ -31,79 +29,6 @@ logger = init_logger(__name__)
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
 _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
-_MINICPMO45_FRAME_POOL_LOCK = Lock()
-_MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
-
-
-class _FbankStats:
-    """``duplex_fbank_stats`` (HF override, default off): time the streaming mel front end.
-
-    ``process_audio_streaming`` recomputes the STFT/mel over the session's whole
-    streaming buffer (up to its 30 s slide trigger) on every unit, on the CPU
-    (only the new frames' STFT with ``duplex_incremental_fbank``, then tagged
-    "incremental"). Every ``every`` calls one line reports the call time and
-    buffer length; the returned features are untouched.
-    """
-
-    def __init__(self, every: int = 200, *, incremental: bool = False) -> None:
-        self.every = every
-        self._message = (
-            "Stage-0 streaming fbank (incremental)" if incremental else "Stage-0 streaming fbank"
-        ) + ": %d calls p50 %.2f ms p90 %.2f ms max %.2f ms; buffer p50 %.1f s max %.1f s"
-        self._lock = Lock()
-        self._ms: list[float] = []
-        self._buffer_s: list[float] = []
-        self.calls = 0
-
-    def record(self, elapsed_s: float, buffer_s: float | None) -> None:
-        with self._lock:
-            self.calls += 1
-            self._ms.append(elapsed_s * 1000.0)
-            if buffer_s is not None:
-                self._buffer_s.append(buffer_s)
-            if len(self._ms) < self.every:
-                return
-            ms, buf = sorted(self._ms), sorted(self._buffer_s)
-            self._ms, self._buffer_s = [], []
-        logger.info(
-            self._message,
-            len(ms),
-            ms[len(ms) // 2],
-            ms[min(len(ms) - 1, int(len(ms) * 0.9))],
-            ms[-1],
-            buf[len(buf) // 2] if buf else -1.0,
-            buf[-1] if buf else -1.0,
-        )
-
-
-def _streaming_buffer_seconds(processor: Any) -> float | None:  # Any: remote-code processor
-    mel_processor = getattr(processor, "_streaming_mel_processor", None)
-    buffer = getattr(mel_processor, "buffer", None)
-    if buffer is None:
-        return None
-    try:
-        samples = len(buffer)
-    except TypeError:
-        return None
-    return samples / float(getattr(mel_processor, "sample_rate", 16000) or 16000)
-
-
-def _frame_preprocess_pool() -> ThreadPoolExecutor | None:
-    """Shared pool for camera-frame JPEG decode + slicing, or ``None`` to stay inline.
-
-    PIL decode/resize and the numpy/torch patch reshape release the GIL, so a
-    step's frames preprocess in parallel instead of back to back on the
-    worker thread. ``MINICPMO_VISION_PREPROCESS_THREADS`` sizes it (<=1: inline).
-    """
-    global _MINICPMO45_FRAME_POOL
-    if _MINICPMO45_FRAME_POOL is None:
-        workers = min(4, os.cpu_count() or 1)
-        if workers <= 1:
-            return None
-        with _MINICPMO45_FRAME_POOL_LOCK:
-            if _MINICPMO45_FRAME_POOL is None:
-                _MINICPMO45_FRAME_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="minicpmo45-frames")
-    return _MINICPMO45_FRAME_POOL
 
 
 @dataclass
@@ -183,9 +108,6 @@ class MiniCPMO45Stage0DuplexRuntime:
         self.model_path = model_path
         self.device = device
         self.sessions: dict[tuple[str, int], _MiniCPMO45Stage0SessionState] = {}
-        # (session_id, epoch, seq) -> (frame payload, per-frame embeddings),
-        # filled by prefetch_vision for the current runner step.
-        self._prefetched_vision: dict[tuple[str, int | None, int], tuple[tuple[object, ...], list[Any]]] = {}
         self.thinker = getattr(stage_model, "thinker", None) or getattr(stage_model, "model", None) or stage_model
         self.processor = (
             getattr(stage_model, "processor", None)
@@ -200,31 +122,13 @@ class MiniCPMO45Stage0DuplexRuntime:
         self._init_token_ids()
         if self.tokenizer is not None:
             self._require_special_token_ids()
-        hf_config = getattr(stage_model, "config", None)
-        # ``duplex_incremental_fbank`` (HF override, default off): each session's
-        # streaming mel front end recomputes only the new frames (incremental_fbank.py).
-        self._incremental_fbank = getattr(hf_config, "duplex_incremental_fbank", False) is True
-        self._fbank_stats = (
-            _FbankStats(incremental=self._incremental_fbank)
-            if getattr(hf_config, "duplex_fbank_stats", False) is True
-            else None
-        )
         # The runtime is built with the model, before its weights load and
         # before the loader switches it to eval mode: the streaming encoder's
         # CUDA graphs are captured later, by build_audio_cuda_graph().
         self._audio_graph_attempted = False
 
     def build_audio_cuda_graph(self) -> bool:
-        """Capture the batched streaming encoder's CUDA graphs once the weights are loaded (idempotent).
-
-        The model runner calls this once the weights are loaded, at the start
-        of its profile run (``omni_post_load``). At
-        runtime construction the audio encoder still has its initial weights
-        and is in training mode, which the batched encoder refuses ("stays
-        per-session: training mode"), so the capture never happened there.
-        ``--hf-overrides '{"duplex_audio_encoder_cuda_graph": false}'`` skips
-        the probe and the capture; the batched encoder then stays eager.
-        """
+        """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent)."""
         if self._audio_graph_attempted:
             return False
         self._audio_graph_attempted = True
@@ -237,13 +141,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         return self._maybe_build_audio_cuda_graph()
 
     def _maybe_build_audio_cuda_graph(self) -> bool:
-        """Capture the batched streaming encoder's CUDA graphs (see ``build_audio_cuda_graph``).
-
-        A silent probe through a session-configured copy of the processor
-        gives the mel-frame count of one steady unit (every unit but a
-        session's first). Any failure leaves the thinker on the eager batched
-        path.
-        """
+        """Probe the steady unit's mel-frame count, then capture encoder graphs."""
         build = getattr(self.thinker, "build_streaming_audio_graph_encoder", None)
         if not callable(build) or self.processor is None:
             return False
@@ -308,7 +206,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             reset_streaming = getattr(processor, "reset_streaming", None)
             if callable(reset_streaming):
                 reset_streaming()
-            self._maybe_enable_incremental_fbank(processor)
             return processor
         configure_streaming = getattr(processor, "configure_streaming", None)
         if callable(configure_streaming):
@@ -318,23 +215,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 slide_trigger_seconds=30.0,
                 slide_stride_seconds=10.0,
             )
-        self._maybe_enable_incremental_fbank(processor)
         return processor
-
-    def _maybe_enable_incremental_fbank(self, processor: Any) -> None:  # Any: remote-code processor
-        """``duplex_incremental_fbank``: put the processor's streaming mel front end on the incremental path."""
-        if not getattr(self, "_incremental_fbank", False):
-            return
-        mel_processor = getattr(processor, "_streaming_mel_processor", None)
-        if mel_processor is None:
-            return
-        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.incremental_fbank import enable_incremental_fbank
-
-        if not enable_incremental_fbank(mel_processor):
-            logger.warning_once(
-                "MiniCPM-o duplex_incremental_fbank: %s is not supported; the streaming fbank recomputes in full",
-                type(mel_processor).__name__,
-            )
 
     def _prepare_session_context(
         self,
@@ -495,13 +376,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         stage0_window: dict[str, object] | None = None,
         stage0_reanchor: dict[str, object] | None = None,
     ) -> _PrefillSteps:
-        """The prefill of one append, yielding each unit's encoder request.
-
-        The caller sends back that unit's audio embeddings (or ``None``).
-        ``encoded_frames`` holds the append's frames already encoded by
-        ``prefetch_vision`` (then ``video_frames`` may be omitted); without it
-        ``video_frames`` are encoded here.
-        """
+        """The prefill of one append, yielding each unit's encoder request."""
         start_time = time.time()
         processor = self._configure_streaming_processor(state)
         append_identity = (epoch, seq) if seq is not None else None
@@ -1026,14 +901,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         processor = processor or self.processor
         process = getattr(processor, "process_audio_streaming", None)
         if callable(process):
-            stats = getattr(self, "_fbank_stats", None)
-            started = time.perf_counter() if stats is not None else 0.0
             try:
                 result = process(audio_chunk, reset=False, return_batch_feature=True)
             except TypeError:
                 result = process(audio_chunk, chunk_idx=chunk_idx)
-            if stats is not None:
-                stats.record(time.perf_counter() - started, _streaming_buffer_seconds(processor))
             return result
         return {"audio_features": audio_chunk, "audio_feature_lens": [[len(audio_chunk)]]}
 
@@ -1487,13 +1358,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         self,
         processed_frames: list[Any],  # Any: BatchFeature, one per frame
     ) -> list[list[torch.Tensor]] | None:
-        """Encode every slice of ``processed_frames`` in one vision-tower call; embeddings per frame.
-
-        One call lets the tower group equal patch grids across frames (and
-        sessions, via ``prefetch_vision``); each slice's embedding is the same
-        as encoding its frame alone. ``tgt_sizes`` stays on the host so the
-        encoder reads the grids without a device sync.
-        """
+        """Encode every slice of ``processed_frames`` in one vision-tower call."""
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
             if target is None:
@@ -1566,126 +1431,8 @@ class MiniCPMO45Stage0DuplexRuntime:
         return processed
 
     def _stage_vision_embeddings(self, frames: list[Image.Image]) -> list[list[torch.Tensor]] | None:
-        """Encode camera frames for omni duplex via the loaded vision tower.
-
-        Official ``streaming_prefill`` encodes each ``frame_list`` entry as its
-        own image (source + optional HD slices) and never stacks audio: the
-        unit still carries one second of soundtrack. A stacked pair uses
-        ``max_slice_nums=[2, 1]`` so the current frame keeps the elevator
-        display readable and the composite stays a single 448-normalized tile.
-        Each frame is sliced on its own, then all slices share one encoder call.
-        """
+        """Encode camera frames via the loaded vision tower; all slices share one encoder call."""
         processed = self._preprocess_frames(frames)
         if processed is None:
             return None
         return self._encode_processed_vision_batch(processed)
-
-    @staticmethod
-    def _vision_prefetch_key(duplex: dict[str, Any]) -> tuple[str, int | None, int] | None:
-        """``(session_id, epoch, seq)`` of an append, parsed like ``preprocess`` does; ``None`` if unkeyed."""
-        session_id = str(duplex.get("session_id") or "")
-        try:
-            seq = int(duplex["seq"]) if duplex.get("seq") is not None else None
-        except (TypeError, ValueError):
-            seq = None
-        try:
-            epoch = int(duplex["epoch"]) if duplex.get("epoch") is not None else None
-        except (TypeError, ValueError):
-            epoch = None
-        if not session_id or seq is None:
-            return None
-        return session_id, epoch, seq
-
-    def _vision_prefetch_chunk_size(self) -> int:
-        """Jobs per pipeline chunk in ``prefetch_vision``: the checkpoint's ``vision_batch_size``, else 16."""
-        for target in (self.stage_model, self.thinker, getattr(self.stage_model, "model", None)):
-            size = getattr(getattr(target, "config", None), "vision_batch_size", None)
-            if isinstance(size, int) and size > 0:
-                return size
-        return 16
-
-    def _finish_vision_prefetch_chunk(
-        self,
-        chunk: list[tuple[tuple[str, int | None, int], tuple[object, ...]]],
-        prepared: list[list[Any] | None],
-    ) -> None:
-        """Encode one chunk's ready preprocessed frames and cache their embeddings by append key."""
-        ready = [(job, processed) for job, processed in zip(chunk, prepared) if processed is not None]
-        if not ready:
-            return
-        encoded = self._encode_processed_vision_batch([item for _, processed in ready for item in processed])
-        if encoded is None:
-            return
-        offset = 0
-        for (key, frames_payload), processed in ready:
-            self._prefetched_vision[key] = (frames_payload, encoded[offset : offset + len(processed)])
-            offset += len(processed)
-
-    def prefetch_vision(self, appends: list[dict[str, Any]]) -> None:
-        """Encode the camera frames of this runner step's new appends in batched vision-tower calls.
-
-        JPEG decode and slicing run on the frame pool; every slice goes through
-        ``get_vision_hidden_states`` in ``vision_batch_size`` chunks, the next
-        chunk's CPU work overlapping this chunk's GPU encode. Results are keyed
-        by append identity and checked against the frame payload on use;
-        anything that fails is left for the per-request path.
-        """
-        self._prefetched_vision.clear()
-        jobs: list[tuple[tuple[str, int | None, int], tuple[object, ...]]] = []
-        for duplex in appends:
-            payload = duplex.get("payload")
-            key = self._vision_prefetch_key(duplex)
-            if key is None or not isinstance(payload, dict):
-                continue
-            frames = payload.get("video_frames")
-            if not isinstance(frames, list) or not frames:
-                continue
-            state = self.sessions.get(key[0])
-            if (
-                state is not None
-                and state.prepared_append_identity == (key[1], key[2])
-                and state.prepared_inputs_embeds is not None
-            ):
-                continue  # already built; preprocess replays the cached append
-            jobs.append((key, tuple(frames)))
-        if not jobs or not callable(getattr(self.processor, "process_image", None)):
-            return
-
-        def preprocess(frames_payload: tuple[object, ...]) -> list[Any] | None:
-            try:
-                decoded = self._decode_video_frames_payload({"video_frames": list(frames_payload)})
-            except ValueError:
-                return None
-            return self._preprocess_frames(decoded) if decoded else None
-
-        pool = _frame_preprocess_pool() if len(jobs) > 1 else None
-        chunk_size = self._vision_prefetch_chunk_size()
-        chunks = [jobs[begin : begin + chunk_size] for begin in range(0, len(jobs), chunk_size)]
-
-        if pool is None:
-            for chunk in chunks:
-                self._finish_vision_prefetch_chunk(chunk, [preprocess(frames) for _, frames in chunk])
-            return
-
-        pending = [pool.submit(preprocess, frames) for _, frames in chunks[0]]
-        for idx, chunk in enumerate(chunks):
-            # Submit the next chunk before this chunk's encode so they overlap.
-            next_pending = (
-                [pool.submit(preprocess, frames) for _, frames in chunks[idx + 1]] if idx + 1 < len(chunks) else None
-            )
-            prepared = [future.result() for future in pending]
-            self._finish_vision_prefetch_chunk(chunk, prepared)
-            pending = next_pending
-
-    def take_prefetched_vision(self, duplex: dict[str, Any]) -> list[list[torch.Tensor]] | None:
-        """Pop this append's prefetched per-frame embeddings if its frame payload still matches."""
-        key = self._vision_prefetch_key(duplex)
-        entry = self._prefetched_vision.pop(key, None) if key is not None else None
-        if entry is None:
-            return None
-        frames_payload, encoded = entry
-        payload = duplex.get("payload")
-        frames = payload.get("video_frames") if isinstance(payload, dict) else None
-        if not isinstance(frames, list) or tuple(frames) != frames_payload:
-            return None
-        return encoded

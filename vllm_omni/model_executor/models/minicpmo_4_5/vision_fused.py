@@ -1,37 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fused SigLIP encoder layers and CUDA graphs for MiniCPM-o 4.5's packed vision encode.
-
-``SiglipVisionTransformer.forward_packed`` runs each of the 27 layers as
-LayerNorm, three projections, attention, a copy of the attention output into
-a packed buffer, the output projection, a residual add, LayerNorm, fc1, GELU,
-fc2 and another residual add: 13 kernels per layer, six of them full passes
-over the activations. Here a layer is six kernels:
-
-* one packed QKV GEMM (the q/k/v weights stacked once; the modules keep views
-  of the stacked weight, so no memory is added);
-* attention per run of equal grids, reading q/k/v as strided views of the
-  packed projection and returning its output in the token layout the next
-  GEMM reads, with no copy for the single-run case;
-* the output projection without its bias, then one pass that adds the bias
-  and the residual, stores the new residual in place and applies
-  ``layer_norm2`` (``residual_layer_norm``);
-* fc1 with its bias and the tanh GELU as the cuBLASLt epilogue
-  (``torch._addmm_activation``);
-* fc2 without its bias, then the same residual pass into the next layer's
-  ``layer_norm1`` (the encoder's ``post_layernorm`` after the last layer).
-
-The math per token is the eager layer's; the residual add and the LayerNorm
-statistics are computed in fp32 inside one pass instead of rounding the sum
-to the model dtype first.
-
-A duplex camera frame always has one patch grid, and a runner step encodes
-up to ``vision_batch_size`` of them, so ``VisionGraphEncoder`` captures the
-packed tower + resampler per ``(grid, batch bucket)`` and replays it: at
-batch 1..4 most of an eager encode is kernel launch time. Batches pad up to
-their bucket with zero slices; a slice attends only to its own patches in
-both the tower and the resampler, so padding never reaches a real slice.
-"""
+"""Fused packed SigLIP layers and CUDA graphs for MiniCPM-o 4.5 vision encode."""
 
 from __future__ import annotations
 
@@ -59,11 +28,7 @@ _CAPTURE_AFTER = 2
 
 
 def supports_fused_layers(vpm: nn.Module) -> bool:
-    """Whether ``encode_packed_fused`` covers ``vpm``'s layers (SigLIP with a GELU MLP).
-
-    An explicit ``eager`` attention implementation (the A/B reference) keeps
-    the unfused layers, since the fused ones always attend through SDPA.
-    """
+    """Whether ``encode_packed_fused`` covers ``vpm`` (SigLIP with a GELU MLP)."""
     layers = getattr(getattr(vpm, "encoder", None), "layers", None)
     if not layers or getattr(vpm, "post_layernorm", None) is None:
         return False
@@ -81,11 +46,7 @@ def supports_fused_layers(vpm: nn.Module) -> bool:
 
 
 def packed_qkv(attn: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """``(3E, E)`` q/k/v weight (and bias) of ``attn``, stacked once.
-
-    The q/k/v parameters are then re-pointed at row views of the stacked
-    tensors, so the old storage is freed and the eager path keeps working.
-    """
+    """``(3E, E)`` q/k/v weight (and bias) of ``attn``, stacked once."""
     cached = attn.__dict__.get("_packed_qkv")
     projections = (attn.q_proj, attn.k_proj, attn.v_proj)
     if cached is not None and all(
@@ -175,14 +136,7 @@ def _bucket(count: int, sizes: Sequence[int]) -> int | None:
 
 
 class VisionGraphEncoder:
-    """CUDA graphs of the packed SigLIP tower + resampler for single-grid chunks.
-
-    ``encode(pixels, height, width, count)`` returns ``(count, queries, D)``
-    for ``count`` slices of one ``(height, width)`` patch grid packed as
-    ``(1, C, patch, count * height * width * patch)``, or ``None`` when no
-    graph covers the chunk (the caller runs it eagerly). A ``(grid, bucket)``
-    is captured once it recurs (``_CAPTURE_AFTER``) and kept in LRU order.
-    """
+    """CUDA graphs of the packed SigLIP tower + resampler for single-grid chunks."""
 
     def __init__(self, vpm: nn.Module, resampler: nn.Module, *, batch_sizes: Sequence[int] = DEFAULT_GRAPH_BATCH_SIZES):
         self.vpm = vpm

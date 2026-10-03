@@ -1,30 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""One forward of MiniCPM-o's streaming Whisper encoder for many duplex sessions.
-
-The per-session path (``get_audio_embedding_streaming``) runs the encoder at
-batch one against an ``EncoderDecoderCache`` that ``torch.cat``-grows every
-layer on each one-second unit. This module encodes every session's ready unit
-in one pass:
-
-* convolutions run on a zero-padded ``[B, mels, frames]`` batch, everything
-  after them on the packed ``[sum(n_b), d]`` rows, so padding is never attended;
-* attention runs per row against that row's own cache, with the per-session
-  shapes, mask and kernel;
-* each session owns a :class:`StreamingAudioKVCache` written in place. Its
-  ``length`` only advances after the whole forward, and a history at the
-  position bound is replaced rather than cleared, so a failed forward leaves
-  committed state untouched.
-
-Results match the per-session path up to floating-point reassociation (not
-bit-exact). :func:`streaming_batch_unsupported_reason` names configurations
-this does not handle, which keep the per-session path.
-"""
+"""Batched streaming Whisper encoder for MiniCPM-o duplex sessions."""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -264,21 +245,8 @@ def encode_streaming_audio_batch(
     *,
     pool_step: int,
     page_positions: int = DEFAULT_KV_PAGE_POSITIONS,
-    new_cache: Callable[[StreamingAudioKVCache | None], StreamingAudioKVCache] | None = None,
 ) -> tuple[list[torch.Tensor | None], list[StreamingAudioKVCache | None]]:
-    """Encode one streaming unit per session in one encoder pass.
-
-    Mirrors ``MiniCPMO45OmniLLMForConditionalGeneration.get_audio_embedding_streaming``
-    row by row: same CNN extra-context trim, same reset when the history would
-    reach ``max_source_positions``, same learned positions, same pooled-length
-    clip. Returns, per chunk, the ``[tokens, hidden]`` embeddings (``None`` when
-    the unit is empty after trimming, which leaves its cache untouched) and the
-    cache now holding that session's history.
-
-    ``new_cache`` (default: a fresh paged :class:`StreamingAudioKVCache`) builds
-    the cache of a new session or of a reset, from the row's current cache; the
-    resident graph encoder passes one that hands out slot-pool caches.
-    """
+    """Encode one streaming unit per session in one encoder pass."""
     implementation = getattr(encoder.config, "_attn_implementation", None) or "eager"
     weight = encoder.conv1.weight
     dtype, device = weight.dtype, weight.device
@@ -307,11 +275,7 @@ def encode_streaming_audio_batch(
         feature_length = frames if chunk.feature_length is None else int(chunk.feature_length)
         pooled_length = ((feature_length - 1) // 2 + 1 - pool_step) // pool_step + 1
         cache = chunk.cache
-        # A new session, or the per-session path's reset: same bound, same
-        # moment. The old cache is dropped only when the caller commits this one.
-        if new_cache is not None and (cache is None or cache.length + length >= max_positions):
-            cache = new_cache(cache)
-        elif cache is None or cache.length + length >= max_positions:
+        if cache is None or cache.length + length >= max_positions:
             cache = StreamingAudioKVCache(
                 num_layers=num_layers,
                 embed_dim=embed_dim,

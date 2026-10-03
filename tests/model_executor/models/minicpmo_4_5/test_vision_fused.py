@@ -55,3 +55,18 @@ def test_prefetched_frames_are_chunked_and_keyed_by_append() -> None:
     last, payload = appends[2], appends[2]["payload"]
     assert runtime.frame_kwargs(last, payload) == {"encoded_frames": [["epa/3"], ["epb/3"], ["epc/3"]]}
     assert runtime.frame_kwargs(last, payload) == {"video_frames": frames}  # taken once
+
+
+def test_packed_vision_adapter_protocol() -> None:
+    shape, out_shape = (1, 3, 16), torch.Size([1, 4, 8])
+    adapter = vision_fused._PackedVisionAdapter(lambda px, runs: px[:, :4, :8], [(2, 2, 1)], shape, out_shape)
+    assert adapter.supports_encoder_cudagraph is True
+    cfg = adapter.get_encoder_cudagraph_config()
+    assert cfg.modalities == ["image"]
+    assert cfg.buffer_keys == ["pixels"]
+    assert cfg.out_hidden_size == 8
+    inputs = adapter.prepare_encoder_cudagraph_capture_inputs(4, 1, 0, torch.device("cpu"), torch.float32)
+    assert "pixels" in inputs.values
+    dest: list[torch.Tensor | None] = [None]
+    adapter.postprocess_encoder_output({"default": torch.ones(1, 4, 8)}, [0], [4], dest, clone=True)
+    assert dest[0] is not None and dest[0].shape == (1, 4, 8)

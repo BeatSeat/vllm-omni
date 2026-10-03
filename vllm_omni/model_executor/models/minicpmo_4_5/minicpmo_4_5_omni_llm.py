@@ -4525,7 +4525,9 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 graph_encoder = None
                 if getattr(self, "vision_cuda_graph", False) and pixel_values[0].is_cuda:
                     if self._vision_graph_encoder is None:
-                        self._vision_graph_encoder = VisionGraphEncoder(vpm, self.resampler)
+                        self._vision_graph_encoder = VisionGraphEncoder(
+                            vpm, self.resampler, vllm_config=getattr(self, "vllm_config", None)
+                        )
                     graph_encoder = self._vision_graph_encoder
                 max_items = max(1, int(self.config.vision_batch_size))
                 return _encode_vision_packed(vpm, self.resampler, pixel_values, layouts, max_items, graph_encoder)

@@ -4876,6 +4876,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 cache_buckets=getattr(config, "duplex_audio_encoder_cuda_graph_cache_buckets", None),
                 page_positions=self._duplex_audio_kv_page_positions(),
                 pinned_h2d=getattr(config, "duplex_audio_encoder_pinned_h2d", False) is True,
+                vllm_config=getattr(self, "vllm_config", None),
             )
             wrapper.capture()
         except Exception:

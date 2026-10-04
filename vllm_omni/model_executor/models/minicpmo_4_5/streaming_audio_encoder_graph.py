@@ -6,12 +6,23 @@ from __future__ import annotations
 
 import functools
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from copy import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from math import prod
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 from torch import nn
+from vllm.config import ModelConfig, MultiModalConfig, VllmConfig
+from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
+from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 from .streaming_audio_encoder import (
     DEFAULT_KV_PAGE_POSITIONS,
@@ -23,7 +34,7 @@ from .streaming_audio_encoder import (
 )
 
 if TYPE_CHECKING:
-    from torch.cuda import CUDAGraph
+    pass
 
 _NEG_INF = float("-inf")
 
@@ -78,6 +89,84 @@ class _Group:
     past: int
 
 
+def _copy_exact(dst: torch.Tensor, src: torch.Tensor) -> None:
+    dst.copy_(src)
+
+
+class _StreamingAudioAdapter(SupportsEncoderCudaGraph):
+    """Adapter exposing steady Whisper encoder steps to vLLM's EncoderCudaGraphManager."""
+
+    supports_encoder_cudagraph: ClassVar[Literal[True]] = True
+
+    def __init__(
+        self,
+        forward: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int], torch.Tensor],
+        shapes: dict[str, tuple[int, ...]],
+        cache_len: int,
+        output_shape: torch.Size,
+    ) -> None:
+        self.forward = forward
+        self.shapes = shapes
+        self.cache_len = int(cache_len)
+        self.output_shape = output_shape
+        self.tokens = prod(output_shape[:-1]) or 1
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        return EncoderCudaGraphConfig(
+            modalities=["audio"],
+            buffer_keys=list(self.shapes.keys()),
+            out_hidden_size=self.output_shape[-1],
+            padding_logics={k: _copy_exact for k in self.shapes},
+        )
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
+        return self.tokens, self.tokens
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
+        return [EncoderItemSpec(input_size=self.tokens, output_tokens=self.tokens)]
+
+    def select_encoder_cudagraph_items(self, mm_kwargs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+        return dict(mm_kwargs)
+
+    def prepare_encoder_cudagraph_capture_inputs(self, *args: Any, **kwargs: Any) -> EncoderCudaGraphCaptureInputs:
+        device = kwargs.get("device") or args[3]
+        dtype = kwargs.get("dtype") or args[4]
+        return EncoderCudaGraphCaptureInputs(
+            {
+                k: torch.zeros(shape, dtype=torch.long if k == "position_ids" else dtype, device=device)
+                for k, shape in self.shapes.items()
+            }
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self, mm_kwargs: dict[str, Any], *args: Any, **kwargs: Any
+    ) -> EncoderCudaGraphReplayBuffers:
+        return EncoderCudaGraphReplayBuffers(mm_kwargs)
+
+    def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
+        return self.forward(
+            inputs["mel"],
+            inputs["cache"],
+            inputs["mask"],
+            inputs["position_ids"],
+            self.cache_len,
+        )
+
+    def encoder_eager_forward(self, mm_kwargs: dict[str, Any], path: str = "default") -> torch.Tensor:
+        return self.encoder_cudagraph_forward(mm_kwargs, path)
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        dest[0] = outputs["default"].clone()
+
+
 class StreamingAudioGraphEncoder:
     """Pre-captured CUDA graphs of the streaming encoder's steady unit shape."""
 
@@ -93,6 +182,7 @@ class StreamingAudioGraphEncoder:
         cache_buckets: Sequence[int] | None = None,
         page_positions: int = DEFAULT_KV_PAGE_POSITIONS,
         pinned_h2d: bool = False,
+        vllm_config: VllmConfig | None = None,
     ) -> None:
         weight, config = encoder.conv1.weight, encoder.config
         if weight.device.type != "cuda":
@@ -114,8 +204,9 @@ class StreamingAudioGraphEncoder:
         if not self.batch_sizes or not self.cache_buckets:
             raise ValueError("StreamingAudioGraphEncoder needs at least one batch size and one cache bucket")
         self.max_batch, self.max_cache_bucket = max(self.batch_sizes), max(self.cache_buckets)
-        # (batch, cache length) -> (graph, pooled output); every graph reads prefix views of one storage.
-        self._graphs: dict[tuple[int, int], tuple[CUDAGraph, torch.Tensor]] = {}
+        self.vllm_config = vllm_config
+        # (batch, cache length) -> EncoderCudaGraphManager
+        self._managers: dict[tuple[int, int], EncoderCudaGraphManager] = {}
 
     def _views(self, batch: int, cache_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         total = cache_len + self.unit_length
@@ -140,16 +231,38 @@ class StreamingAudioGraphEncoder:
         pool = current_platform.get_global_graph_pool()
         current_stream = torch.cuda.current_stream(self.device)
         for key in itertools.product(self.batch_sizes, self.cache_buckets):
+            batch_k, cache_len = key
             views = self._views(*key)
             warmup_stream = torch.cuda.Stream(device=self.device)
             warmup_stream.wait_stream(current_stream)
             with torch.cuda.stream(warmup_stream), torch.inference_mode():
-                for _ in range(3):
-                    self._forward(*views, key[1])
+                out = self._forward(*views, cache_len)
+                for _ in range(1):
+                    self._forward(*views, cache_len)
             current_stream.wait_stream(warmup_stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.inference_mode(), torch.cuda.graph(graph, pool=pool):
-                self._graphs[key] = (graph, self._forward(*views, key[1]))
+            shapes = {
+                "mel": views[0].shape,
+                "cache": views[1].shape,
+                "mask": views[2].shape,
+                "position_ids": views[3].shape,
+            }
+            adapter = _StreamingAudioAdapter(self._forward, shapes, cache_len, out.shape)
+            config = copy(self.vllm_config) if self.vllm_config is not None else VllmConfig()
+            if getattr(config, "model_config", None) is None:
+                config.model_config = ModelConfig.__new__(ModelConfig)
+            if getattr(config.model_config, "multimodal_config", None) is None:
+                config.model_config.multimodal_config = MultiModalConfig()
+            cc = config.compilation_config = copy(config.compilation_config)
+            cc.encoder_cudagraph_token_budgets = [adapter.tokens]
+            cc.encoder_cudagraph_max_vision_items_per_batch, cc.encoder_cudagraph_max_frames_per_batch = 1, 0
+            config.parallel_config = copy(config.parallel_config)
+            config.parallel_config.tensor_parallel_size = 1
+
+            manager = EncoderCudaGraphManager(config, self.device, self.dtype, adapter)
+            with torch.cuda.stream(warmup_stream):
+                manager.capture(graph_pool=pool)
+            current_stream.wait_stream(warmup_stream)
+            self._managers[key] = manager
 
     def _forward(
         self,
@@ -249,10 +362,17 @@ class StreamingAudioGraphEncoder:
             if row.past:
                 cache[:, :, slot, pad:cache_len, :].copy_(row.cache_in.history(row.past))
             position_ids[slot].copy_(torch.arange(row.past, row.past + self.unit_length, device=self.device))
-        graph, pooled = self._graphs[(batch, cache_len)]
-        graph.replay()
+        manager = self._managers[(batch, cache_len)]
+        pooled = manager.execute(
+            {
+                "mel": mel,
+                "cache": cache,
+                "mask": mask,
+                "position_ids": position_ids,
+            }
+        )[0]
         for slot, row in enumerate(group):
-            outputs[row.index] = pooled[slot, : self.pooled_length].clone()
+            outputs[row.index] = pooled[slot, : self.pooled_length]
             row.cache_out.reserve(row.past + self.unit_length, dtype=self.dtype, device=self.device)
             row.cache_out.commit(row.past, cache[:, :, slot, cache_len : cache_len + self.unit_length, :])
             row.cache_out.length = row.past + self.unit_length

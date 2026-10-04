@@ -999,6 +999,8 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _batched_audio_encoder(self) -> Callable[[list[Any]], tuple[list[Any], list[Any]]] | None:
         encoder = getattr(self, "_batched_audio_encoder_fn", False)
         if encoder is False:
+            if not self._audio_graph_attempted:
+                self.build_audio_cuda_graph()
             thinker = getattr(self, "thinker", None)
             batch = getattr(thinker, "get_audio_embedding_streaming_batch", None)
             supported = getattr(thinker, "supports_streaming_audio_batch", None)

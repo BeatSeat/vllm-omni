@@ -1679,23 +1679,3 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             loaded_weights.update(talker_loaded)
 
         return loaded_weights
-
-    def omni_post_load(self) -> None:
-        """Runner hook at the start of the profile run, weights loaded and in eval mode.
-
-        Captures the duplex Stage-0 streaming audio encoder's CUDA graphs on the thinker's device.
-        """
-        helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
-        build = getattr(helper, "build_audio_cuda_graph", None)
-        if not callable(build):
-            return
-        device = self._module_device(self.thinker if getattr(self, "thinker", None) is not None else self)
-        if device.type == "cuda":
-            previous_device = current_omni_platform.current_device()
-            current_omni_platform.set_device(device)
-            try:
-                build()
-            finally:
-                current_omni_platform.set_device(torch.device(device.type, previous_device))
-        else:
-            build()

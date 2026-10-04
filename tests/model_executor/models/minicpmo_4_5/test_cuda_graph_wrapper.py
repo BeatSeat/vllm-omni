@@ -757,9 +757,7 @@ def test_whole_euler_graph_replay_matches_eager_for_uncached_and_cached_shapes(
 
     torch.manual_seed(0)
     estimator = _WholeEulerDiT().eval().cuda()
-    wrapper = WholeEulerCFMGraphWrapper(
-        estimator=estimator, n_timesteps=10, max_graphs=32
-    )
+    wrapper = WholeEulerCFMGraphWrapper(estimator=estimator, n_timesteps=10, max_graphs=32)
 
     batch_size = 2
     chunk_size = 10

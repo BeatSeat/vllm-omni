@@ -1751,7 +1751,7 @@ class WholeEulerCFMGraphWrapper:
                 self.max_graphs,
                 room,
             )
-            keys = keys[:max(0, room)]
+            keys = keys[: max(0, room)]
         x = torch.empty((1, int(channels), 1), device=self.device, dtype=self.dtype)
         entry_fn = functools.partial(self._entry, x=x, spk_dim=int(spk_dim), fill=self._precapture_fill)
         before = self._stats["captures"]

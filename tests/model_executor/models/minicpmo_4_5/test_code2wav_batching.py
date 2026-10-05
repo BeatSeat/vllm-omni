@@ -1862,3 +1862,49 @@ def test_decode_ragged_batch_mixed_onset_and_continuation():
     )
     assert len(audios) == 2
     assert len(next_states) == 2
+
+
+def test_row_offset_fallback_reaches_eager_when_replay_declines():
+    """Declined Whole-Euler replay must eager-solve, not recurse through per-offset grouping."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), cfm_graph_config={"row_offset_merge": True})
+    _enable_fake_ragged_kernel(adapter)
+    mu, speakers, cond = torch.ones((2, 1, 2)), torch.ones((2, 1)), torch.zeros((2, 1, 2))
+    _, _, stacked = adapter._decode_cfm(mu, speakers, cond, cnn_cache=None, att_cache=None)
+    equal_rows = [
+        torch.cat((stacked[:, :, row : row + 1], stacked[:, :, 2 + row : 3 + row]), dim=2) for row in range(2)
+    ]
+    mixed_rows = [equal_rows[0], torch.nn.functional.pad(equal_rows[1], (0, 0, 0, 3))]
+    adapter._whole_euler_graph_wrapper = SimpleNamespace(enabled=True, ragged_body=object(), replay=lambda **_: None)
+    calls = {"n": 0}
+    original = adapter._decode_cfm
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        assert calls["n"] < 8, "row-offset fallback recursed instead of eager-solving"
+        return original(*args, **kwargs)
+
+    adapter._decode_cfm = counting
+    previous_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(64)
+    try:
+        equal_x, _, equal_att = adapter._decode_cfm(
+            mu, speakers, cond, cnn_cache=None, att_cache=equal_rows, valid_lengths=[2, 2]
+        )
+        mixed_x, _, mixed_att = adapter._decode_cfm(
+            mu, speakers, cond, cnn_cache=None, att_cache=mixed_rows, valid_lengths=[2, 2]
+        )
+    finally:
+        sys.setrecursionlimit(previous_limit)
+    assert equal_x.shape[0] == mixed_x.shape[0] == 2
+    assert len(equal_att) == len(mixed_att) == 2
+
+
+def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _tf32_mode
+
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    assert _tf32_mode({}) == "off"
+    assert _tf32_mode({"token2wav_allow_tf32": True}) == "tf32"
+    assert _tf32_mode({"code2wav_allow_tf32": True}) == "tf32"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32x3")
+    assert _tf32_mode({}) == "tf32"

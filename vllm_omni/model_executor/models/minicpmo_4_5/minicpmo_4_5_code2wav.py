@@ -51,19 +51,25 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
 
 
 def _tf32_mode(extra: Mapping[str, Any]) -> str:
-    """Stage-2 TF32x3 Tensor Core scope: ``"off"`` (default) or ``"tf32x3"`` (CFM DiT only)."""
+    """Ordinary TF32 for CFM DiT dense GEMMs (``"off"`` / ``"tf32"``).
+
+    Does not run compensated TF32x3 on ``F.linear``. ``token2wav_allow_tf32``
+    is the shipped YAML key; ``code2wav_allow_tf32`` and env ``tf32x3`` alias it.
+    Triton ``cfm_attention`` still uses ``input_precision="tf32x3"`` on its own.
+    """
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
-    value = raw if raw not in (None, "") else extra.get("code2wav_allow_tf32", False)
+    value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", False))
     if isinstance(value, str):
         return {
-            "tf32x3": "tf32x3",
-            "3xtf32": "tf32x3",
-            "flow": "tf32x3",
-            "1": "tf32x3",
-            "true": "tf32x3",
-            "yes": "tf32x3",
+            "tf32": "tf32",
+            "tf32x3": "tf32",
+            "3xtf32": "tf32",
+            "flow": "tf32",
+            "1": "tf32",
+            "true": "tf32",
+            "yes": "tf32",
         }.get(value.strip().lower(), "off")
-    return "tf32x3" if value else "off"
+    return "tf32" if value else "off"
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -843,7 +849,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         # policy after eager execution/capture; cuDNN's policy is independent.
         previous_tf32 = torch.backends.cuda.matmul.allow_tf32
         try:
-            if self._extra_config().get("token2wav_allow_tf32", False):
+            extra = self._extra_config()
+            if extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", False)):
                 torch.backends.cuda.matmul.allow_tf32 = True
             return self._forward_impl(
                 input_ids,
@@ -1192,11 +1199,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         # Token2wav runs in fp32, so without TF32 every flow-DiT GEMM runs on
-        # SIMT cores. TF32x3 uses SM80+ Tensor Cores scoped strictly to CFM DiT,
-        # leaving HiFT vocoder in high-fidelity FP32.
+        # SIMT cores. Ordinary TF32 uses SM80+ Tensor Cores for those dense
+        # GEMMs. Triton cfm_attention still requests tf32x3 dots on its own.
         tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
         if tf32_mode != "off":
-            logger.info("MiniCPM-o Code2Wav: TF32x3 Tensor Core enabled (CFM DiT only)")
+            logger.info("MiniCPM-o Code2Wav: TF32 matmul enabled for CFM DiT dense GEMMs")
         use_float16 = bool(extra.get("token2wav_float16", False))
         previous_dtype = torch.get_default_dtype()
         try:

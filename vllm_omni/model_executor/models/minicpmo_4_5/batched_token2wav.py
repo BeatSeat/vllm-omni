@@ -1211,8 +1211,11 @@ class BatchedToken2Wav(nn.Module):
             )
             if whole_euler_result is not None:
                 return whole_euler_result
-        if row_offsets is not None:
-            # No single solve took them (graphs off, or the slot pool refused).
+        if row_offsets is not None and len(set(row_offsets)) > 1:
+            # Mixed cache lengths only. A same-length group (including every
+            # ``_decode_cfm_per_offset`` subgroup, and equal-length rows under
+            # ``row_offset_merge``) must fall through to eager: otherwise a
+            # declined Whole-Euler replay re-enters this fallback forever.
             return self._decode_cfm_per_offset(
                 mu,
                 speakers,

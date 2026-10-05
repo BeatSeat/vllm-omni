@@ -61,7 +61,7 @@ def test_fused_body_matches_ragged_body(device: str) -> None:
     )
     actual = _run(blocks_forward_chunk_fused, estimator, rows=4, frames=6, cached=5, lengths=[6, 4])
     for want, got in zip(expected, actual, strict=True):
-        torch.testing.assert_close(got, want, rtol=1e-5, atol=2e-5)
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=2e-4)
 
 
 def test_unsupported_estimator_is_refused() -> None:

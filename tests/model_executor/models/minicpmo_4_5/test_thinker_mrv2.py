@@ -98,3 +98,34 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
         assert out.multimodal_outputs["latent"] is hidden
         torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], batch.input_ids[:, None])
         torch.testing.assert_close(out.multimodal_outputs["latent_positions"], batch.positions[:, None])
+
+
+def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
+    model = _model(mocker, session="duplex")
+    batch = SimpleNamespace(
+        input_ids=torch.tensor([101, 102]),
+        positions=torch.tensor([0, 1]),
+    )
+    hidden = torch.randn(2, 8)
+    buffers = [
+        {
+            "duplex": {
+                "duplex_prompt_token_ids": [1, 2, 3],
+                "special_token_ids": {"tts_bos_token_id": 151703, "turn_start_token_id": 151644},
+            }
+        },
+        {},
+    ]
+    out = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=buffers,
+    )
+    assert out.text_hidden_states is hidden
+    assert out.multimodal_outputs["latent"] is hidden
+    assert out.multimodal_outputs["duplex_prompt_token_ids"] == [[1, 2, 3], None]
+    assert "tts_bos_token_id" in out.multimodal_outputs["meta"]
+    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
+    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1] is None
+

@@ -902,9 +902,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             flags: list[bool] = []
             for row in np.flatnonzero(input_batch.is_prefilling_np[:num_reqs]).tolist():
                 info = model_intermediate_buffer[row]
-                if info.get("native_duplex") is True:
-                    raise NotImplementedError("MiniCPM-o native duplex Talker requires model_runner: v1")
-                state = info.get("audio_state")
+                state = info.get("audio_state") if isinstance(info, dict) else None
                 flags.append(bool(state.get("finished")) if isinstance(state, dict) else False)
                 slots.append(int(input_batch.idx_mapping_np[row]))
             if slots:
@@ -935,11 +933,55 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not self._mrv2_decode_rows_logged and not input_batch.has_prefill:
             self._mrv2_decode_rows_logged = True
             logger.info("MiniCPM-o Talker: MRv2 device-side codec output active (no host read of sampled ids)")
+
+        meta_outputs: dict[str, Any] = {"codec_frame_valid": frame_valid}
+        if model_intermediate_buffer and any(
+            isinstance(info, dict) and info.get("native_duplex") is True for info in model_intermediate_buffer
+        ):
+            native_duplex_flags: list[torch.Tensor] = []
+            duplex_epochs: list[torch.Tensor] = []
+            duplex_turn_ids: list[torch.Tensor] = []
+            segment_texts_utf8: list[torch.Tensor] = []
+            turn_end_flags: list[torch.Tensor] = []
+            for info in model_intermediate_buffer:
+                info_dict = info if isinstance(info, dict) else {}
+                native_duplex = info_dict.get("native_duplex") is True
+                duplex_info = info_dict.get("duplex") if isinstance(info_dict.get("duplex"), dict) else {}
+                epoch = duplex_info.get("epoch", -1)
+                turn_id = duplex_info.get("turn_id", -1)
+                meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
+                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
+                if not isinstance(segment_text, str):
+                    segment_text = ""
+                turn_eos_id = meta_info.get("turn_eos_token_id")
+                ids_info = info_dict.get("ids") if isinstance(info_dict.get("ids"), dict) else {}
+                tts_ids = ids_info.get("tts") if native_duplex else None
+                if isinstance(tts_ids, torch.Tensor):
+                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
+                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
+                    )
+                elif isinstance(tts_ids, (list, tuple)):
+                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+                else:
+                    contains_turn_eos = False
+                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
+                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
+                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                segment_texts_utf8.append(
+                    torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8)
+                )
+                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+            meta_outputs["native_duplex"] = native_duplex_flags
+            meta_outputs["duplex_epoch"] = duplex_epochs
+            meta_outputs["duplex_turn_id"] = duplex_turn_ids
+            meta_outputs["native_duplex_segment_text"] = segment_texts_utf8
+            meta_outputs["turn_end"] = turn_end_flags
+
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
                 "codes": {"audio": token_ids.to(dtype=torch.long).reshape(num_tokens, 1)},
-                "meta": {"codec_frame_valid": frame_valid},
+                "meta": meta_outputs,
             },
         )
 

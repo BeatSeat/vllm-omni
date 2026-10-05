@@ -124,12 +124,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if (
             self.model_stage == "llm"
             and self._use_v2_model_runner
-            and getattr(vllm_config.model_config, "session_mode", "turn") != "turn"
-        ):
-            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
-        if (
-            self.model_stage == "llm"
-            and self._use_v2_model_runner
             and getattr(vllm_config.model_config, "async_chunk", False)
         ):
             raise ValueError("MiniCPM-o MRv2 Thinker requires async_chunk: false for its full llm2tts payload")
@@ -833,16 +827,62 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 req_states=req_states,
                 model_intermediate_buffer=model_intermediate_buffer,
             )
-        if any(isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer):
-            raise NotImplementedError("MiniCPM-o duplex Thinker requires model_runner: v1")
         num_tokens = model_outputs.shape[0]
+        multimodal_outputs: dict[str, Any] = {
+            "latent": model_outputs,
+            "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
+            "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
+        }
+        if model_intermediate_buffer and any(
+            isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer
+        ):
+            duplex_rows = []
+            for req_info in model_intermediate_buffer:
+                duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
+                duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
+
+            prompt_rows = []
+            for duplex_info in duplex_rows:
+                prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
+                prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
+            if any(row is not None for row in prompt_rows):
+                multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
+
+            special_keys = {
+                key
+                for duplex_info in duplex_rows
+                for key, value in (
+                    duplex_info.get("special_token_ids", {}).items()
+                    if isinstance(duplex_info.get("special_token_ids"), dict)
+                    else ()
+                )
+                if isinstance(key, str) and isinstance(value, int) and value >= 0
+            }
+            if special_keys:
+                multimodal_outputs["meta"] = {
+                    key: [
+                        torch.tensor(
+                            [int(value)],
+                            dtype=torch.long,
+                            device=model_outputs.device,
+                        )
+                        if isinstance(value, int) and value >= 0
+                        else None
+                        for duplex_info in duplex_rows
+                        for value in [
+                            (
+                                duplex_info.get("special_token_ids", {}).get(key)
+                                if isinstance(duplex_info.get("special_token_ids"), dict)
+                                else None
+                            )
+                        ]
+                    ]
+                    for key in sorted(special_keys)
+                }
+
         return OmniOutput(
             text_hidden_states=model_outputs,
-            multimodal_outputs={
-                "latent": model_outputs,
-                "latent_input_ids": input_batch.input_ids[:num_tokens].reshape(-1, 1),
-                "latent_positions": input_batch.positions[:num_tokens].reshape(-1, 1),
-            },
+            multimodal_outputs=multimodal_outputs,
         )
 
     def make_omni_output(self, model_outputs, **kwargs):

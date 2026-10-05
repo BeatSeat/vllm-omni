@@ -138,3 +138,32 @@ def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker,
     assert output.num_sampled.tolist() == [1, 0]
     base.assert_called_once_with(logits, batch)
     talker.take_mrv2_forced_eos.assert_called_once_with(batch, base.req_states, 2)
+
+
+def test_mrv2_talker_native_duplex_output() -> None:
+    talker = _talker()
+    rows = [
+        dict(slot=0, prompt_len=4, computed=6, span=[17], prefill=False),
+    ]
+    batch, padded = _batch(rows, pad_to=1)
+    buffers = [
+        {
+            "native_duplex": True,
+            "duplex": {"epoch": 2, "turn_id": 5},
+            "meta": {"native_duplex_segment_text": "hello"},
+        }
+    ]
+    hidden = torch.zeros((1, 4))
+    out = talker.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=_req_states({0: 4}),
+        model_intermediate_buffer=buffers,
+    )
+    assert isinstance(out, OmniOutput)
+    meta = out.multimodal_outputs["meta"]
+    assert meta["native_duplex"][0].item() is True
+    assert meta["duplex_epoch"][0].item() == 2
+    assert meta["duplex_turn_id"][0].item() == 5
+    assert bytes(meta["native_duplex_segment_text"][0].tolist()).decode("utf-8") == "hello"
+

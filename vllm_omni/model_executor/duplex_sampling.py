@@ -56,6 +56,12 @@ class DuplexSamplingHelper:
         info = model_intermediate_buffer.get(req_id) if isinstance(model_intermediate_buffer, dict) else None
         if isinstance(info, dict):
             return info
+        model_state = getattr(runner, "model_state", None)
+        if model_state is not None and hasattr(model_state, "intermediate_buffer"):
+            ib = model_state.intermediate_buffer
+            idx = getattr(ib, "req_id_to_index", {}).get(req_id)
+            if idx is not None and idx < len(getattr(ib, "buffers", [])):
+                return ib.buffers[idx]
         requests = getattr(runner, "requests", {})
         req_state = requests.get(req_id) if isinstance(requests, dict) else None
         info = getattr(req_state, "additional_information_cpu", None)
@@ -74,9 +80,10 @@ class DuplexSamplingHelper:
 
     def rows(self, runner: Any) -> tuple[DuplexSamplingRow, ...]:
         rows: list[DuplexSamplingRow] = []
-        input_batch = runner.input_batch
+        input_batch = getattr(runner, "input_batch", None)
         req_ids = [str(req_id) for req_id in getattr(input_batch, "req_ids", [])]
         requests = getattr(runner, "requests", {})
+        req_states = getattr(runner, "req_states", None)
         temperature_cpu = getattr(input_batch, "temperature_cpu", None)
         top_k_cpu = getattr(input_batch, "top_k_cpu", None)
         top_p_cpu = getattr(input_batch, "top_p_cpu", None)
@@ -104,6 +111,13 @@ class DuplexSamplingHelper:
                 max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
             except (TypeError, ValueError):
                 max_tokens = 0
+            if max_tokens <= 0 and req_states is not None and hasattr(req_states, "max_tokens"):
+                req_idx = getattr(req_states, "req_id_to_index", {}).get(req_id)
+                if req_idx is not None and req_idx < len(req_states.max_tokens):
+                    try:
+                        max_tokens = int(req_states.max_tokens[req_idx])
+                    except (TypeError, ValueError):
+                        max_tokens = 0
             rows.append(
                 DuplexSamplingRow(
                     row_idx=row_idx,
@@ -174,6 +188,47 @@ class DuplexSamplingRunnerMixin:
         helper = getattr(self, "_duplex_sampling_helper", None)
         if helper is not None:
             helper.clear()
+
+    def _maybe_apply_duplex_window_reanchor(self, scheduler_output: SchedulerOutput | None = None) -> None:
+        """Apply in-place KV reanchor and rotation on worker before model forward."""
+        reanchor_hook = getattr(getattr(self, "model", None), "apply_duplex_kv_reanchor", None)
+        if callable(reanchor_hook):
+            try:
+                reanchor_hook(self, scheduler_output=scheduler_output)
+            except TypeError:
+                reanchor_hook(self)
+            return
+
+        helper = getattr(self, "_duplex_window_helper", None)
+        if helper is not None and hasattr(helper, "maybe_apply_reanchor"):
+            try:
+                helper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
+            except TypeError:
+                helper.maybe_apply_reanchor(self)
+            return
+
+        input_batch = getattr(self, "input_batch", None)
+        if input_batch is None:
+            return
+        num_reqs = getattr(input_batch, "num_reqs", len(getattr(input_batch, "req_ids", [])))
+        req_ids = getattr(input_batch, "req_ids", [])[:num_reqs]
+        has_reanchor = False
+        for req_id in req_ids:
+            info = DuplexSamplingHelper._request_intermediate_info(self, req_id)
+            if isinstance(info, dict) and isinstance(info.get("duplex"), dict):
+                if "stage0_reanchor" in info["duplex"]:
+                    has_reanchor = True
+                    break
+        if not has_reanchor:
+            return
+
+        model_module = getattr(getattr(self, "model", None), "__module__", "")
+        if "minicpmo_4_5" in model_module:
+            from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv import (
+                MiniCPMO45DuplexWorkerHelper,
+            )
+
+            MiniCPMO45DuplexWorkerHelper.maybe_apply_reanchor(self, scheduler_output=scheduler_output)
 
 
 __all__ = ["DuplexSamplingHelper", "DuplexSamplingRow", "DuplexSamplingRunnerMixin"]

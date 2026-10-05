@@ -509,6 +509,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.update_requests(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if hasattr(self, "_update_duplex_sampling_states"):
+                self._update_duplex_sampling_states(scheduler_output)
+            if hasattr(self, "_maybe_apply_duplex_window_reanchor"):
+                self._maybe_apply_duplex_window_reanchor(scheduler_output)
             if self.aux_output_connector is not None:
                 self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -771,3 +775,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+
+    @property
+    def model_intermediate_buffer(self) -> dict[str, Any]:
+        """Backward-compatible view of intermediate buffers keyed by req_id."""
+        ib = getattr(getattr(self, "model_state", None), "intermediate_buffer", None)
+        if ib is None:
+            return {}
+        return {
+            req_id: ib.buffers[idx]
+            for req_id, idx in getattr(ib, "req_id_to_index", {}).items()
+            if idx < len(ib.buffers)
+        }

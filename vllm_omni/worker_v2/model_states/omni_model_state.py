@@ -792,8 +792,10 @@ class OmniModelState(DefaultModelState):
                 num_computed_tokens = self._get_input_batch_num_computed(input_batch, req_idx, i)
             if prompt_len is not None:
                 info["_omni_prompt_len"] = int(prompt_len)
+                info["duplex_prompt_len"] = int(prompt_len)
             if num_computed_tokens is not None:
                 info["_omni_num_computed_tokens"] = int(num_computed_tokens)
+                info["duplex_token_offset"] = int(num_computed_tokens)
             if prompt_len is not None and num_computed_tokens is not None:
                 info["_omni_is_prefill"] = int(num_computed_tokens) < int(prompt_len)
 

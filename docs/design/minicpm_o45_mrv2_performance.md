@@ -23,3 +23,18 @@ performance or interruption correctness.
 The shared asynchronous output snapshot and batched Talker preprocessing also
 apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
+
+## Duplex mode on MRv2
+
+Full-duplex serving (`session_mode: duplex`) is adapted to Model Runner V2
+via `minicpmo_4_5_duplex_mrv2.yaml`. Thinker (stage 0), Talker (stage 1) and
+Code2Wav (stage 2) execute through MRv2 runners.
+
+- Thinker: reuses native Stage-0 duplex preprocessing, window KV compaction
+  and reanchor (`MiniCPMO45DuplexWorkerHelper`), and device-side duplex sampling
+  via `DuplexSamplingRunnerMixin`. Outputs `duplex_prompt_token_ids` and
+  special boundary token metadata within `make_omni_output_mrv2` for `llm2tts`.
+- Talker: runs on `OmniARModelRunner` with native duplex metadata propagation
+  (`duplex_epoch`, `duplex_turn_id`, `native_duplex_segment_text`, `turn_end`).
+- Code2Wav: receives full-payload duplex metadata on MRv2 generation runner.
+

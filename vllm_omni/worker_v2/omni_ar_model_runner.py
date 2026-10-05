@@ -32,6 +32,7 @@ from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
@@ -90,7 +91,7 @@ def _guard_graph_replay_for_pooler_copy(
         main_stream.wait_event(copy_event)
 
 
-class OmniARModelRunner(OmniGPUModelRunner):
+class OmniARModelRunner(OmniGPUModelRunner, DuplexSamplingRunnerMixin):
     """AR stage runner. Produces per-request hidden states + multimodal outputs."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -102,6 +103,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_pending = [False] * 4
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
+        self._init_duplex_sampling_state()
+
+    def load_model(self, *args: Any, **kwargs: Any) -> None:
+        super().load_model(*args, **kwargs)
+        self._resolve_duplex_sampling_hook(force=True)
 
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
@@ -155,6 +161,27 @@ class OmniARModelRunner(OmniGPUModelRunner):
             output = sample_determined(self.model_state, input_batch, self.sampler)
             if output is not None:
                 return output, output.num_sampled, output.num_rejected
+        if getattr(self, "_duplex_sampling_hook", None) is not None:
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
+            self._apply_duplex_sampling(logits, None)
+            if grammar_output is not None and getattr(self, "structured_outputs_worker", None) is not None:
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
+            model_sample = getattr(self.model, "sample", None)
+            sampler_output = None
+            if callable(model_sample):
+                try:
+                    sampler_output = model_sample(logits, None)
+                except TypeError:
+                    sampler_output = None
+            if sampler_output is None:
+                sampler_output = self.sampler(logits, input_batch)
+            return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
         return super().sample(hidden_states, input_batch, grammar_output)
 
     @torch.inference_mode()

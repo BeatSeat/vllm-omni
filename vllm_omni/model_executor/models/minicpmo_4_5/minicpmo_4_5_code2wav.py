@@ -839,14 +839,22 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        return self._forward_impl(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds,
-            runtime_additional_information,
-            **kwargs,
-        )
+        # This stage owns the vocoder process. Restore its previous matmul
+        # policy after eager execution/capture; cuDNN's policy is independent.
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            if self._extra_config().get("token2wav_allow_tf32", False):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return self._forward_impl(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                runtime_additional_information,
+                **kwargs,
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
     @torch.inference_mode()
     def _forward_impl(

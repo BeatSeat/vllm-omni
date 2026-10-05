@@ -987,7 +987,11 @@ def test_whole_euler_slot_entry_enforces_budget_boundary(monkeypatch: pytest.Mon
         n_timesteps=10,
         max_graphs=2,
         att_slots=2,
+        ragged_body=Mock(),
+        modulation_fn=lambda t: t,
+        query_bucket_frames=16,
     )
+    monkeypatch.setattr(wrapper, "_record", lambda key, *args, **kwargs: (Mock(), Mock(), Mock(), Mock()))
     pool = wrapper._ensure_slot_pool((0, 4))
     assert pool is not None
 

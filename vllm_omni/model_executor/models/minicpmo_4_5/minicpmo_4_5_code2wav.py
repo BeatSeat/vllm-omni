@@ -51,11 +51,11 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
 
 
 def _tf32_mode(extra: Mapping[str, Any]) -> str:
-    """Ordinary TF32 for CFM DiT dense GEMMs (``"off"`` / ``"tf32"``).
+    """Ordinary TF32 for CFM DiT GEMMs (``"off"`` / ``"tf32"``).
 
-    Does not run compensated TF32x3 on ``F.linear``. ``token2wav_allow_tf32``
-    is the shipped YAML key; ``code2wav_allow_tf32`` and env ``tf32x3`` alias it.
-    Triton ``cfm_attention`` still uses ``input_precision="tf32x3"`` on its own.
+    Enables ``allow_tf32`` on dense QKV/MLP and Triton ``input_precision="tf32"``
+    dots. Not compensated TF32x3. ``token2wav_allow_tf32`` is the shipped YAML
+    key; ``code2wav_allow_tf32`` and legacy env ``tf32x3`` / ``3xtf32`` alias it.
     """
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
     value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", False))
@@ -1199,11 +1199,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
         # Token2wav runs in fp32, so without TF32 every flow-DiT GEMM runs on
-        # SIMT cores. Ordinary TF32 uses SM80+ Tensor Cores for those dense
-        # GEMMs. Triton cfm_attention still requests tf32x3 dots on its own.
+        # SIMT cores. Ordinary TF32 uses SM80+ Tensor Cores for dense GEMMs and
+        # Triton CFM attention dots. HiFT stays IEEE FP32.
         tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
         if tf32_mode != "off":
-            logger.info("MiniCPM-o Code2Wav: TF32 matmul enabled for CFM DiT dense GEMMs")
+            logger.info("MiniCPM-o Code2Wav: ordinary TF32 enabled for CFM DiT GEMMs")
         use_float16 = bool(extra.get("token2wav_float16", False))
         previous_dtype = torch.get_default_dtype()
         try:

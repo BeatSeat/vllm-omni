@@ -1906,5 +1906,7 @@ def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
     assert _tf32_mode({}) == "off"
     assert _tf32_mode({"token2wav_allow_tf32": True}) == "tf32"
     assert _tf32_mode({"code2wav_allow_tf32": True}) == "tf32"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32")
+    assert _tf32_mode({}) == "tf32"
     monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32x3")
     assert _tf32_mode({}) == "tf32"

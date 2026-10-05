@@ -132,7 +132,7 @@ def _mlp(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
 
 @functools.cache
 def tiled_attention_supported(device_index: int) -> bool:
-    """``cfm_attention``'s tf32x3 dots need NVIDIA tensor cores with TF32 (SM80+)."""
+    """``cfm_attention`` TF32 dots need NVIDIA tensor cores (SM80+)."""
     return torch.version.hip is None and torch.cuda.get_device_capability(device_index) >= (8, 0)
 
 

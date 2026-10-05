@@ -284,7 +284,7 @@ def _undecorate_dynamo(module: nn.Module, method: str) -> None:
 
 
 def _cfm_matmul_tf32(fn):
-    """Run the flow CFM (and capture its graphs) with TF32 matmuls when ``cfm_tf32``; the rest stays fp32."""
+    """Run the flow CFM (and capture its graphs) with ordinary TF32 GEMMs when ``cfm_tf32``; HiFT stays fp32."""
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):

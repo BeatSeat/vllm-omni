@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Tiled FP32 attention for the short streaming CFM windows on NVIDIA CUDA."""
+"""Tiled CFM attention: float32 tensors, ordinary TF32 Tensor Core dots."""
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -61,7 +61,7 @@ def _attention(
             (keys[None, :] < nk) & (ds[:, None] < dim),
             0,
         )
-        score = tl.dot(queries, kval, input_precision="tf32x3") * scale
+        score = tl.dot(queries, kval, input_precision="tf32") * scale
         valid = (rows[:, None] < nq) & (keys[None, :] < nk)
         if has_mask:
             keep = tl.load(mask + b * mb + rows[:, None] * mt + keys[None, :] * mk, valid, 0)
@@ -80,7 +80,7 @@ def _attention(
             (keys[:, None] < nk) & (ds[None, :] < dim),
             0,
         )
-        accumulator = accumulator * correction[:, None] + tl.dot(prob, values, input_precision="tf32x3")
+        accumulator = accumulator * correction[:, None] + tl.dot(prob, values, input_precision="tf32")
         maximum = new_max
     result = accumulator / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
@@ -98,7 +98,7 @@ def cfm_attention(
     mask: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """FP32 tiled attention; optional ``kv_rows`` indexes a pooled K/V cache."""
+    """Tiled attention with TF32 dots; optional ``kv_rows`` indexes a pooled K/V cache."""
     b, heads, nq, dim = q.shape
     nk = k.shape[2]
     if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:

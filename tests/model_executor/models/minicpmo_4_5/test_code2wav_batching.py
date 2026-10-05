@@ -1709,7 +1709,17 @@ def _padded_decode_adapter(bucket_frames: int) -> tuple[BatchedToken2Wav, int, i
     Returns the adapter, the valid width, and the padding width. Every call
     seeds the same way, so two adapters built here agree on weights and noise.
     """
-    from cosyvoice2.flow.decoder_dit import DiT
+    for name in ("cosyvoice2.flow.decoder_dit", "stepaudio2.cosyvoice2.flow.decoder_dit"):
+        try:
+            import importlib
+
+            decoder_dit = importlib.import_module(name)
+            break
+        except ImportError:
+            pass
+    else:
+        decoder_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+    DiT = decoder_dit.DiT
 
     torch.manual_seed(23)
     estimator = DiT(
@@ -1817,3 +1827,38 @@ def test_padding_does_not_change_the_valid_frames():
 
     assert int(padded_x.shape[2]) == int(exact_x.shape[2]) == mel_frames
     assert torch.allclose(padded_x, exact_x, atol=1e-5)
+
+
+def test_decode_ragged_batch_mixed_onset_and_continuation():
+    """Ragged batch merging fresh onset and continuation states does not crash stacking conformer caches."""
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    _enable_fake_ragged_kernel(adapter)
+    prompt = adapter.prepare_prompt("shared_p", "/fake/prompt.wav")
+    onset_states = adapter.setup_batch(prompt, 1)
+    state_onset = onset_states[0]
+
+    # Run one decode step on another state so its conformer/estimator caches advance.
+    cont_states_init = adapter.setup_batch(prompt, 1)
+    _, cont_states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        cont_states_init,
+        last_chunk=False,
+    )
+    state_continuation = cont_states[0]
+
+    # Verify conformer caches have mismatched shapes between onset and continuation states.
+    assert (
+        state_onset.flow_cache["conformer_att_cache"].shape
+        != state_continuation.flow_cache["conformer_att_cache"].shape
+    )
+
+    # Ragged decode with both onset and continuation states in a single batch.
+    audios, next_states = adapter.decode_ragged_batch(
+        [torch.tensor([20, 21]), torch.tensor([30, 31])],
+        prompt,
+        [state_onset, state_continuation],
+        last_chunks=[False, False],
+    )
+    assert len(audios) == 2
+    assert len(next_states) == 2

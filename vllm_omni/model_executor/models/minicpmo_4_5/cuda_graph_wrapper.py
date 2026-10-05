@@ -287,6 +287,25 @@ def _memory_snapshot(device: torch.device) -> tuple[int, int] | None:
         return None
 
 
+def _memory_peak(device: torch.device) -> tuple[int, int] | None:
+    """Return allocator peak (allocated, reserved) bytes when available.
+
+    A before/after delta misses transient capture workspaces.  Peak counters
+    are the useful signal for deciding whether another graph bucket is safe;
+    they are sampled without synchronizing and are therefore cheap enough for
+    capture telemetry.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        return (
+            int(torch.accelerator.max_memory_allocated(device)),
+            int(torch.accelerator.max_memory_reserved(device)),
+        )
+    except Exception:
+        return None
+
+
 def _format_memory_delta(before: tuple[int, int] | None, after: tuple[int, int] | None) -> str:
     if before is None or after is None:
         return ""
@@ -559,11 +578,19 @@ class CFMGraphWrapper:
             "captures": 0,
             "flushes": 0,
             "eager": 0,
+            "peak_allocated": 0,
+            "peak_reserved": 0,
         }
 
     def stats_snapshot(self) -> dict[str, int]:
         """Bounded cumulative telemetry for the graph cache."""
         return {**self._stats, "cache_size": len(self._cache)}
+
+    def _record_peak(self) -> None:
+        peak = _memory_peak(self.device)
+        if peak is not None:
+            self._stats["peak_allocated"] = max(self._stats["peak_allocated"], peak[0])
+            self._stats["peak_reserved"] = max(self._stats["peak_reserved"], peak[1])
 
     def _call_graph_fn(self, args: tuple[torch.Tensor, ...]) -> torch.Tensor:
         return self.graph_fn(args[0], args[1], args[6], args[2], args[3], args[4], args[5])
@@ -643,6 +670,7 @@ class CFMGraphWrapper:
             return None
 
         self._stats["captures"] += 1
+        self._record_peak()
         logger.info(
             "Captured CFM CUDA Graph for shape %s (cache=%d/%d, stats=%s)%s",
             key,
@@ -1100,6 +1128,8 @@ class WholeEulerCFMGraphWrapper:
             "flushes": 0,
             "eager": 0,
             "slot_replays": 0,
+            "peak_allocated": 0,
+            "peak_reserved": 0,
         }
 
         self.timeline, self.dt_steps = _euler_timeline(self.n_timesteps, self.device, self.dtype)
@@ -1125,6 +1155,12 @@ class WholeEulerCFMGraphWrapper:
     def stats_snapshot(self) -> dict[str, int]:
         """Bounded cumulative telemetry for the graph cache."""
         return {**self._stats, "cache_size": len(self._cache) + len(self._slot_graphs)}
+
+    def _record_peak(self) -> None:
+        peak = _memory_peak(self.device)
+        if peak is not None:
+            self._stats["peak_allocated"] = max(self._stats["peak_allocated"], peak[0])
+            self._stats["peak_reserved"] = max(self._stats["peak_reserved"], peak[1])
 
     @staticmethod
     def _retire(graphs: dict[tuple, tuple]) -> None:
@@ -1429,6 +1465,7 @@ class WholeEulerCFMGraphWrapper:
             return None
 
         self._stats["captures"] += 1
+        self._record_peak()
         logger.info(
             "Captured Whole-Euler CFM CUDA Graph for shape %s (cache=%d/%d, %s, stats=%s)%s",
             key,
@@ -1459,7 +1496,7 @@ class WholeEulerCFMGraphWrapper:
         if entry is not None:
             self._stats["hits"] += 1
             return entry
-        if len(self._cache) >= self.max_graphs:
+        if len(self._cache) + len(self._slot_graphs) >= self.max_graphs:
             self._unsupported.add(key)
             return None
         entry = self._capture(
@@ -1528,6 +1565,9 @@ class WholeEulerCFMGraphWrapper:
             self._stats["hits"] += 1
             return entry
         if key in self._unsupported:
+            return None
+        if len(self._cache) + len(self._slot_graphs) >= self.max_graphs:
+            self._unsupported.add(key)
             return None
         pool = self.slot_pool
         assert pool is not None
@@ -1709,7 +1749,18 @@ class WholeEulerCFMGraphWrapper:
         """Capture every slot-pool graph (batch grid x capture widths); the cache offset is not a key."""
         before = self._stats["captures"]
         shape = {"channels": channels, "spk_dim": spk_dim, "fill": self._precapture_fill}
-        for graph_batch, query_cap in itertools.product(sorted(self._graph_batches(), reverse=True), self.query_widths):
+        keys = list(itertools.product(sorted(self._graph_batches(), reverse=True), self.query_widths))
+        room = self.max_graphs - (len(self._cache) + len(self._slot_graphs))
+        if len(keys) > room:
+            logger.warning(
+                "Whole-Euler slot precapture requested %d graphs; max_graphs budget is %d (room=%d). "
+                "Excess shapes will execute eagerly",
+                len(keys),
+                self.max_graphs,
+                room,
+            )
+            keys = keys[: max(0, room)]
+        for graph_batch, query_cap in keys:
             if self._slot_entry(graph_batch=graph_batch, query_cap=query_cap, **shape) is None:
                 break
         return self._stats["captures"] - before
@@ -1742,7 +1793,7 @@ class WholeEulerCFMGraphWrapper:
         if not widths:
             return 0
         keys = [(b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in widths for o in grid]
-        room = self.max_graphs - len(self._cache)
+        room = self.max_graphs - (len(self._cache) + len(self._slot_graphs))
         if len(keys) > room:
             logger.warning(
                 "Whole-Euler precapture requested %d graphs; max_graphs budget is %d (room=%d). "

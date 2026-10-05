@@ -1106,10 +1106,12 @@ class BatchedToken2Wav(nn.Module):
         # ``row_offset_merge``: ragged rows whose caches differ in length each
         # start from the noise at their own offset and attend their own cache.
         row_offsets = None
-        if self._row_offset_merge and att_rows is not None and valid_lengths is not None:
-            row_offsets = [int(row.shape[4]) for row in att_rows]
-            if len(set(row_offsets)) == 1:
-                row_offsets = None
+        if att_rows is not None and valid_lengths is not None:
+            lengths = [int(row.shape[4]) for row in att_rows]
+            if len(set(lengths)) > 1 or self._row_offset_merge:
+                row_offsets = lengths
+                if len(set(row_offsets)) == 1 and not self._row_offset_merge:
+                    row_offsets = None
         mel_frames = int(mu.shape[2])
         # Padding only pays off while replay is active: Whole-Euler, the CFM wrapper (still enabled,
         # no TRT stepper), or on NPU the platform runner keyed by `_cfm_graph_enabled`.
@@ -1869,12 +1871,9 @@ class BatchedToken2Wav(nn.Module):
         # Row-offset merges hold caches of different lengths, which never stack: the solve takes them
         # per row, and the encoder groups above already read the conformer caches.
         per_row_att = per_request_att or (
-            self._row_offset_merge
-            and len({int(state.flow_cache["estimator_att_cache"].shape[4]) for state in states}) > 1
+            len({int(state.flow_cache["estimator_att_cache"].shape[4]) for state in states}) > 1
         )
-        flow_cache = self._stack_flow_cache(
-            states, include_estimator_att=not per_row_att, include_conformer=not self._row_offset_merge
-        )
+        flow_cache = self._stack_flow_cache(states, include_estimator_att=not per_row_att, include_conformer=False)
         prompt_len = int(features.mels.shape[1])
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(padded_hidden.device):
@@ -1920,10 +1919,17 @@ class BatchedToken2Wav(nn.Module):
 
         audios: list[torch.Tensor | None] = [None] * batch_size
         next_states: list[BatchedToken2WavState | None] = [None] * batch_size
-        vocoder_groups: dict[tuple[int, bool], list[int]] = {}
+        vocoder_groups: dict[tuple[Any, ...], list[int]] = {}
         for row, last_chunk in enumerate(last_chunks):
-            vocoder_groups.setdefault((hidden_lengths[row], last_chunk), []).append(row)
-        for (hidden_length, last_chunk), rows in vocoder_groups.items():
+            key = (
+                hidden_lengths[row],
+                last_chunk,
+                tuple(states[row].hift_cache["mel"].shape),
+                tuple(states[row].hift_cache["source"].shape),
+                tuple(states[row].hift_cache["speech"].shape),
+            )
+            vocoder_groups.setdefault(key, []).append(row)
+        for (hidden_length, last_chunk, *_), rows in vocoder_groups.items():
             old_mel = torch.cat([states[row].hift_cache["mel"] for row in rows], dim=0)
             old_source = torch.cat([states[row].hift_cache["source"] for row in rows], dim=0)
             old_speech = torch.cat([states[row].hift_cache["speech"] for row in rows], dim=0)

@@ -978,6 +978,45 @@ def test_whole_euler_precapture_enforces_budget_boundary(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_whole_euler_slot_entry_enforces_budget_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: torch.cuda.graph_pool_handle())
+    torch.manual_seed(0)
+    estimator = _WholeEulerDiT().eval().cuda()
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=2,
+        att_slots=2,
+    )
+    pool = wrapper._ensure_slot_pool((0, 4))
+    assert pool is not None
+
+    fill = wrapper._precapture_fill
+    # Capture 1 slot graph
+    entry1 = wrapper._slot_entry(graph_batch=1, query_cap=10, channels=4, spk_dim=4, fill=fill)
+    assert entry1 is not None
+    assert len(wrapper._slot_graphs) == 1
+    assert wrapper.stats_snapshot()["cache_size"] == 1
+
+    # Capture 1 arena graph
+    x = torch.empty((1, 4, 1), device="cuda", dtype=torch.float32)
+    entry2 = wrapper._entry(graph_batch=1, query_cap=12, offset=0, x=x, spk_dim=4, fill=fill)
+    assert entry2 is not None
+    assert len(wrapper._cache) == 1
+    assert wrapper.stats_snapshot()["cache_size"] == 2
+
+    # A 3rd graph (slot or arena) exceeds max_graphs=2: falls back to eager (returns None)
+    entry3_slot = wrapper._slot_entry(graph_batch=1, query_cap=14, channels=4, spk_dim=4, fill=fill)
+    assert entry3_slot is None
+
+    entry3_arena = wrapper._entry(graph_batch=1, query_cap=16, offset=0, x=x, spk_dim=4, fill=fill)
+    assert entry3_arena is None
+
+    assert wrapper.stats_snapshot()["cache_size"] == 2
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_whole_euler_arena_cleaned_when_first_capture_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

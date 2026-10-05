@@ -1903,9 +1903,15 @@ def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _tf32_mode
 
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
-    assert _tf32_mode({}) == "off"
+    assert _tf32_mode({}) == "tf32"
+    assert _tf32_mode({"token2wav_allow_tf32": False}) == "off"
+    assert _tf32_mode({"code2wav_allow_tf32": False}) == "off"
     assert _tf32_mode({"token2wav_allow_tf32": True}) == "tf32"
     assert _tf32_mode({"code2wav_allow_tf32": True}) == "tf32"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "0")
+    assert _tf32_mode({}) == "off"
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    assert _tf32_mode({}) == "off"
     monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32")
     assert _tf32_mode({}) == "tf32"
     monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "tf32x3")

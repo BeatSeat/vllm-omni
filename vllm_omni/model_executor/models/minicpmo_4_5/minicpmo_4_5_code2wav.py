@@ -56,9 +56,10 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     Enables ``allow_tf32`` on dense QKV/MLP and Triton ``input_precision="tf32"``
     dots. Not compensated TF32x3. ``token2wav_allow_tf32`` is the shipped YAML
     key; ``code2wav_allow_tf32`` and legacy env ``tf32x3`` / ``3xtf32`` alias it.
+    Defaults to ``"tf32"`` unless explicitly disabled.
     """
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
-    value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", False))
+    value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", True))
     if isinstance(value, str):
         return {
             "tf32": "tf32",
@@ -850,7 +851,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         previous_tf32 = torch.backends.cuda.matmul.allow_tf32
         try:
             extra = self._extra_config()
-            if extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", False)):
+            if _tf32_mode(extra) != "off":
                 torch.backends.cuda.matmul.allow_tf32 = True
             return self._forward_impl(
                 input_ids,

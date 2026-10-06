@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from transformers.models.whisper.modeling_whisper import WhisperConfig
 
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMForConditionalGeneration,
     MiniCPMWhisperEncoder,
@@ -81,3 +82,41 @@ def test_batched_rounds_match_sequential_sessions() -> None:
         # Not in the batch: the same cache object, the same committed length.
         assert all(batched[s] is c and (c.length if c else 0) == n for s, (c, n) in idle.items())
     assert resets >= 2, "the schedule must cross the max_source_positions reset"
+
+
+def test_graph_build_honors_eager_without_engine_config() -> None:
+    # The thinker keeps no vllm_config: the gate reads the flag __init__ stored.
+    thinker = _thinker()
+    thinker._enforce_eager = True
+    assert thinker.build_streaming_audio_graph_encoder(unit_frames=24) is False
+    assert thinker._duplex_audio_cuda_graph_encoder is None
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graph_build_captures_on_cuda() -> None:
+    thinker = _thinker().cuda()
+    thinker._enforce_eager = False
+    thinker.config.duplex_audio_encoder_cuda_graph_batch_sizes = [1, 2]
+    thinker.config.duplex_audio_encoder_cuda_graph_cache_buckets = [8]
+    assert thinker.build_streaming_audio_graph_encoder(unit_frames=24) is True
+    assert thinker._duplex_audio_cuda_graph_encoder is not None
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "device", "captures"),
+    [("duplex", "cuda", 1), ("turn", "cuda", 0), ("duplex", "cpu", 0)],
+)
+def test_duplex_audio_graphs_capture_while_the_model_loads(monkeypatch, session_mode, device, captures) -> None:
+    # Captured in load_weights, the graphs count against the KV budget instead of past it.
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
+    model.thinker = nn.Linear(1, 1)
+    calls: list[None] = []
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(build_audio_cuda_graph=lambda: calls.append(None))
+    monkeypatch.setattr(
+        MiniCPMO45OmniForConditionalGeneration, "_module_device", staticmethod(lambda module: torch.device(device))
+    )
+    model._capture_duplex_audio_graphs()
+    assert len(calls) == captures

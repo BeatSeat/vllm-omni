@@ -1679,4 +1679,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)
 
+        self._capture_duplex_audio_graphs()
         return loaded_weights
+
+    def _capture_duplex_audio_graphs(self) -> None:
+        """Capture the duplex streaming audio encoder graphs while the model loads.
+
+        Inside load_model their memory counts as model memory, so the KV budget leaves room for it.
+        A lazy capture on the first duplex request allocates past gpu_memory_utilization instead,
+        which OOMs the stages sharing the GPU.
+        """
+        model_config = getattr(self.vllm_config, "model_config", None)
+        if self.thinker is None or getattr(model_config, "session_mode", "turn") != "duplex":
+            return
+        if self._module_device(self.thinker).type != "cuda":
+            return
+        self._duplex_data_plane_helper().build_audio_cuda_graph()

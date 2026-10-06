@@ -4195,6 +4195,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Duplex session cap of this deployment; sizes the audio-encoder graph
         # grid when ``duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions``.
         self._duplex_max_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1) or 1)
+        self._enforce_eager = bool(vllm_config.model_config.enforce_eager)
         # Model-local opt-out for A/B measurements; --enforce-eager always wins.
         encoder_graphs = (
             bool(getattr(config, "encoder_cuda_graph", True)) and not vllm_config.model_config.enforce_eager
@@ -4927,8 +4928,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         """Capture CUDA graphs of the streaming encoder's steady unit. Failures stay eager."""
         self._duplex_audio_cuda_graph_encoder = None
         config = self.config
-        enforce_eager = bool(getattr(getattr(self.vllm_config, "model_config", None), "enforce_eager", False))
-        enabled = bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)) and not enforce_eager
+        enabled = bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)) and not self._enforce_eager
         if not self.supports_streaming_audio_batch() or not enabled:
             return False
         if self.apm.conv1.weight.device.type != "cuda":
@@ -4950,7 +4950,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 cache_buckets=getattr(config, "duplex_audio_encoder_cuda_graph_cache_buckets", None),
                 page_positions=self._duplex_audio_kv_page_positions(),
                 pinned_h2d=getattr(config, "duplex_audio_encoder_pinned_h2d", False) is True,
-                vllm_config=getattr(self, "vllm_config", None),
             )
             wrapper.capture()
         except Exception:

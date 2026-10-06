@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Fixed-buffer streaming state and CUDA graph replay of the PersonaPlex Mimi codec."""
 
+import gc
+import weakref
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -245,12 +250,15 @@ def test_failed_capture_warns_with_the_error_and_stays_eager(monkeypatch: pytest
     expected_pcm = codec.decode_frame(expected_codes)
     codec.streaming_init(2)
 
-    class _FailingGraph:
-        def __init__(self) -> None:
+    class _FailingCapture:
+        def __enter__(self) -> None:
+            pass
+
+        def __exit__(self, *_args) -> None:
             raise RuntimeError("CUDA error: out of memory")
 
     warnings: list[tuple[tuple, dict]] = []
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FailingGraph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *_args, **_kwargs: _FailingCapture())
     monkeypatch.setattr(
         personaplex_mimi_cudagraph.logger,
         "warning",
@@ -263,8 +271,10 @@ def test_failed_capture_warns_with_the_error_and_stays_eager(monkeypatch: pytest
     assert len(warnings) == 1
     args, kwargs = warnings[0]
     assert "requested" in args[0] and "capture failed" in args[0] and "eagerly" in args[0]
-    assert args[1:] == ("encode/decode_f1", 2)
-    assert kwargs == {"exc_info": True}
+    assert args[1:3] == ("encode/decode_f1", 2)
+    assert "Traceback (most recent call last):" in args[3]
+    assert "RuntimeError: CUDA error: out of memory" in args[3]
+    assert not kwargs
     # The warmup frames are rolled back, so the eager codec starts a fresh stream.
     assert torch.equal(codec.encode_frame(pcm), expected_codes)
     assert torch.equal(codec.decode_frame(expected_codes), expected_pcm)
@@ -356,3 +366,232 @@ def test_resize_after_capture_warns_that_graphs_are_dropped(monkeypatch: pytest.
     codec.streaming_init(3)
     assert codec._cuda_graphs == {}
     assert len(warnings) == 1 and warnings[0][1:] == (2, 3, "encode")
+
+
+@pytest.fixture
+def capture_faults(monkeypatch: pytest.MonkeyPatch):
+    """Exercise capture orchestration and error boundaries with CPU tensors."""
+    from vllm_omni.model_executor.models.personaplex import personaplex_mimi_cudagraph as graphs
+
+    state = SimpleNamespace(
+        errors={},
+        counts={},
+        events=[],
+        warnings=[],
+        phase="setup",
+        capturing=False,
+        graph_refs=[],
+        capture_refs=[],
+        output_refs=[],
+        check_released=False,
+    )
+    state.original_stream = state.stream = object()
+
+    def record(event):
+        state.events.append(event)
+        state.counts[event] = state.counts.get(event, 0) + 1
+        error = state.errors.get((event, state.counts[event]), state.errors.get(event))
+        if error is not None:
+            raise error
+
+    def eager(name):
+        def step(frame, active):
+            state.phase = "capture" if state.capturing else "warmup"
+            record(f"{name}_{state.phase}")
+            if state.capturing:
+                output = frame.clone()
+                state.output_refs.append(weakref.ref(output))
+                return output
+            return frame
+
+        return step
+
+    def reset():
+        assert state.stream is state.original_stream
+        if state.check_released:
+            assert all(ref() is None for ref in state.graph_refs + state.capture_refs + state.output_refs)
+        state.phase = "reset"
+        record("reset")
+
+    codec = SimpleNamespace(
+        device="cuda",
+        dtype=torch.float32,
+        _batch_size=2,
+        _encode_frame_eager=eager("encode"),
+        _decode_frames_eager=eager("decode"),
+        reset_streaming=reset,
+    )
+
+    class Graph:
+        def __init__(self):
+            record("construct")
+            state.graph_refs.append(weakref.ref(self))
+
+    class Capture:
+        def __init__(self, graph):
+            self.graph = graph
+            state.capture_refs.append(weakref.ref(self))
+
+        def __enter__(self):
+            record("capture_setup_sync")
+            record("capture_setup_empty_cache")
+            state.stream = object()
+            state.capturing = True
+            record("capture_begin")
+
+        def __exit__(self, exc_type, exc, traceback):
+            state.capturing = False
+            # Match torch.cuda.graph: capture_end can raise before restoration,
+            # and can replace a body exception with capture-invalidated.
+            record("capture_end")
+            state.stream = state.original_stream
+
+    @contextmanager
+    def stream_context(stream):
+        previous = state.stream
+        state.stream = stream
+        try:
+            yield
+        finally:
+            state.stream = previous
+
+    zeros, ones = torch.zeros, torch.ones
+    monkeypatch.setattr(torch, "zeros", lambda *args, **kwargs: zeros(*args, **(kwargs | {"device": "cpu"})))
+    monkeypatch.setattr(torch, "ones", lambda *args, **kwargs: ones(*args, **(kwargs | {"device": "cpu"})))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: (0, 0))
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph, **kwargs: Capture(graph))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: state.stream)
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: record(f"sync_{state.phase}"))
+    monkeypatch.setattr(graphs.logger, "warning", lambda *args, **kwargs: state.warnings.append((args, kwargs)))
+    state.capture = lambda: graphs.capture_mimi_frame_graphs(
+        codec,
+        encode=True,
+        decode_frame_counts=(1,),
+        warmup_iters=1,
+    )
+    return state
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("step", ["encode_warmup", "decode_warmup"])
+@pytest.mark.parametrize("error_type", [RuntimeError, torch.cuda.OutOfMemoryError])
+def test_eager_warmup_failures_propagate_before_capture(capture_faults, step, error_type):
+    error = error_type("injected eager tensor failure")
+    capture_faults.errors[step] = error
+    with pytest.raises(error_type) as raised:
+        capture_faults.capture()
+    assert raised.value is error
+    assert capture_faults.counts.get("construct", 0) == 0
+    assert capture_faults.counts["reset"] == 1
+    assert not capture_faults.warnings
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "point",
+    [
+        "sync_warmup",
+        "construct",
+        "capture_setup_sync",
+        "capture_setup_empty_cache",
+        "capture_begin",
+        "sync_capture",
+        "sync_reset",
+        "reset",
+    ],
+)
+def test_device_and_reset_failures_are_never_capture_fallbacks(capture_faults, point):
+    # Even an otherwise recoverable error class must propagate at these boundaries.
+    error = torch.cuda.OutOfMemoryError("injected device or reset failure")
+    capture_faults.errors[point] = error
+    with pytest.raises(torch.cuda.OutOfMemoryError) as raised:
+        capture_faults.capture()
+    assert raised.value is error
+    assert not capture_faults.warnings
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "message",
+    [
+        "tensor size mismatch",
+        "CUDA error: an illegal memory access was encountered",
+        "CUDA error: device-side assert triggered",
+        "CUDA error: operation failed due to a previous error during capture",
+    ],
+)
+def test_unknown_or_fatal_capture_errors_propagate(capture_faults, message):
+    error = RuntimeError(message)
+    capture_faults.errors["encode_capture"] = error
+    with pytest.raises(RuntimeError) as raised:
+        capture_faults.capture()
+    assert raised.value is error
+    assert capture_faults.stream is capture_faults.original_stream
+    assert capture_faults.counts["reset"] == 1
+    assert not capture_faults.warnings
+
+
+@pytest.mark.cpu
+def test_recoverable_capture_failure_discards_partial_graphs_after_all_warmups(capture_faults):
+    error = torch.cuda.OutOfMemoryError("capture allocation failed")
+    capture_faults.errors[("capture_end", 2)] = error
+    capture_faults.check_released = True
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        assert capture_faults.capture() == {}
+    finally:
+        if was_enabled:
+            gc.enable()
+    assert capture_faults.events.index("decode_warmup") < capture_faults.events.index("construct")
+    assert capture_faults.counts["capture_end"] == 2  # an earlier graph completed
+    assert capture_faults.counts["sync_reset"] == 1
+    assert capture_faults.stream is capture_faults.original_stream
+    assert len(capture_faults.warnings) == 1
+    assert "capture allocation failed" in capture_faults.warnings[0][0][-1]
+    assert "Traceback (most recent call last):" in capture_faults.warnings[0][0][-1]
+    assert not capture_faults.warnings[0][1]
+    assert error.__traceback__ is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_capture_end_does_not_hide_the_original_failure(capture_faults, recoverable):
+    message = "CUDA error: operation not permitted when stream is capturing" if recoverable else "tensor size mismatch"
+    original = RuntimeError(message)
+    capture_faults.errors["encode_capture"] = original
+    invalidated = RuntimeError("CUDA error: operation failed due to a previous error during capture")
+    capture_faults.errors["capture_end"] = invalidated
+    if recoverable:
+        capture_faults.check_released = True
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            assert capture_faults.capture() == {}
+        finally:
+            if was_enabled:
+                gc.enable()
+        assert len(capture_faults.warnings) == 1
+        assert original.__traceback__ is None and invalidated.__traceback__ is None
+    else:
+        with pytest.raises(RuntimeError) as raised:
+            capture_faults.capture()
+        assert raised.value is invalidated and raised.value.__context__ is original
+        assert not capture_faults.warnings
+    assert capture_faults.stream is capture_faults.original_stream
+    assert capture_faults.counts["reset"] == 1
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("point", ["reset", "sync_reset"])
+def test_capture_fallback_requires_successful_reset(capture_faults, point):
+    capture_faults.errors["capture_end"] = torch.cuda.OutOfMemoryError("capture allocation failed")
+    error = RuntimeError("codec could not reset")
+    capture_faults.errors[point] = error
+    with pytest.raises(RuntimeError) as raised:
+        capture_faults.capture()
+    assert raised.value is error
+    assert not capture_faults.warnings

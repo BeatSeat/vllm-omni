@@ -459,8 +459,9 @@ class PersonaPlexMimiCodec(nn.Module):
         fresh afterwards. ``pool`` is a CUDA graph memory pool to share with
         other codecs replayed on the same stream; by default the codec gets a
         private one. Returns the captured graph names; on a non-CUDA device the
-        codec stays eager, and so it does if capture fails with a CUDA error,
-        which is logged as a warning with its traceback.
+        codec stays eager, and so it does after a recoverable capture failure,
+        which is logged with its traceback. Warmup, device execution and reset
+        failures propagate instead of leaving an apparently usable codec.
         """
         from vllm_omni.model_executor.models.personaplex.personaplex_mimi_cudagraph import (
             capture_mimi_frame_graphs,
@@ -508,7 +509,7 @@ class PersonaPlexMimiCodec(nn.Module):
         x = self._run_stages(x, self._enc_stages, active)
         x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
         x = self._downsample(x, active)
-        codes = self.model.quantizer.encode(x)  # [Q, B, T]
+        codes = self.model.quantizer.encode(x, num_quantizers=CODEBOOKS)  # [Q, B, T]
         return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
 
     def _quantizer_decode(self, codes: torch.Tensor) -> torch.Tensor:

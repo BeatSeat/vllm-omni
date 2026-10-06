@@ -17,7 +17,9 @@ in eager execution.
 
 from __future__ import annotations
 
+import traceback
 from collections.abc import Callable
+from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,6 +31,58 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 __all__ = ["MimiFrameGraph", "capture_mimi_frame_graphs"]
+
+
+def _is_recoverable_capture_error(error: RuntimeError) -> bool:
+    """Allow only known capture limitations, never an unexplained CUDA error."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    known_failure = False
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        message = str(current).split("\n", 1)[0]
+        if isinstance(current, torch.cuda.OutOfMemoryError) or (
+            isinstance(current, RuntimeError)
+            and (
+                message.startswith("CUDA out of memory.")
+                or message
+                in {
+                    "CUDA error: out of memory",
+                    "CUDA error: operation not permitted when stream is capturing",
+                }
+            )
+        ):
+            known_failure = True
+        elif not (
+            isinstance(current, RuntimeError)
+            and message == "CUDA error: operation failed due to a previous error during capture"
+        ):
+            return False
+        # capture_end can replace a body exception with capture-invalidated.
+        # The original failure must also be recoverable, even if suppressed.
+        pending.extend(exc for exc in (current.__cause__, current.__context__) if exc is not None)
+    return known_failure
+
+
+def _capture_error_details(error: RuntimeError) -> str:
+    """Preserve diagnostics without retaining capture frames or graph pools."""
+    details = "".join(traceback.format_exception(error))
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            # ExitStack frames can retain their own traceback in exception tuples.
+            traceback.clear_frames(current.__traceback__)
+        current.__traceback__ = None
+        pending.extend(exc for exc in (current.__cause__, current.__context__) if exc is not None)
+    return details
 
 
 class MimiFrameGraph:
@@ -78,8 +132,8 @@ def capture_mimi_frame_graphs(
 ) -> dict[str, MimiFrameGraph]:
     """Capture the codec's encode and ``F``-frame decode steps.
 
-    Returns an empty dict off CUDA. A failed capture logs a warning with the
-    traceback and also returns an empty dict, so the codec keeps running eagerly.
+    Returns an empty dict off CUDA or after a recoverable capture failure.
+    Warmup, device execution and stream-reset failures always propagate.
     """
     from vllm_omni.model_executor.models.personaplex.personaplex_mimi import CODEBOOKS, FRAME_SIZE
 
@@ -110,35 +164,58 @@ def capture_mimi_frame_graphs(
     if pool is None:
         pool = torch.cuda.graph_pool_handle()
     graphs: dict[str, MimiFrameGraph] = {}
+    warmed_specs: list[tuple[str, Callable, torch.Tensor, torch.Tensor]] = []
+    capture_error_details: str | None = None
     try:
         with torch.no_grad():
+            # Validate every eager step before capture can select the fallback.
             for name, eager, static_input in specs:
                 static_active = torch.ones(batch_size, dtype=torch.bool, device=device)
                 for _ in range(max(warmup_iters, 1)):
                     eager(static_input, static_active)
                 torch.accelerator.synchronize(device)
-                graph = torch.cuda.CUDAGraph()
-                # Other worker threads may issue CUDA calls while this records.
-                with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
-                    static_output = eager(static_input, static_active)
+                warmed_specs.append((name, eager, static_input, static_active))
+            for name, eager, static_input, static_active in warmed_specs:
+                # capture_end may raise before torch.cuda.graph restores its
+                # stream. Always restore our caller's stream on that path.
+                with torch.cuda.stream(torch.cuda.current_stream(device)):
+                    graph = torch.cuda.CUDAGraph()
+                    # __enter__ synchronizes and clears the CUDA cache. A
+                    # failure there is a setup failure, not a capture fallback.
+                    capture = torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local")
+                    capture.__enter__()
+                    try:
+                        # Other worker threads may issue CUDA calls while this records.
+                        with ExitStack() as stack:
+                            stack.push(capture)
+                            static_output = eager(static_input, static_active)
+                    except RuntimeError as error:
+                        if not _is_recoverable_capture_error(error):
+                            raise
+                        capture_error_details = _capture_error_details(error)
+                        graphs.clear()
+                        # Release partial graphs and graph-owned output tensors
+                        # before reset, including the last loop iteration.
+                        graph = static_output = capture = None
+                        break
+                # A device execution failure is not an optional capture failure.
                 torch.accelerator.synchronize(device)
                 graphs[name] = MimiFrameGraph(graph, static_input, static_active, static_output, eager)
-    except RuntimeError:
-        # CUDA capture errors (including out of memory) are RuntimeErrors. The
-        # codec is still correct without graphs, so keep serving eagerly, and
-        # log the traceback because eager frames are launch bound.
-        logger.warning(
-            "PersonaPlex Mimi CUDA graphs were requested (%s at batch size %d) but capture failed; "
-            "the codec runs eagerly, which lowers realtime session capacity",
-            "/".join(name for name, _, _ in specs),
-            batch_size,
-            exc_info=True,
-        )
-        graphs = {}
     finally:
         # Warmup frames advanced the real streaming state; restore a fresh
         # stream without reallocating the tensors the graphs point at.
         codec.reset_streaming()
+    # Reset enqueues device work too. Do not report usable graphs or an eager
+    # fallback unless that work completed successfully.
+    torch.accelerator.synchronize(device)
+    if capture_error_details is not None:
+        logger.warning(
+            "PersonaPlex Mimi CUDA graphs were requested (%s at batch size %d) but capture failed; "
+            "the codec runs eagerly, which lowers realtime session capacity\n%s",
+            "/".join(name for name, _, _ in specs),
+            batch_size,
+            capture_error_details,
+        )
     if graphs:
         logger.debug("Captured PersonaPlex Mimi %s graph(s) at batch size %d", "/".join(graphs), batch_size)
     return graphs

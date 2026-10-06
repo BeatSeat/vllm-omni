@@ -67,12 +67,12 @@ class DuplexSamplingHelper:
         else:
             self.active_request_ids.discard(req_id)
 
-    def update_states(self, runner: object, scheduler_output: object) -> None:
+    def update_states(self, runner: Any, scheduler_output: Any) -> None:
         self.active_request_ids.difference_update(str(req_id) for req_id in scheduler_output.finished_req_ids)
         for request in scheduler_output.scheduled_new_reqs:
             self.refresh_active_request(runner, str(request.req_id))
 
-    def rows(self, runner: object) -> tuple[DuplexSamplingRow, ...]:
+    def rows(self, runner: Any) -> tuple[DuplexSamplingRow, ...]:
         rows: list[DuplexSamplingRow] = []
         input_batch = runner.input_batch
         req_ids = [str(req_id) for req_id in getattr(input_batch, "req_ids", [])]
@@ -91,7 +91,8 @@ class DuplexSamplingHelper:
             if not isinstance(session_id, str) or not session_id:
                 session_id = None
             try:
-                seq = int(duplex.get("seq"))
+                seq_raw = duplex.get("seq")
+                seq = int(seq_raw) if seq_raw is not None else None
             except (TypeError, ValueError):
                 seq = None
             payload = duplex.get("payload")

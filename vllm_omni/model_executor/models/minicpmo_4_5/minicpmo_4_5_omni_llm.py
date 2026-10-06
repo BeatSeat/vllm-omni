@@ -4293,7 +4293,9 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # off unless the HF config's vision_fused_layers / vision_cuda_graph turn them on.
         if self.vpm is not None:
             self.vpm.fused_layers = bool(getattr(config, "vision_fused_layers", False))
-        self.vision_cuda_graph = bool(getattr(config, "vision_cuda_graph", False))
+        self.vision_cuda_graph = (
+            bool(getattr(config, "vision_cuda_graph", False)) and not vllm_config.model_config.enforce_eager
+        )
         self._vision_graph_encoder: VisionGraphEncoder | None = None
 
         # Initialize audio encoder (APM) and audio projection
@@ -4925,7 +4927,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         """Capture CUDA graphs of the streaming encoder's steady unit. Failures stay eager."""
         self._duplex_audio_cuda_graph_encoder = None
         config = self.config
-        enabled = bool(getattr(config, "duplex_audio_encoder_cuda_graph", True))
+        enforce_eager = bool(getattr(getattr(self.vllm_config, "model_config", None), "enforce_eager", False))
+        enabled = bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)) and not enforce_eager
         if not self.supports_streaming_audio_batch() or not enabled:
             return False
         if self.apm.conv1.weight.device.type != "cuda":

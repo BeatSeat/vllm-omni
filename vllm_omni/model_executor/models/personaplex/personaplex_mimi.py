@@ -52,11 +52,10 @@ if TYPE_CHECKING:
 
 
 def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
-    # Stage 0 and Code2Wav currently use one B=1 codec per session and omit
-    # `active`, so preserve that API by treating None as all rows active. When
-    # they switch to shared B>1 codecs, their batch builders must pass bool[B]:
+    # Stage 0 shares one codec with a row per session slot and passes bool[B]:
     # True advances that row's streaming state; False keeps an absent or padded
-    # row's offsets and convolution carries unchanged.
+    # row's offsets and convolution carries unchanged. Code2Wav leases one B=1
+    # codec per request and omits `active`, which means all rows are active.
     if active is None:
         return all_active
     if active.shape != all_active.shape:
@@ -490,7 +489,7 @@ class PersonaPlexMimiCodec(nn.Module):
         return x
 
     def _frame_graph(self, name: str) -> MimiFrameGraph | None:
-        graph = self._cuda_graphs.get(name) if hasattr(self, "_cuda_graphs") else None
+        graph = self._cuda_graphs.get(name)
         if graph is None or torch.cuda.is_current_stream_capturing():
             return None
         return graph

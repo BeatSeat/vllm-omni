@@ -369,32 +369,59 @@ class PersonaPlexStage0DuplexRuntime:
                 f"PersonaPlex scheduler prompt reservation mismatch: reserved={prompt_len}, prepared={prepared_len}"
             )
         input_ids = torch.zeros((prepared_len,), dtype=torch.long, device=device)
-        info_update = {
+        info_update = self._prepared_info_update(
+            state, seq, silence=silence.detach().cpu(), prefill_applied=first_append
+        )
+        # This path has no device teacher-forcing copies, so the talker reads
+        # these host tensors from the request information.
+        info_update["pplex_depformer_audio_tokens"] = depformer_audio_tokens.detach().cpu()
+        info_update["pplex_depformer_audio_provided"] = depformer_audio_provided.detach().cpu()
+        return self._store_prepared(
+            state,
+            seq,
+            PersonaPlexStage0PreparedAppend(
+                input_ids=input_ids,
+                inputs_embeds=full_embeds,
+                user_codes=state.user_codes,
+                info_update=info_update,
+                prefill_applied=first_append,
+                prompt_offset=prompt_offset,
+            ),
+        )
+
+    @staticmethod
+    def _prepared_info_update(
+        state: PersonaPlexStage0SessionState,
+        seq: int,
+        *,
+        silence: torch.Tensor,
+        prefill_applied: bool,
+    ) -> dict[str, Any]:
+        """Request-information update shared by the per-request and batched append paths."""
+        return {
             "pplex_user_codes": state.user_codes,
-            "pplex_silence_codes": silence.detach().cpu(),
-            "pplex_depformer_audio_tokens": depformer_audio_tokens.detach().cpu(),
-            "pplex_depformer_audio_provided": depformer_audio_provided.detach().cpu(),
+            "pplex_silence_codes": silence,
             "meta": {
                 "pplex_frame": state.prefill_slots + int(state.user_codes.shape[0]),
                 "pplex_prefill_len": state.prefill_slots,
             },
             "duplex": {
                 "stage0_prepared": True,
-                "prefill_applied": first_append,
-                "session_id": session_id,
-                "epoch": epoch,
+                "prefill_applied": prefill_applied,
+                "session_id": state.session_id,
+                "epoch": state.epoch,
                 "seq": seq,
             },
         }
-        prepared = PersonaPlexStage0PreparedAppend(
-            input_ids=input_ids,
-            inputs_embeds=full_embeds,
-            user_codes=state.user_codes,
-            info_update=info_update,
-            prefill_applied=first_append,
-            prompt_offset=prompt_offset,
-        )
-        state.prepared_identity = identity
+
+    @staticmethod
+    def _store_prepared(
+        state: PersonaPlexStage0SessionState,
+        seq: int,
+        prepared: PersonaPlexStage0PreparedAppend,
+    ) -> PersonaPlexStage0PreparedAppend:
+        """Record ``prepared`` as the session's current append and advance its sequence."""
+        state.prepared_identity = (state.epoch, seq)
         state.prepared = prepared
         state.last_seq = seq
         return prepared
@@ -409,22 +436,18 @@ class PersonaPlexStage0DuplexRuntime:
         state.encoded_frame_device = None
 
     def _constants(self) -> dict[str, torch.Tensor]:
-        """Host and device copies of the live-append constant frames, built once."""
+        """Live-append constant frames on the device (plus host silence), built once."""
         if self._constants_cache is not None:
             return self._constants_cache
         import torch
 
         device, _ = self._model_device_dtype()
         silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
-        sine = torch.tensor(SINE_TOKENS, dtype=torch.long)
-        live_provided = torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool)
         self._constants_cache = {
             "silence": silence,
-            "sine": sine,
-            "live_provided": live_provided,
             "silence_device": silence.to(device),
-            "sine_device": sine.to(device),
-            "live_provided_device": live_provided.to(device),
+            "sine_device": torch.tensor(SINE_TOKENS, dtype=torch.long, device=device),
+            "live_provided_device": torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool, device=device),
             "zero_text_device": torch.tensor([ZERO_TEXT_TOKEN], dtype=torch.long, device=device),
         }
         return self._constants_cache
@@ -488,38 +511,23 @@ class PersonaPlexStage0DuplexRuntime:
             state.encoded_identity = None
             state.encoded_frame = None
             state.user_codes = torch.cat([state.user_codes, user_frame], dim=0)
-            user_d0_host = state.user_codes[-2] if state.user_codes.shape[0] > 1 else c["sine"]
-            dep_tokens = torch.cat([c["silence"], user_frame[0, :1], user_d0_host[1:8]])
-            info_update = {
-                "pplex_user_codes": state.user_codes,
-                "pplex_silence_codes": c["silence"],
-                "pplex_depformer_audio_tokens": dep_tokens,
-                "pplex_depformer_audio_provided": c["live_provided"],
-                "meta": {
-                    "pplex_frame": state.prefill_slots + int(state.user_codes.shape[0]),
-                    "pplex_prefill_len": state.prefill_slots,
-                },
-                "duplex": {
-                    "stage0_prepared": True,
-                    "prefill_applied": False,
-                    "session_id": state.session_id,
-                    "epoch": state.epoch,
-                    "seq": seq,
-                },
-            }
-            state.prepared = PersonaPlexStage0PreparedAppend(
-                input_ids=input_ids[row],
-                inputs_embeds=embeds[row],
-                user_codes=state.user_codes,
-                info_update=info_update,
-                prefill_applied=False,
-                # Resolved by prepare_append from the scheduler's prompt length.
-                prompt_offset=-1,
-                depformer_audio_tokens_device=dep_tokens_device[row],
-                depformer_audio_provided_device=c["live_provided_device"],
+            # The talker reads teacher forcing from the device copies below, so
+            # no host tokens or mask are built for these appends.
+            self._store_prepared(
+                state,
+                seq,
+                PersonaPlexStage0PreparedAppend(
+                    input_ids=input_ids[row],
+                    inputs_embeds=embeds[row],
+                    user_codes=state.user_codes,
+                    info_update=self._prepared_info_update(state, seq, silence=c["silence"], prefill_applied=False),
+                    prefill_applied=False,
+                    # Resolved by prepare_append from the scheduler's prompt length.
+                    prompt_offset=-1,
+                    depformer_audio_tokens_device=dep_tokens_device[row],
+                    depformer_audio_provided_device=c["live_provided_device"],
+                ),
             )
-            state.prepared_identity = (state.epoch, seq)
-            state.last_seq = seq
         return n
 
     def prepared_depformer_state(self, request_id: str) -> tuple[torch.Tensor, torch.Tensor] | None:

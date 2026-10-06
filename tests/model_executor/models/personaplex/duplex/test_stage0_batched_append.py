@@ -220,6 +220,12 @@ def test_mixed_prefill_and_live_steps_match_the_per_request_path() -> None:
 
     assert _device_prepared(batched, ("a", 0)) and _device_prepared(batched, ("c", 0))
     assert not _device_prepared(reference, ("a", 0))
+    # Batched live appends publish no host teacher-forcing copies; the per-request path still does.
+    host_fields = {"pplex_depformer_audio_tokens", "pplex_depformer_audio_provided"}
+    batched_info = batched._personaplex_duplex_stage0_runtime.sessions[("a", 0)].prepared.info_update
+    reference_info = reference._personaplex_duplex_stage0_runtime.sessions[("a", 0)].prepared.info_update
+    assert host_fields.isdisjoint(batched_info)
+    assert host_fields <= reference_info.keys()
     runtime = batched._personaplex_duplex_stage0_runtime
     assert runtime._shared_codec().encode_calls == len(steps)
     assert len(runtime.sessions[("a", 0)].user_history_device) == 2

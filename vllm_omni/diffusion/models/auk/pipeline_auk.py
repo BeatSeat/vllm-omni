@@ -11,9 +11,11 @@ both, and the BigVGAN-flow decoder renders the waveform.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any, ClassVar
 
@@ -64,6 +66,10 @@ _FLASH_CFG = 0.0
 _WARMUP_TARGET_FRAMES = (150, 300, 600)
 _WARMUP_REF_FRAMES = (0, 150)
 _WARMUP_TEXT_TOKENS = 96
+# Reference clips whose posterior-mean latents are kept. Voice cloning reuses a
+# small set of reference voices, so repeat requests skip the VAE encode.
+# ``model_config.auk_ref_cache_size`` overrides it; 0 disables the cache.
+_REF_CACHE_SIZE = 16
 # Decorrelates the VAE posterior draw from the initial latent for the same request seed.
 _VAE_SEED_OFFSET = 0x5EED_0A0C
 
@@ -157,6 +163,9 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         max_dit_graphs = od_config.model_config.get("max_dit_graphs", 32)
         if isinstance(max_dit_graphs, bool) or not isinstance(max_dit_graphs, int) or max_dit_graphs < 1:
             raise ValueError("AuK max_dit_graphs must be a positive integer")
+        ref_cache_size = od_config.model_config.get("auk_ref_cache_size", _REF_CACHE_SIZE)
+        if isinstance(ref_cache_size, bool) or not isinstance(ref_cache_size, int) or ref_cache_size < 0:
+            raise ValueError("AuK auk_ref_cache_size must be a non-negative integer (0 disables the cache)")
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", None) or torch.bfloat16
 
@@ -218,6 +227,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         if model_config.get("auk_vae_tile_frames") is not None:
             vae_decode_kwargs["tile_frames"] = int(model_config["auk_vae_tile_frames"])
         self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager, **vae_decode_kwargs)
+        self._ref_cache_size = ref_cache_size
+        self._ref_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
         logger.info(
             "AuK pipeline ready: variant=%s dtype=%s latent_dim=%d hop=%d sample_rate=%d",
@@ -399,8 +410,24 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
         if audio is None:
             return torch.zeros(1, 0, self.latent_dim, device=self.device, dtype=torch.float32)
-        wav = self._prepare_waveform(_unwrap_single(audio)).to(self.device)
-        return self.vae.encode(wav, sample=sample, generator=generator)
+        wav = self._prepare_waveform(_unwrap_single(audio))
+        # The posterior mean is a pure function of the prepared waveform, so it
+        # is cached by content. A posterior draw depends on the generator and
+        # is always recomputed. Callers must not modify the returned tensor.
+        key = None
+        if not sample and self._ref_cache_size:
+            digest = hashlib.blake2b(wav.numpy().tobytes(), digest_size=16).hexdigest()
+            key = f"{wav.shape[-1]}:{digest}"
+            cached = self._ref_cache.get(key)
+            if cached is not None:
+                self._ref_cache.move_to_end(key)
+                return cached
+        latents = self.vae.encode(wav.to(self.device), sample=sample, generator=generator)
+        if key is not None:
+            self._ref_cache[key] = latents
+            while len(self._ref_cache) > self._ref_cache_size:
+                self._ref_cache.popitem(last=False)
+        return latents
 
     def _target_frames(self, gen_seconds: Any, ref_frames: int) -> int:
         """Target latent length, capped by the remaining context."""

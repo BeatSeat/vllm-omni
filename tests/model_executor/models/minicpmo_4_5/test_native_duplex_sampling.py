@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
@@ -69,12 +70,23 @@ def _reference(logits, md, states, row_params) -> list[int]:
         if temperature <= 0:
             out.append(int(row_logits.argmax()))
             continue
-        probs, ids = Model._duplex_top_k_top_p_candidates(row_logits / temperature, top_k=top_k, top_p=top_p)
+        scaled = row_logits / temperature
+        candidates = Model._duplex_top_k_top_p_candidates(scaled, top_k=top_k, top_p=top_p)
         # The candidate-space distribution is the dense top-k / top-p filter's.
-        dense = torch.softmax(Model._top_k_top_p_filter(row_logits / temperature, top_k=int(top_k), top_p=top_p), -1)
-        torch.testing.assert_close(torch.zeros_like(dense).scatter_(1, ids, probs), dense)
-        out.append(int(ids[0, torch.multinomial(probs[0], 1, generator=generator)]))
+        dense = torch.softmax(Model._top_k_top_p_filter(scaled, top_k=int(top_k), top_p=top_p), -1)
+        torch.testing.assert_close(_expand(scaled, candidates), dense)
+        uniform = torch.rand((), generator=generator)
+        out.append(int(Model._duplex_draw_candidates(scaled, candidates, uniform.view(1))))
     return out
+
+
+def _expand(logits, candidates) -> torch.Tensor:
+    """The candidates as a dense distribution: the tie slot spread over its lowest-index tied tokens."""
+    probs, ids, kth, ties = candidates
+    dense = torch.zeros(logits.shape, dtype=probs.dtype).scatter_(1, ids[:, :-1], probs[:, :-1])
+    tied = logits == kth
+    kept = tied & (tied.cumsum(dim=-1) <= ties)
+    return dense + kept * (probs[:, -1:] / ties.clamp(min=1))
 
 
 def _run(model, md, steps) -> tuple[list[list[int]], list[bool]]:
@@ -113,20 +125,63 @@ def test_deferred_rows_match_the_synchronous_rows(seed, all_greedy, monkeypatch)
     assert all(torch.equal(md.generators[r].get_state(), sync_md.generators[r].get_state()) for r in range(6))
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("top_p", [1.0, 0.8, 0.5])
-def test_duplex_candidates_preserves_tied_logits_and_top_p(dtype, top_p):
-    logits = torch.tensor(
-        [
-            [4.0, 3.0, 3.0, 1.0],
-            [5.0, 2.0, 1.0, 0.0],
-            [2.0, 2.0, 2.0, 2.0],
-        ],
-        dtype=dtype,
+def _tied_logits(device: str) -> torch.Tensor:
+    """Rows whose k-th logit is tied well past k, with the nucleus cutting inside and before the tie."""
+    logits = torch.full((4, 64), -3.0, device=device)
+    logits[0, [3, 9, 17, 30, 41, 50]] = 1.0  # six tied for k=2
+    logits[1, 7], logits[1, [2, 12, 22, 32, 42]] = 4.0, 1.0  # a leader, then five tied for k=3
+    logits[2] = torch.randn(64, generator=torch.Generator().manual_seed(0)).to(device)
+    logits[3, ::4] = 0.5  # sixteen tied for k=4
+    return logits
+
+
+@pytest.mark.parametrize("top_p", [1.0, 0.9, 0.5, 0.2])
+@pytest.mark.parametrize("top_k", [2, 3, 4, 0])
+def test_candidate_draws_follow_the_dense_distribution(top_k, top_p):
+    # A midpoint grid of uniforms integrates the inverse CDF exactly: each token
+    # is drawn in proportion to its dense probability, ties included.
+    logits, n = _tied_logits("cpu"), 4096
+    expected = torch.softmax(Model._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p), dim=-1)
+    rows = logits.repeat(n, 1)
+    grid = ((torch.arange(n, dtype=torch.float32) + 0.5) / n).repeat_interleave(logits.shape[0])
+    draws = Model._duplex_draw_candidates(
+        rows, Model._duplex_top_k_top_p_candidates(rows, top_k=top_k, top_p=top_p), grid
     )
-    for top_k in [1, 2, 3]:
-        filtered = Model._top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
-        expected = torch.softmax(filtered, dim=-1)
-        probs, ids = Model._duplex_top_k_top_p_candidates(logits, top_k=top_k, top_p=top_p)
-        actual = torch.zeros_like(expected).scatter_(1, ids, probs)
-        torch.testing.assert_close(actual, expected)
+    counts = torch.zeros_like(expected).index_put_(
+        (torch.arange(rows.shape[0]) % logits.shape[0], draws), torch.ones(rows.shape[0]), accumulate=True
+    )
+    torch.testing.assert_close(counts / n, expected, atol=2.0 / n, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("top_p", [0.2, 0.25, 0.5, 0.8, 1.0])
+@pytest.mark.parametrize("n", [4, 10, 20, 64, 100])
+def test_tied_nucleus_boundaries_match_the_dense_filter(n, top_p, dtype):
+    # Uniform ties put every top_p on (or next to) a candidate boundary.
+    logits = torch.full((3, n + 8), -30.0)
+    logits[0, :n], logits[1, 3 : 3 + n], logits[2, :2], logits[2, 4 : 4 + n] = 20.0, 0.5, 2.0, 1.0
+    logits = logits.to(dtype)
+    # The candidates compute in float32; bf16 widens exactly, so ties survive.
+    expected = torch.softmax(Model._top_k_top_p_filter(logits.float(), top_k=3, top_p=top_p), dim=-1)
+    actual = _expand(logits, Model._duplex_top_k_top_p_candidates(logits, top_k=3, top_p=top_p))
+    assert torch.equal(actual > 0, expected > 0)
+    torch.testing.assert_close(actual, expected)
+
+
+class _NoHostReads(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func in (torch.ops.aten._local_scalar_dense.default, torch.ops.aten.is_nonzero.default):
+            raise AssertionError(f"host read: {func}")
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))],
+)
+def test_candidate_sampling_reads_nothing_back_to_the_host(device):
+    logits = _tied_logits(device)
+    with _NoHostReads():
+        for top_k, top_p in [(2, 0.5), (4, 1.0), (0, 0.8)]:
+            candidates = Model._duplex_top_k_top_p_candidates(logits, top_k=top_k, top_p=top_p)
+            Model._duplex_draw_candidates(logits, candidates, torch.rand(logits.shape[0], device=device))

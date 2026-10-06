@@ -1117,13 +1117,16 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             for pos, local_idx in enumerate(greedy):
                 samples[local_idx] = greedy_sample[pos : pos + 1]
         drawn = [local_idx for local_idx in range(len(rows)) if samples[local_idx] is None]
-        # Candidate-space sampling: one batched top-k per (top_k, top_p) group,
-        # then a multinomial over ~top_k candidates with the row's generator.
+        # One uniform per row from its generator, in row order, then a batched draw per (top_k, top_p) group.
+        uniforms: dict[int, torch.Tensor] = {}
         groups: dict[tuple[int, float], list[int]] = {}
         for local_idx in drawn:
+            generator = generators.get(rows[local_idx])
+            if rewinds is not None:
+                rewinds[local_idx] = _generator_rewind(generator)
+            uniforms[local_idx] = torch.rand((), generator=generator, device=device)
             _temperature, top_k, top_p = row_params[rows[local_idx]]
             groups.setdefault((int(top_k), float(top_p)), []).append(local_idx)
-        candidates: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         if drawn:
             temps = torch.tensor([float(row_params[row_idx][0]) for row_idx in rows], dtype=stage2_logits.dtype)
             temps = to_device_nonblocking(temps, device).view(-1, 1)
@@ -1132,14 +1135,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 # pageable host copy and block the host on queued GPU work.
                 members_t = index_to_device(members, device)
                 group_logits = stage2_logits[members_t] / temps[members_t]
-                cand_probs, cand_indices = self._duplex_top_k_top_p_candidates(group_logits, top_k=top_k, top_p=top_p)
-                candidates.update((local_idx, (cand_probs[i], cand_indices[i])) for i, local_idx in enumerate(members))
-        for local_idx in drawn:
-            generator = generators.get(rows[local_idx])
-            if rewinds is not None:
-                rewinds[local_idx] = _generator_rewind(generator)
-            probs, indices = candidates[local_idx]
-            samples[local_idx] = indices.gather(0, torch.multinomial(probs, num_samples=1, generator=generator))
+                candidates = self._duplex_top_k_top_p_candidates(group_logits, top_k=top_k, top_p=top_p)
+                group_uniforms = torch.stack([uniforms[local_idx] for local_idx in members])
+                draws = self._duplex_draw_candidates(group_logits, candidates, group_uniforms)
+                for i, local_idx in enumerate(members):
+                    samples[local_idx] = draws[i : i + 1]
         return torch.cat(samples)  # type: ignore[arg-type]
 
     def _sample_minicpmo45_native_duplex_rows(
@@ -1599,7 +1599,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
             logits = logits.masked_fill(logits < kth, float("-inf"))
         if 0.0 < top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            # Stable: tied logits enter the nucleus lowest index first.
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1, stable=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_remove = cumulative_probs > top_p
             sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
@@ -1612,38 +1613,71 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     @staticmethod
     def _duplex_top_k_top_p_candidates(
         logits: torch.Tensor, *, top_k: int, top_p: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(probs, indices)``: ``softmax(_top_k_top_p_filter(logits))`` restricted to its own support.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``softmax(_top_k_top_p_filter(logits))`` on its support as ``(probs, indices, kth, ties)``, no host read.
 
-        The nucleus is decided on the k sorted candidates, O(V + k log k)
-        instead of sorting the vocabulary. A tie at the k-th logit keeps
-        every tied value, preserving dense top-k threshold filtering semantics.
+        Nucleus order (value descending, index ascending), O(V + k log k). All logits tied at the k-th value
+        stay; their count is data-dependent, so they share the last slot (index -1): the ``ties`` lowest-index
+        ones the nucleus keeps, at one probability each.
         """
         vocab = logits.shape[-1]
         k = int(top_k) if top_k else 0
-        if not k or k <= 0 or k >= vocab:
-            values, indices = torch.sort(logits, descending=True, dim=-1, stable=True)
-        else:
-            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
-            counts = (logits >= kth).sum(dim=-1)
-            max_k = int(counts.max().item())
-            values, indices = torch.topk(logits, max_k, dim=-1)
-            values = values.masked_fill(values < kth, float("-inf"))
+        if 0 < k < vocab:
+            values, indices = torch.topk(logits, k, dim=-1)
+            kth = values[..., -1:]
+            values = values.masked_fill(values <= kth, float("-inf"))
             perm = torch.argsort(indices, dim=-1)
-            v_sorted = values.gather(-1, perm)
-            idx_sorted = indices.gather(-1, perm)
-            values, final_perm = torch.sort(v_sorted, descending=True, dim=-1, stable=True)
-            indices = idx_sorted.gather(-1, final_perm)
-        probs = torch.softmax(values, dim=-1)
+            values, order = torch.sort(values.gather(-1, perm), descending=True, dim=-1, stable=True)
+            indices = indices.gather(-1, perm).gather(-1, order)
+            tied = (logits == kth).sum(dim=-1, keepdim=True)
+        else:
+            values, indices = torch.sort(logits, descending=True, dim=-1, stable=True)
+            kth = torch.full_like(values[..., :1], float("-inf"))
+            tied = torch.zeros_like(indices[..., :1])
+        # In float32, as softmax does: exponentials past the largest logit, then one division by their sum.
+        values, kth_value = values.float(), kth.float()
+        top = torch.maximum(values[..., :1], kth_value)
+        weights, tie_weight = (values - top).exp(), torch.where(tied > 0, (kth_value - top).exp(), 0.0)
+        total = weights.sum(dim=-1, keepdim=True) + tied * tie_weight
+        probs, tie_prob = weights / total, tie_weight / total
+        ties = tied
         if 0.0 < float(top_p) < 1.0:
             cumulative = probs.cumsum(dim=-1)
             remove = cumulative > float(top_p)
             remove[..., 1:] = remove[..., :-1].clone()
             remove[..., 0] = False
             probs = probs.masked_fill(remove, 0.0)
-            sum_p = probs.sum(dim=-1, keepdim=True)
-            probs = torch.where(sum_p > 0, probs / sum_p, probs)
-        return probs, indices
+            # Tied token j stays while the mass before it, ``before + j * tie_prob``, is at most top_p (the
+            # first candidate always does); the floor's estimate of the last j is corrected on that mass.
+            before = cumulative[..., -1:]
+            last = ((float(top_p) - before) / tie_prob.clamp(min=torch.finfo(torch.float32).tiny)).floor()
+            last = torch.where(before + (last + 1) * tie_prob <= float(top_p), last + 1, last)
+            last = torch.where(before + last * tie_prob > float(top_p), last - 1, last)
+            kept = torch.where(tie_prob > 0, last + 1, torch.zeros_like(last))
+            ties = torch.minimum(kept.clamp(min=0), tied.float()).long()
+        probs = torch.cat([probs, ties * tie_prob], dim=-1)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        return probs, torch.cat([indices, torch.full_like(indices[..., :1], -1)], dim=-1), kth, ties
+
+    @staticmethod
+    def _duplex_draw_candidates(
+        logits: torch.Tensor,
+        candidates: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        uniforms: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per row, the inverse-CDF draw of ``_duplex_top_k_top_p_candidates(logits)`` at a uniform in [0, 1)."""
+        probs, indices, kth, ties = candidates
+        cdf = probs.cumsum(dim=-1)
+        target = uniforms.view(-1, 1).to(cdf.dtype) * cdf[..., -1:]
+        slot = torch.searchsorted(cdf, target, right=True).clamp(max=probs.shape[-1] - 1)
+        token = indices.gather(-1, slot)
+        # In the tie slot, the j-th lowest-index tied token, j uniform over the kept ties.
+        block = probs[..., -1:]
+        share = (target - (cdf[..., -1:] - block)) / block.clamp(min=torch.finfo(cdf.dtype).tiny) * ties
+        j = torch.minimum(share.floor().clamp(min=0), (ties - 1).clamp(min=0).to(share.dtype)).long()
+        tied = logits == kth
+        tie_token = (tied & (tied.cumsum(dim=-1) == j + 1)).int().argmax(dim=-1, keepdim=True)
+        return torch.where(slot == probs.shape[-1] - 1, tie_token, token).squeeze(-1)
 
     @staticmethod
     def _duplex_boundary_chunk_eos_probs(logits: torch.Tensor, chunk_eos_id: int) -> torch.Tensor:

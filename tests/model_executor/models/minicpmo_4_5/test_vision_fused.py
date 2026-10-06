@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO4
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     SiglipVisionConfig,
     SiglipVisionTransformer,
+    _vision_encode_paths,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -70,3 +71,17 @@ def test_packed_vision_adapter_protocol() -> None:
     dest: list[torch.Tensor | None] = [None]
     adapter.postprocess_encoder_output({"default": torch.ones(1, 4, 8)}, [0], [4], dest, clone=True)
     assert dest[0] is not None and dest[0].shape == (1, 4, 8)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "encoder_graphs", "expected"),
+    [
+        ({}, True, (False, False)),  # default: the padded batch keeps the vpm encoder graph
+        ({"vision_cuda_graph": True}, True, (True, True)),
+        ({"vision_cuda_graph": True}, False, (False, False)),  # encoder_cuda_graph=False / --enforce-eager
+        ({"vision_packed_encode": True}, True, (True, False)),  # packed eager, for A/B
+        ({"vision_packed_encode": False, "vision_cuda_graph": True}, True, (False, False)),
+    ],
+)
+def test_vision_encode_paths(overrides, encoder_graphs, expected) -> None:
+    assert _vision_encode_paths(SimpleNamespace(**overrides), encoder_graphs=encoder_graphs) == expected

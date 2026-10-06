@@ -2051,6 +2051,23 @@ class Resampler(nn.Module):
         return out @ self.proj
 
 
+def _vision_encode_paths(config: Any, *, encoder_graphs: bool) -> tuple[bool, bool]:
+    """``(vision_packed_encode, vision_cuda_graph)`` from the HF config.
+
+    The packed path (_encode_vision_packed, vision_fused.py) serves the opt-in
+    ``vision_fused_layers`` and ``vision_cuda_graph``; otherwise the padded
+    batch runs and replays the SigLIP graph of ``vpm._encoder_graph``.
+    ``encoder_graphs`` (``encoder_cuda_graph`` and not ``--enforce-eager``)
+    gates the packed graphs too. ``vision_packed_encode`` overrides the path,
+    e.g. to measure packed eager encoding.
+    """
+    graph = bool(getattr(config, "vision_cuda_graph", False)) and encoder_graphs
+    packed = getattr(config, "vision_packed_encode", None)
+    if packed is None:
+        return bool(getattr(config, "vision_fused_layers", False)) or graph, graph
+    return bool(packed), graph and bool(packed)
+
+
 def _packed_vision_layouts(
     pixel_values: Sequence[torch.Tensor],
     tgt_sizes: torch.Tensor | Sequence[Sequence[int]],
@@ -4288,15 +4305,9 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.resampler.attn_implementation = config.vision_config._attn_implementation
         else:
             self.resampler = None
-        # Unpadded, grid-grouped vision encoding (_encode_vision_packed); False keeps the padded batch.
-        self.vision_packed_encode = True
-        # Fused packed SigLIP layers and CUDA graphs of single-grid chunks (vision_fused.py),
-        # off unless the HF config's vision_fused_layers / vision_cuda_graph turn them on.
         if self.vpm is not None:
             self.vpm.fused_layers = bool(getattr(config, "vision_fused_layers", False))
-        self.vision_cuda_graph = (
-            bool(getattr(config, "vision_cuda_graph", False)) and not vllm_config.model_config.enforce_eager
-        )
+        self.vision_packed_encode, self.vision_cuda_graph = _vision_encode_paths(config, encoder_graphs=encoder_graphs)
         self._vision_graph_encoder: VisionGraphEncoder | None = None
 
         # Initialize audio encoder (APM) and audio projection
@@ -4584,9 +4595,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 graph_encoder = None
                 if getattr(self, "vision_cuda_graph", False) and pixel_values[0].is_cuda:
                     if self._vision_graph_encoder is None:
-                        self._vision_graph_encoder = VisionGraphEncoder(
-                            vpm, self.resampler, vllm_config=getattr(self, "vllm_config", None)
-                        )
+                        self._vision_graph_encoder = VisionGraphEncoder(vpm, self.resampler)
                     graph_encoder = self._vision_graph_encoder
                 max_items = max(1, int(self.config.vision_batch_size))
                 return _encode_vision_packed(vpm, self.resampler, pixel_values, layouts, max_items, graph_encoder)

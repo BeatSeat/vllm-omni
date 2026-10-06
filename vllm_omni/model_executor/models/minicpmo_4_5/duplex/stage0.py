@@ -161,8 +161,10 @@ class MiniCPMO45Stage0DuplexRuntime:
         The steady unit's mel-frame count comes from a probe processor configured like a session's: the
         shared processor's default chunk is no model unit, and a first unit has its own size.
         """
-        config = getattr(self.thinker, "config", None)
-        attempted, self._audio_graph_attempted = self._audio_graph_attempted, True
+        thinker = getattr(self, "thinker", None)
+        config = getattr(thinker, "config", None)
+        attempted = getattr(self, "_audio_graph_attempted", False)
+        self._audio_graph_attempted = True
         if attempted or not bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)):
             return False
         apm = getattr(self.thinker, "apm", None)
@@ -999,7 +1001,7 @@ class MiniCPMO45Stage0DuplexRuntime:
     def _batched_audio_encoder(self) -> Callable[[list[Any]], tuple[list[Any], list[Any]]] | None:
         encoder = getattr(self, "_batched_audio_encoder_fn", False)
         if encoder is False:
-            if not self._audio_graph_attempted:
+            if not getattr(self, "_audio_graph_attempted", False):
                 self.build_audio_cuda_graph()
             thinker = getattr(self, "thinker", None)
             batch = getattr(thinker, "get_audio_embedding_streaming_batch", None)

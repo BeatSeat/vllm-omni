@@ -1620,10 +1620,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         every tied value, preserving dense top-k threshold filtering semantics.
         """
         vocab = logits.shape[-1]
-        if not top_k or top_k <= 0 or top_k >= vocab:
+        k = int(top_k) if top_k else 0
+        if not k or k <= 0 or k >= vocab:
             values, indices = torch.sort(logits, descending=True, dim=-1, stable=True)
         else:
-            kth = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
             counts = (logits >= kth).sum(dim=-1)
             max_k = int(counts.max().item())
             values, indices = torch.topk(logits, max_k, dim=-1)

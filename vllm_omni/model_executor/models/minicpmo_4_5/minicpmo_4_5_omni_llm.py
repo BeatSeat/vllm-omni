@@ -4766,6 +4766,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             audio_embeds = self._encode_audio_features(wavforms, audio_attention_mask)
 
+        _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
         # One host read of every length instead of an implicit .item() per slice bound.
         num_audio_tokens = feature_lens_after_pooling.tolist()
 

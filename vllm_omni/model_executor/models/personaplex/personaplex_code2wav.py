@@ -446,21 +446,27 @@ class PersonaPlexCode2Wav(nn.Module):
         """
         codec = self.mimi
         k = int(self._num_codebooks)
-        num_frames = max(int(codes_kf.shape[1]) for _, _, codes_kf in items)
-        codes = torch.zeros((num_frames, self._num_codec_rows, k), dtype=torch.long)
-        active = torch.zeros((num_frames, self._num_codec_rows), dtype=torch.bool)
-        for _, row, codes_kf in items:
-            frames = int(codes_kf.shape[1])
-            codes[:frames, row] = codes_kf.to(device="cpu", dtype=torch.long).T
+        cleaned_items: list[tuple[int, int, torch.Tensor]] = []
+        for i, row, raw_codes in items:
+            t = raw_codes
+            if t.ndim == 3 and t.shape[0] == 1:
+                t = t.squeeze(0)
+            elif t.ndim == 1:
+                t = t.unsqueeze(1)
+            cleaned_items.append((i, row, t))
+        num_frames = max(int(c.shape[1]) for _, _, c in cleaned_items)
+        codes = torch.zeros((num_frames, self._num_codec_rows, k), dtype=torch.long, device=self._mimi_device)
+        active = torch.zeros((num_frames, self._num_codec_rows), dtype=torch.bool, device=self._mimi_device)
+        for _, row, c in cleaned_items:
+            frames = int(c.shape[1])
+            codes[:frames, row] = c[:k].to(device=self._mimi_device, dtype=torch.long).T
             active[:frames, row] = True
-        codes = codes.to(device=self._mimi_device)
-        active = active.to(device=self._mimi_device)
         pcm = torch.stack([codec.decode_frame(codes[f], active[f]) for f in range(num_frames)])
         pcm = pcm.to(device="cpu", dtype=torch.float32)  # [F, rows, samples]
-        if any(row == self._scratch_row for _, row, _ in items):
+        if any(row == self._scratch_row for _, row, _ in cleaned_items):
             codec.reset_slot(self._scratch_row)
         # Clone so each request's PCM owns its storage instead of viewing the whole pass.
-        return [(i, pcm[: codes_kf.shape[1], row].clone().reshape(-1)) for i, row, codes_kf in items]
+        return [(i, pcm[: c.shape[1], row].clone().reshape(-1)) for i, row, c in cleaned_items]
 
     def _lease_row(self, request_id: str) -> int:
         row = self._request_rows.get(request_id)

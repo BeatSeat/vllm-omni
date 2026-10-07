@@ -1160,8 +1160,10 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
-        value = getattr(stage_config, name)
+    # vLLM config objects copied verbatim into the engine args; getattr's
+    # default covers stage config types without the field.
+    for name in ("compilation_config", "profiler_config", "speculative_config"):
+        value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
@@ -1994,10 +1996,6 @@ def build_diffusion_config(
         if isinstance(value, int) and value > 0:
             od_config.additional_config.setdefault(f"diffusion_kv_profile_{dimension}", value)
 
-    if od_config.distributed_executor_backend == "ray":
-        runtime_env = _to_dict(_get_attr_or_item(metadata.runtime_cfg, "env", {}) or {})
-        od_config.ray_worker_env = {str(key): str(value) for key, value in runtime_env.items()}
-
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
@@ -2007,10 +2005,7 @@ def build_diffusion_config(
     else:
         physical_devices = list(range(current_omni_platform.get_device_count()))
 
-    # Ray validates cluster-wide GPU availability through its placement
-    # group. The stage driver only sees the GPUs on its own node, so a local
-    # device-count check would reject every valid multi-node configuration.
-    if od_config.distributed_executor_backend != "ray" and len(physical_devices) < num_devices_per_stage:
+    if len(physical_devices) < num_devices_per_stage:
         raise ValueError(
             f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"

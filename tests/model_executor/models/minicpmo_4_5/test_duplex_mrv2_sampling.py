@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from vllm.sampling_params import SamplingParams
+
+from tests.helpers.mark import hardware_test
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import MiniCPMO45DuplexSampler
+
+pytestmark = [pytest.mark.core_model]
+
+
+@pytest.mark.cpu
+def test_mrv2_rows_read_sampling_params_from_intermediate_buffers():
+    helper = DuplexSamplingHelper()
+    infos = {
+        "a": {"duplex": {"data_plane": True}, "sampling_params": SamplingParams(temperature=0.2, top_k=7, top_p=0.5)},
+        "b": {"duplex": {"data_plane": True}, "sampling_params": SamplingParams(temperature=0.8, top_k=15, top_p=0.9)},
+    }
+    runner = SimpleNamespace(input_batch=SimpleNamespace(req_ids=["b", "a"]), model_intermediate_buffer=infos)
+    for request_id in infos:
+        helper.refresh_active_request(runner, request_id)
+    rows = helper.rows(runner)
+    assert [(row.request_id, row.temperature, row.top_k, row.top_p) for row in rows] == [
+        ("b", 0.8, 15, 0.9),
+        ("a", 0.2, 7, 0.5),
+    ]
+    assert all(row.max_tokens == 16 for row in rows)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("partial_prefill", [True, False])
+def test_mrv2_sampler_preserves_history_seed_counts_and_prefill_eligibility(mocker, partial_prefill):
+    device = "cuda"
+    params = SamplingParams(temperature=0.2, top_k=7, top_p=0.5, seed=13)
+    model = SimpleNamespace(
+        _mrv2_sampling_infos={
+            "a": {"duplex": {"data_plane": True, "session_id": "session"}, "sampling_params": params}
+        },
+        prepare_duplex_sampling=mocker.Mock(),
+        sample=mocker.Mock(
+            return_value=SimpleNamespace(sampled_token_ids=torch.tensor([[9]], device=device), logprobs_tensors=None)
+        ),
+    )
+    # Request a occupies slot 2; neither slot number nor padded tokens are
+    # sampling row indices. The uncomputed tail must never enter its history.
+    tokens = torch.tensor([[0] * 8, [0] * 8, [1, 2, 3, 4, 6, 8, 77, 88]], device=device)
+    states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=tokens),
+        prompt_len=SimpleNamespace(np=np.array([0, 0, 4])),
+        prefill_len=SimpleNamespace(gpu=torch.tensor([0, 0, 7 if partial_prefill else 4], device=device)),
+    )
+    batch = SimpleNamespace(
+        req_ids=["a"],
+        num_reqs=1,
+        num_draft_tokens=0,
+        idx_mapping_np=np.array([2]),
+        idx_mapping=torch.tensor([2], device=device),
+        seq_lens=torch.tensor([6], device=device),
+        cu_num_logits=torch.tensor([0, 1], device=device),
+        is_prefilling_np=np.array([partial_prefill]),
+        num_computed_prefill_tokens_np=np.array([5]),
+        num_scheduled_tokens=np.array([1]),
+        prefill_len_np=np.array([7 if partial_prefill else 4]),
+    )
+    base_output = SimpleNamespace(num_sampled=torch.tensor([0], device=device))
+    base = mocker.Mock(return_value=base_output)
+    base.req_states = states
+    sampler = MiniCPMO45DuplexSampler(base, model)
+    output = sampler(torch.zeros(1, 40, device=device), batch)
+    if partial_prefill:
+        assert output is base_output
+        model.sample.assert_not_called()
+        assert model.prepare_duplex_sampling.call_args.args[2] == ()
+        assert sampler.generators == {}
+    else:
+        assert output.num_sampled.tolist() == [1]
+        assert output.num_rejected.tolist() == [0]
+        assert output.sampled_token_ids.tolist() == [[9]]
+        md = model.sample.call_args.args[1]
+        assert md.output_token_ids == [[6, 8]]
+        assert md.generators[0].initial_seed() == 13
+        assert md.top_k.tolist() == [7]
+        generator = md.generators[0]
+        sampler(torch.zeros(1, 40, device=device), batch)
+        assert model.sample.call_args.args[1].generators[0] is generator
+        sampler.forget_requests(["a"])
+        assert sampler.generators == {}

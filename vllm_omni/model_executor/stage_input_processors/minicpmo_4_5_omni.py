@@ -136,14 +136,21 @@ def _to_transport_list(value):
 
 
 def _coerce_int(value):
+    while isinstance(value, (list, tuple)):
+        if len(value) != 1:
+            return None
+        value = value[0]
     if hasattr(value, "detach"):
         flat = value.detach().cpu().reshape(-1)
-        if flat.numel() == 0:
+        if flat.numel() != 1:
             return None
         value = flat[0].item()
+    if isinstance(value, float):
+        if not (-(2**63) <= value <= 2**63 - 1) or value != value:
+            return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -261,6 +268,8 @@ def tts2code2wav_async_chunk(
     duplex_epoch = _coerce_int(output_meta.get("duplex_epoch"))
     duplex_turn_id = _coerce_int(output_meta.get("duplex_turn_id"))
     segment_text_utf8 = output_meta.get("llm_output_text_utf8")
+    if isinstance(segment_text_utf8, (list, tuple)) and len(segment_text_utf8) > 0:
+        segment_text_utf8 = segment_text_utf8[0]
     if not isinstance(segment_text_utf8, torch.Tensor):
         segment_text_utf8 = None
     turn_end = bool(_coerce_int(output_meta.get("turn_end")))
@@ -340,7 +349,7 @@ def tts2code2wav_async_chunk(
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
-    flush_pending = finished
+    flush_pending = finished or (native_duplex and turn_end)
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
         return None

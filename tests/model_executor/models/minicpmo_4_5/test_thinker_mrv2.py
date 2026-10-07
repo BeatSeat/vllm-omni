@@ -18,6 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     [
         ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2),
         ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4),
+        ("minicpmo_4_5_duplex_mrv2.yaml", [16, 16, 16], 4),
     ],
 )
 def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, monkeypatch):
@@ -37,6 +38,11 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3
+    if config.session_mode == "duplex":
+        assert (
+            stages[0].yaml_engine_args["hf_overrides"]["duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions"]
+            is True
+        )
 
 
 def _model(mocker, *, v2=True, session="turn", async_chunk=False):
@@ -81,6 +87,7 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
     model = _model(mocker)
     # Chunked prefill (two tokens), decode (one token), and graph padding.
     batch = SimpleNamespace(
+        req_ids=["a", "b"],
         input_ids=torch.tensor([11, 12, 41, 0]),
         positions=torch.tensor([6, 7, 20, 0]),
     )
@@ -98,3 +105,69 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
         assert out.multimodal_outputs["latent"] is hidden
         torch.testing.assert_close(out.multimodal_outputs["latent_input_ids"], batch.input_ids[:, None])
         torch.testing.assert_close(out.multimodal_outputs["latent_positions"], batch.positions[:, None])
+
+
+def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
+    model = _model(mocker, session="duplex")
+    assert model.has_preprocess is True
+    batch = SimpleNamespace(
+        req_ids=["a", "b"],
+        input_ids=torch.tensor([101, 102]),
+        positions=torch.tensor([0, 1]),
+    )
+    hidden = torch.randn(2, 8)
+    buffers = [
+        {
+            "duplex": {
+                "duplex_prompt_token_ids": [1, 2, 3],
+                "special_token_ids": {"tts_bos_token_id": 151703, "turn_start_token_id": 151644},
+            }
+        },
+        {},
+    ]
+    out = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=buffers,
+    )
+    assert out.text_hidden_states is hidden
+    assert out.multimodal_outputs["latent"] is hidden
+    assert out.multimodal_outputs["duplex_prompt_token_ids"] == [[1, 2, 3], None]
+    assert "tts_bos_token_id" in out.multimodal_outputs["meta"]
+    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
+    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1] is None
+
+
+def test_mrv2_turn_thinker_retains_native_multimodal_path(mocker):
+    assert _model(mocker, session="turn").has_preprocess is False
+
+
+def test_mrv2_thinker_custom_sampler_and_lifecycle(mocker):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.mrv2_sampling import (
+        MiniCPMO45DuplexSampler,
+    )
+    from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+    model = _model(mocker, session="duplex")
+    base_sampler = mocker.MagicMock()
+    sampler, _ = model.mrv2_custom_sampler(base_sampler)
+    assert isinstance(sampler, MiniCPMO45DuplexSampler)
+    assert model._mrv2_duplex_sampler is sampler
+
+    state_mock = mocker.MagicMock(spec=OmniModelState)
+    state_mock.model = model
+    resolved = OmniModelState.custom_sampler(state_mock, base_sampler)
+    assert resolved is not None
+    assert isinstance(resolved[0], MiniCPMO45DuplexSampler)
+
+    model.preprocess(
+        torch.tensor([1]),
+        torch.randn(1, 4),
+        req_id="req-1",
+        duplex={"data_plane": True, "session_id": "s1", "epoch": 0, "seq": 1},
+    )
+    assert "req-1" in model._mrv2_sampling_infos
+
+    model.on_requests_finished({"req-1"})
+    assert "req-1" not in model._mrv2_sampling_infos

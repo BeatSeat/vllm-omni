@@ -333,6 +333,10 @@ class MiniCPMO45TalkerSampler(OmniSampler):
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
+        masked = getattr(self.talker, "_mrv2_masked_eos", None)
+        self.talker._mrv2_masked_eos = None
+        if masked is not None and masked.shape[0] == logits.shape[0]:
+            logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
         output = self.base_sampler(logits, input_batch)
         if forced is not None:
             sampled = output.sampled_token_ids
@@ -406,6 +410,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mrv2_empty_speech: torch.Tensor | None = None
         # Rows the sampler must force to codec EOS, computed with this step's output.
         self._mrv2_forced_eos: torch.Tensor | None = None
+        self._mrv2_masked_eos: torch.Tensor | None = None
         self._mrv2_decode_rows_logged = False
 
     def _init_native_talker(self, prefix: str) -> None:
@@ -902,9 +907,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             flags: list[bool] = []
             for row in np.flatnonzero(input_batch.is_prefilling_np[:num_reqs]).tolist():
                 info = model_intermediate_buffer[row]
-                if info.get("native_duplex") is True:
-                    raise NotImplementedError("MiniCPM-o native duplex Talker requires model_runner: v1")
-                state = info.get("audio_state")
+                state = info.get("audio_state") if isinstance(info, dict) else None
                 flags.append(bool(state.get("finished")) if isinstance(state, dict) else False)
                 slots.append(int(input_batch.idx_mapping_np[row]))
             if slots:
@@ -927,19 +930,87 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         valid = decode & ~eos_input & ~empty
         # MiniCPMTTS.generate's max_new_token, clamped to the Talker context
         # (see ``preprocess``); the sample after the last allowed code is EOS.
+        # For native duplex chunks, limit is _DUPLEX_CODEC_FRAMES_PER_CHUNK (25),
+        # unless turn-end drain is active.
+        limits, minimums, draining = [], [], []
+        for i in range(num_reqs):
+            info = model_intermediate_buffer[i] if i < len(model_intermediate_buffer) else {}
+            info_dict = info if isinstance(info, dict) else {}
+            if info_dict.get("native_duplex") is True:
+                meta = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
+                max_tok, min_tok = _native_duplex_chunk_budget(meta)
+                limits.append(max_tok - 1)
+                minimums.append(min_tok)
+                draining.append(bool(meta.get("turn_end")))
+            else:
+                limits.append(_OFFLINE_CODEC_MAX_NEW_TOKENS - 1)
+                minimums.append(0)
+                draining.append(False)
+        device_limits = index_to_device(limits, device, dtype=torch.long)
         remaining = int(self._tts_config.max_position_embeddings) - prompt_len
-        limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
+        limit = torch.minimum(torch.clamp(remaining - 1, min=0), device_limits)
         self._mrv2_forced_eos = empty | eos_input | (step >= limit)
+        cadence = (step >= _DUPLEX_CODEC_FRAMES_PER_CHUNK) & (
+            step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
+        )
+        self._mrv2_masked_eos = ~self._mrv2_forced_eos & (
+            (step < index_to_device(minimums, device, dtype=torch.long))
+            | (index_to_device(draining, device, dtype=torch.bool) & cadence)
+        )
         frame_valid = torch.zeros(num_tokens, dtype=torch.bool, device=device)
         frame_valid.index_copy_(0, last_rows, valid)
         if not self._mrv2_decode_rows_logged and not input_batch.has_prefill:
             self._mrv2_decode_rows_logged = True
             logger.info("MiniCPM-o Talker: MRv2 device-side codec output active (no host read of sampled ids)")
+
+        meta_outputs: dict[str, Any] = {"codec_frame_valid": frame_valid}
+        if model_intermediate_buffer and any(
+            isinstance(info, dict) and info.get("native_duplex") is True for info in model_intermediate_buffer
+        ):
+            native_duplex_flags: list[torch.Tensor] = []
+            duplex_epochs: list[torch.Tensor] = []
+            duplex_turn_ids: list[torch.Tensor] = []
+            segment_texts_utf8: list[torch.Tensor] = []
+            turn_end_flags: list[torch.Tensor] = []
+            for info in model_intermediate_buffer:
+                info_dict = info if isinstance(info, dict) else {}
+                native_duplex = info_dict.get("native_duplex") is True
+                duplex_info = info_dict.get("duplex") if isinstance(info_dict.get("duplex"), dict) else {}
+                epoch = duplex_info.get("epoch", -1)
+                turn_id = duplex_info.get("turn_id", -1)
+                meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
+                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
+                if not isinstance(segment_text, str):
+                    segment_text = ""
+                turn_eos_id = meta_info.get("turn_eos_token_id")
+                ids_info = info_dict.get("ids") if isinstance(info_dict.get("ids"), dict) else {}
+                tts_ids = ids_info.get("tts") if native_duplex else None
+                if isinstance(tts_ids, torch.Tensor):
+                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
+                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
+                    )
+                elif isinstance(tts_ids, (list, tuple)):
+                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+                else:
+                    contains_turn_eos = False
+                native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
+                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
+                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
+                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+            meta_outputs["native_duplex"] = native_duplex_flags
+            meta_outputs["duplex_epoch"] = duplex_epochs
+            meta_outputs["duplex_turn_id"] = duplex_turn_ids
+            # Key matching Stage 2 and tts2code2wav_async_chunk expectations:
+            meta_outputs["llm_output_text_utf8"] = segment_texts_utf8
+            meta_outputs["native_duplex_segment_text"] = segment_texts_utf8
+            meta_outputs["turn_end"] = turn_end_flags
+
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
                 "codes": {"audio": token_ids.to(dtype=torch.long).reshape(num_tokens, 1)},
-                "meta": {"codec_frame_valid": frame_valid},
+                "meta": meta_outputs,
             },
         )
 

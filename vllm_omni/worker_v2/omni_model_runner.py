@@ -509,6 +509,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.update_requests(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
+            reanchor = getattr(self.model, "apply_duplex_kv_reanchor", None)
+            if callable(reanchor):
+                reanchor(self, scheduler_output=scheduler_output)
             if self.aux_output_connector is not None:
                 self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:

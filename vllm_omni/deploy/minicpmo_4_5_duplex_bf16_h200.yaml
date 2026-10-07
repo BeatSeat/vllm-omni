@@ -1,23 +1,19 @@
-# Opt-in single-H200 native full-duplex throughput profile (V1).
-# Profile Option A: Focus on max throughput with Fused DiT Body & Slot Pool.
-# Retains FP32 attention cache required by cfm_fused_body on NVIDIA SM80+.
-# Ordinary TF32 for CFM DiT GEMMs (cuBLAS allow_tf32 + Triton tf32 dots).
-# HiFT stays IEEE FP32.
+# Opt-in single-H200 native full-duplex memory-optimized profile (V1).
+# Profile Option B: Compressed BF16 DiT attention cache for high session capacity.
+# Uses ragged Whole-Euler Flow graphs with standard arena allocation, allowing
+# DiT key/value cache compression to BF16 (halving DiT KV footprint).
 base_config: minicpmo_4_5.yaml
 
 connectors:
   connector_of_shared_memory:
     extra:
       token2wav_allow_tf32: true
-      # Stage 2: Fused DiT transformer body (LayerNorm + QKV + Residual)
-      cfm_fused_body: true
       # Stage 2: Flow condition encoder CUDA graph
       cfm_encoder_cuda_graph: true
-      # Stage 2: Pre-allocated persistent slot pool and row offset merging (requires cfm_fused_body)
-      cfm_slot_pool: true
-      cfm_row_offset_merge: true
-      # Stage 2: Requires FP32 attention cache to enable cfm_fused_body
-      code2wav_bfloat16_attention_cache: false
+      # Stage 2: Compressed BF16 DiT attention cache (disables cfm_fused_body / cfm_slot_pool)
+      code2wav_bfloat16_attention_cache: true
+      cfm_fused_body: false
+      cfm_slot_pool: false
 
 stages:
   - stage_id: 0

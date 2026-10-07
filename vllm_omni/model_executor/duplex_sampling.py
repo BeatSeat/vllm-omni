@@ -100,6 +100,8 @@ class DuplexSamplingHelper:
                 payload = None
             request = requests.get(req_id) if isinstance(requests, dict) else None
             sampling_params = getattr(request, "sampling_params", None)
+            if sampling_params is None and isinstance(info, dict):
+                sampling_params = info.get("sampling_params")
             try:
                 max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
             except (TypeError, ValueError):
@@ -112,9 +114,21 @@ class DuplexSamplingHelper:
                     seq=seq,
                     payload=payload,
                     max_tokens=max_tokens if max_tokens > 0 else None,
-                    temperature=_host_value(temperature_cpu, row_idx, float),
-                    top_k=_host_value(top_k_cpu, row_idx, int),
-                    top_p=_host_value(top_p_cpu, row_idx, float),
+                    temperature=(
+                        _host_value(temperature_cpu, row_idx, float)
+                        if temperature_cpu is not None
+                        else getattr(sampling_params, "temperature", None)
+                    ),
+                    top_k=(
+                        _host_value(top_k_cpu, row_idx, int)
+                        if top_k_cpu is not None
+                        else getattr(sampling_params, "top_k", None)
+                    ),
+                    top_p=(
+                        _host_value(top_p_cpu, row_idx, float)
+                        if top_p_cpu is not None
+                        else getattr(sampling_params, "top_p", None)
+                    ),
                 )
             )
         return tuple(rows)

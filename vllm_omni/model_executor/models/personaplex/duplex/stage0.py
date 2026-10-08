@@ -233,6 +233,7 @@ class PersonaPlexStage0DuplexRuntime:
         max_sessions: int = 1,
         tokenizer=None,
         voice_loader=None,
+        codec_cuda_graphs: bool = False,
     ) -> None:
         if max_sessions <= 0:
             raise ValueError("PersonaPlex Stage 0 max_sessions must be positive")
@@ -241,6 +242,7 @@ class PersonaPlexStage0DuplexRuntime:
         self.device = device
         self.max_sessions = max_sessions
         self._codec_factory = codec_factory
+        self._codec_cuda_graphs = codec_cuda_graphs
         self._codec: Any | None = None
         self._free_slots: list[int] = list(reversed(range(max_sessions)))
         self._tokenizer = tokenizer
@@ -783,6 +785,8 @@ class PersonaPlexStage0DuplexRuntime:
                 )
         # Stage 0 only encodes: no decoder rows (half of the codec's per-row state).
         codec.streaming_init(self.max_sessions, decode=False)
+        if self._codec_cuda_graphs:
+            codec.capture_cuda_graphs(encode=True, decode_frame_counts=())
         self._codec = codec
         return codec
 

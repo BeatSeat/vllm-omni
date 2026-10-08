@@ -687,17 +687,22 @@ def test_talker_batch_preprocess_writes_the_rows() -> None:
     assert torch.equal(inputs_embeds[4], torch.full((4,), -1.0))
 
 
-def test_prefill_cache_and_voice_archive(tmp_path) -> None:
+def test_prefill_cache_and_voice_archive(tmp_path, monkeypatch, mocker) -> None:
     runtime = _runtime(_FakeCodec(), max_sessions=4)
+    # Keep the fixture's three-token shape, but distinguish the persona text.
+    monkeypatch.setattr(runtime, "_tokenizer", lambda text: [7, 8, sum(map(ord, text))])
+    prefill = mocker.spy(runtime.stage_model, "_build_prefill_embed")
     first = runtime.prepare_append(_duplex_info(seq=1, session_id="a"), prompt_len=64)
     second = runtime.prepare_append(_duplex_info(seq=1, session_id="b"), prompt_len=64)
     assert first.prefill_applied is True and second.prefill_applied is True
     assert torch.equal(first.inputs_embeds[:-1], second.inputs_embeds[:-1])
+    assert prefill.call_count == 1
 
     diff = _duplex_info(seq=1, session_id="c")
     diff["runtime_config"]["personaplex_persona"] = "Different persona."
     third = runtime.prepare_append(diff, prompt_len=64)
     assert not torch.equal(first.inputs_embeds[:-1], third.inputs_embeds[:-1])
+    assert prefill.call_count == 2
 
     buf = io.BytesIO()
     torch.save({"embeddings": torch.arange(4.0).reshape(1, 4)}, buf)

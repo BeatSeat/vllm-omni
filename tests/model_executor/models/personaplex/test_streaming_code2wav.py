@@ -263,6 +263,7 @@ def test_delta_codes_skip_history_and_emit_only_new_pcm(mocker) -> None:
         model(input_ids=_codes(1, start=frame), request_ids=["req"])
     assert decode.call_count == 10
     assert cat.call_count == 0
+    mocker.stop(decode)
 
     first = model(input_ids=_codes(2), request_ids=["req2"])
     second = model(input_ids=_codes(1, start=100), request_ids=["req2"])
@@ -329,7 +330,15 @@ def test_rows_leased_recycled_and_scratch_fallback() -> None:
         runtime_additional_information=[{"request_id": "second"}, {}],
         seq_token_counts=[2, 2],
     )
-    assert _audios(scratch) == [_pcm(103), _pcm(101)]
+    assert _audios(scratch) == [_pcm(103), _pcm(201)]
+    assert mimi.reset_rows == [0, 2]
+    assert model._request_rows == {"second": 1}
+    repeated_scratch = model(input_ids=_codes(1))
+    assert _audio(repeated_scratch).tolist() == _pcm(201)
+    assert mimi.reset_rows == [0, 2, 2]
+    recycled = model(input_ids=_codes(1), request_ids=["third"])
+    assert _audio(recycled).tolist() == _pcm(1)
+    assert model._request_rows == {"second": 1, "third": 0}
 
 
 def _step(model, requests: dict[str, int], *, step: int = 0, infos=None):

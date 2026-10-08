@@ -33,6 +33,7 @@ class _NativeRequestState:
     external_req_id: str
     prompt_token_ids: list[int]
     additional_information: Any = None
+    model_intermediate_buffer: Any = None
     sampling_params: Any = None
     num_computed_tokens: int = 0
     resumable: bool = False
@@ -77,6 +78,7 @@ class _NativeRequestState:
             output_token_count=len(self.output_token_ids),
             last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
             additional_information=self.additional_information,
+            model_intermediate_buffer=self.model_intermediate_buffer,
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
             resumable=self.resumable,
@@ -276,6 +278,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 external_req_id=external_req_id,
                 prompt_token_ids=list(getattr(request_data, "prompt_token_ids", None) or []),
                 additional_information=getattr(request_data, "additional_information", None),
+                model_intermediate_buffer=getattr(request_data, "model_intermediate_buffer", None),
                 sampling_params=getattr(request_data, "sampling_params", None),
                 num_computed_tokens=int(getattr(request_data, "num_computed_tokens", 0) or 0),
                 resumable=bool(getattr(request_data, "resumable", False)),

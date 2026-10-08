@@ -675,3 +675,47 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
 
     assert plane._get_model_config() is model_config
     assert _get_accept_hidden_layer_index(plane) == 24
+
+
+@pytest.mark.parametrize("factory", ["from_base", "from_request"])
+def test_native_request_preserves_streaming_flag_and_reference_audio(plane, factory):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import tts2code2wav_async_chunk
+
+    base = NewRequestData(
+        req_id="internal",
+        prompt_token_ids=[0, 0],
+        mm_features=[],
+        sampling_params=SamplingParams(stop_token_ids=[6561]),
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    owner = SimpleNamespace(
+        **vars(base),
+        request_id="internal",
+        external_req_id="voice",
+        resumable=True,
+        model_intermediate_buffer={"codes": {"ref": [0.1, -0.1]}, "meta": {"ref_audio_sr": 16000}},
+    )
+    data = (
+        OmniNewRequestData.from_base(base, owner)
+        if factory == "from_base"
+        else OmniNewRequestData.from_request(owner, ([],), prefill_token_ids=[0, 0])
+    )
+    plane.register_request(data)
+    state = plane._native_requests["internal"]
+    assert state.resumable is True
+    state.accept_tokens([6561])
+    snapshot = state.snapshot(include_token_history=True)
+    payload = tts2code2wav_async_chunk(
+        SimpleNamespace(),
+        {"codes": {"audio": torch.arange(7)}, "meta": {"native_duplex": True, "turn_end": True}},
+        snapshot,
+    )
+    assert payload is not None and payload.meta.last_chunk is True
+    assert payload.meta.ref_audio_sr == 16000
+    torch.testing.assert_close(payload.codes.ref, torch.tensor([0.1, -0.1]))

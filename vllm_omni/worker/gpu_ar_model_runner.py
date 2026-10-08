@@ -52,6 +52,7 @@ from vllm_omni.utils.mm_outputs import (
     partition_payload_list,
     snapshot_mm_payload,
 )
+from vllm_omni.worker import gpu_talker_multiframe
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -182,6 +183,10 @@ def _snapshot_tensor_payload_to_cpu_async(
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
         cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory)
+        # An executor may discard an unconsumed output (e.g. cancellation).
+        # Keep the allocator from reusing its source storage before D2H ends.
+        for source in cuda_sources:
+            source.record_stream(copy_stream)
         ready_event.record(copy_stream)
     return _AsyncCPUPayloadSnapshot(cpu_payload, ready_event, cuda_sources)
 
@@ -397,6 +402,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if getattr(self, "num_spec_tokens", 0) > 0:
+            gpu_talker_multiframe.ensure_codec_vocab(self)
+
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        drafts = gpu_talker_multiframe.propose_drafts(self, sampled_token_ids)
+        if drafts is not None:
+            self._draft_probs = None
+            self._draft_prob_req_ids = None
+            return drafts
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1375,6 +1390,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         fallthrough is load-bearing, not an error path; it is logged once per
         model for visibility.
         """
+        # The multi-frame forward already sampled every accepted codec row.
+        # Return it once instead of sampling stale K-wide logits again.
+        sampled = gpu_talker_multiframe.take_sampler_output(self)
+        if sampled is not None:
+            return sampled
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
@@ -1835,9 +1855,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             and needs_pooler_payload
             and (self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states())
         )
-        if not needs_pooler_payload and prefix_cache_step_id is not None:
-            # No consumer for this step's merge: consume the step context by
-            # id (exactly-once contract). The cache write still lands.
+        if prefix_cache_step_id is not None and (
+            not needs_pooler_payload or self._model_mm_outputs_written_in_sample()
+        ):
+            # No consumer for this step's merge, or the model wrote its mm
+            # outputs in sample() after the snapshot: consume the step context
+            # by id (exactly-once contract) and build from the live outputs.
+            # The cache write still lands.
             assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None

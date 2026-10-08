@@ -40,6 +40,15 @@ REQUESTS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _cpu_topk_topp(monkeypatch):
+    # These parity fixtures use CPU tensors even on a CUDA test host. vLLM
+    # 0.31 otherwise selects the installed Triton kernel for native sampling.
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    monkeypatch.setattr(topk_topp_sampler, "HAS_TRITON", False)
+
+
 def _talker(seed: int) -> MiniCPMO45OmniTTSForConditionalGeneration:
     torch.manual_seed(seed)
     talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
@@ -571,7 +580,7 @@ def test_frame_budgets_bound_a_request_without_max_tokens_by_the_context():
 
 
 @pytest.mark.parametrize("platform", ["cuda", "npu"])
-def test_kstep_overlay_arms_cuda_stage1_only(platform: str):
+def test_kstep_overlay_arms_cuda_stage1_only(platform: str, monkeypatch):
     """The opt-in overlay arms K=8 on CUDA stage 1 and keeps the codec EOS as
     the only stop id; the base config (and NPU through the overlay) is as before."""
     from pathlib import Path
@@ -579,6 +588,9 @@ def test_kstep_overlay_arms_cuda_stage1_only(platform: str):
     from tests.helpers.stage_config import get_deploy_config_path
     from vllm_omni.config.pipeline_registry import resolve_pipeline_config
     from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
 
     def stage1(name: str):
         deploy = _apply_platform_overrides(load_deploy_config(Path(get_deploy_config_path(name))), platform=platform)
@@ -593,3 +605,55 @@ def test_kstep_overlay_arms_cuda_stage1_only(platform: str):
     else:
         assert overlay.yaml_engine_args == base.yaml_engine_args
         assert overlay.yaml_extras["default_sampling_params"] == base.yaml_extras["default_sampling_params"]
+
+
+def _production_runner(fixture):
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.__dict__.update(vars(fixture))
+    return runner
+
+
+def test_production_runner_load_normalizes_kstep_codec_vocab(monkeypatch):
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    runner = _production_runner(_runner([_params()], batch_vocab=0))
+    arch = SimpleNamespace(vocab_size=0)
+    runner.model_config = SimpleNamespace(model_arch_config=arch, get_vocab_size=lambda: arch.vocab_size)
+    runner._resolve_duplex_sampling_hook = lambda **kwargs: None
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda *args, **kwargs: None)
+    runner.load_model()
+    assert (runner.input_batch.vocab_size, arch.vocab_size) == (VOCAB, VOCAB)
+
+
+def test_production_runner_proposes_constant_codec_drafts_and_falls_back(monkeypatch):
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = _production_runner(_runner([_params(), _params()]))
+    runner._draft_probs = runner._draft_prob_req_ids = object()
+    assert runner.propose_draft_token_ids(None, [[3], [5, 7]]) == [[3, 3, 3], [7, 7, 7]]
+    assert runner._draft_probs is None and runner._draft_prob_req_ids is None
+    runner.requests["r1"].sampling_params.presence_penalty = 0.5
+    assert runner.propose_draft_token_ids(None, [[3], [7]]) == [[], []]
+
+    sentinel = object()
+    monkeypatch.setattr(GPUModelRunner, "propose_draft_token_ids", lambda *args, **kwargs: sentinel)
+    runner.model = SimpleNamespace(supports_multi_frame_decode=False)
+    assert runner.propose_draft_token_ids(None, [[3], [7]]) is sentinel
+
+
+def test_production_runner_consumes_multiframe_sampler_output_once(monkeypatch):
+    from vllm.v1.outputs import SamplerOutput
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = _production_runner(_runner([_params()]))
+    sampled = SamplerOutput(sampled_token_ids=torch.tensor([[4, 5, -1]], dtype=torch.int32), logprobs_tensors=None)
+    runner._talker_frames_sampler_output = sampled
+    assert runner._sample(None, object()) is sampled
+    assert runner._talker_frames_sampler_output is None
+
+    runner.input_batch.sampling_metadata = None
+    sentinel = object()
+    monkeypatch.setattr(GPUModelRunner, "_sample", lambda *args, **kwargs: sentinel)
+    assert runner._sample(None, object()) is sentinel

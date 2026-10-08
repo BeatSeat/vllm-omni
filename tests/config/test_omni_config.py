@@ -966,6 +966,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "parallel_config",
         "compilation_config",
         "profiler_config",
+        "speculative_config",
         "quantization_config",
     }
     assert "diffusion_config" not in public_fields
@@ -1887,7 +1888,7 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
 
 @pytest.mark.parametrize("source", ["default", "topology", "deploy", "stage-cli"])
 @pytest.mark.parametrize("key_container", [list, tuple])
-def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
+def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
@@ -1920,7 +1921,7 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
     legacy_args = {**legacy_stage.yaml_engine_args, **(override_keys if source == "stage-cli" else {})}
     restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
-    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model="test-model")
+    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model=str(tmp_path))
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
@@ -2350,3 +2351,24 @@ def test_async_chunk_auto_disabled_without_processor():
     # since doing so will just raise a ValueError in validation.
     merge_pipeline_deploy(pipeline, deploy)
     assert not deploy.async_chunk
+
+
+def test_minicpmo_kstep_speculation_survives_typed_engine_projection(monkeypatch):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    config = _from_pipeline_key("minicpmo_4_5", deploy_config_path=str(_DEPLOY_DIR / "minicpmo_4_5_kstep.yaml"))
+    stage = config.stage_by_id(1)
+    expected = {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+    assert stage.speculative_config == expected
+    args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert args["speculative_config"] == expected
+    assert args["speculative_config"] is not stage.speculative_config
+    assert config.stage_by_id(0).speculative_config is None
+    assert config.stage_by_id(2).speculative_config is None

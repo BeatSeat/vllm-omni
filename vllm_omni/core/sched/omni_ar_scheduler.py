@@ -1037,22 +1037,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             "update_streaming_prompt_for_condition",
             None,
         )
-        if stage_id != 0 and streaming_prompt_payload is not None and callable(update_streaming_prompt):
+        native_prompt = bool(getattr(self, "_native_data_plane", False))
+        if (
+            stage_id != 0
+            and streaming_prompt_payload is not None
+            and (callable(update_streaming_prompt) or native_prompt)
+        ):
             mm_feature_base = session.num_computed_tokens
             try:
-                replaced = update_streaming_prompt(
-                    streaming_prompt_payload,
-                    session,
-                    update_prompt=True,
-                )
+                if callable(update_streaming_prompt):
+                    replaced = update_streaming_prompt(streaming_prompt_payload, session, update_prompt=True)
+                else:
+                    replaced = self._update_native_streaming_prompt(session, streaming_prompt_payload)
             except ValueError as exc:
                 # This streaming update has already been dequeued. Report the
                 # permanent contract failure so the next scheduling pass
                 # finishes only this request instead of crashing EngineCore.
-                # callable(update_streaming_prompt) above implies a live
-                # adapter; the assert narrows it for the type checker.
-                assert chunk_transfer_adapter is not None
-                chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                if chunk_transfer_adapter is not None:
+                    chunk_transfer_adapter.record_receive_failure(req_id, str(exc))
+                else:
+                    self._streaming_context_overflow[req_id] = (session.client_index, str(exc))
+                    if not session.is_finished():
+                        self.finish_requests((req_id,), RequestStatus.FINISHED_ERROR)
                 return
             if replaced is not None:
                 if replaced:
@@ -1091,6 +1097,49 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
+
+    def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
+        """Apply the existing Talker window recipe without a V1 transfer adapter.
+
+        Sender-only MRv2 stages receive conditions through StreamingUpdate.
+        The request already owns the previous condition metadata and confirmed
+        codec ledger, so no parallel request registry is needed.
+        """
+        from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+            _resolve_talker_streaming_prompt_config,
+        )
+
+        limit, previous_chunks, on_capacity = _resolve_talker_streaming_prompt_config(self.vllm_config.model_config)
+        if previous_chunks != 1 or payload.get("native_duplex") is not True:
+            return None
+        previous_info = getattr(session, "model_intermediate_buffer", None) or {}
+        previous = previous_info.get("meta", {})
+        meta = payload["meta"]
+        previous_seq, seq = previous.get("streaming_condition_seq"), meta.get("streaming_condition_seq")
+        if (
+            not isinstance(previous_seq, int)
+            or isinstance(previous_seq, bool)
+            or not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or seq != previous_seq + 1
+        ):
+            raise ValueError("native Talker streaming_condition_seq must advance by one")
+        # Carry only confirmed codec ids, never the uncomputed sampled EOS.
+        # This also seeds the MRv2 16-code penalty after a new condition.
+        payload.setdefault("ids", {})["streaming_prompt_previous_codes"] = list(
+            session._all_token_ids[session.num_prompt_tokens : session.num_computed_tokens]
+        )
+        return construct_next_stage_streaming_input_prompt(
+            payload,
+            session,
+            max_model_len=limit,
+            previous_condition_len=previous.get("next_stage_prompt_len"),
+            previous_condition_seq=previous_seq,
+            condition_seq=seq,
+            recompute_previous_chunks=previous_chunks,
+            recompute_on_capacity=on_capacity,
+        )
 
     def _maybe_reanchor_streaming_window(
         self,

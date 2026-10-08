@@ -214,3 +214,114 @@ def test_mrv2_turn_end_drain_masks_cadence_eos(mocker, step, turn_start, turn_en
     logits[0, _EOS] = 10
     output = sampler(logits, batch)
     assert (output.sampled_token_ids.item() != _EOS) is masked
+
+
+@pytest.mark.cuda
+def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
+    """The real MRv2 sampler pipeline scores the V1 16-frame codec penalty.
+
+    The stock penalty would tax every code in the prompt (the scheduler's
+    placeholder id 0) and in the whole output once; the Talker's penalty taxes
+    ``penalty ** count`` over the last 16 sampled codes only.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.config import VllmConfig
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.states import RequestState
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _CODEC_PENALTY_WINDOW,
+        _apply_batched_repetition_penalty,
+        _install_mrv2_talker_sampler,
+    )
+
+    device, vocab, penalty = torch.device("cuda"), 32, 1.05
+    reqs = RequestState(4, 64, 64, 0, vocab, device)
+    sampler = Sampler(VllmConfig(), 4, vocab, device, reqs)
+    talker = _talker(max_reqs=4)
+    wrapped = _install_mrv2_talker_sampler(sampler, talker)
+
+    prompt = [0, 0, 0]
+    # Code 5 only before the window, code 7 three times and code 9 once inside it.
+    output = [5, 5, 5, 5] + [7, 1, 2, 7, 3, 4, 7, 6, 8, 10, 11, 12, 13, 14, 15, 9]
+    assert len(output) - 4 == _CODEC_PENALTY_WINDOW
+    reqs.add_request("talker", len(prompt), prompt + output, len(prompt) + len(output), 64)
+    slot = reqs.req_id_to_index["talker"]
+    wrapped.add_request(slot, SamplingParams(repetition_penalty=penalty, temperature=1.0))
+    reqs.apply_staged_writes()
+    wrapped.apply_staged_writes()
+
+    logits = torch.linspace(-3.0, 3.0, vocab, device=device).reshape(1, vocab)
+    idx = torch.tensor([slot], dtype=torch.int32, device=device)
+    processed = wrapped.apply_sampling_params(
+        logits.clone(),
+        idx,
+        idx,
+        np.array([slot]),
+        torch.tensor([len(prompt) + len(output)], device=device),
+        torch.tensor([output[-1]], dtype=torch.int32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        np.array([len(prompt) + len(output) + 1]),
+        skip_top_k_top_p=True,
+    )
+    expected = _apply_batched_repetition_penalty(
+        logits.cpu(), [torch.tensor(output)], penalty=penalty, window_size=_CODEC_PENALTY_WINDOW
+    )
+    torch.testing.assert_close(processed.cpu(), expected)
+    # Neither the placeholder prompt id nor codes outside the window are taxed.
+    assert processed[0, 0].item() == pytest.approx(logits[0, 0].item())
+    assert processed[0, 5].item() == pytest.approx(logits[0, 5].item())
+    assert processed[0, 7].item() == pytest.approx(logits[0, 7].item() * penalty**3)
+    # The runner still finds the output bin counts on ``penalties_state``.
+    assert sampler.penalties_state.output_bin_counts is not None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("output_count", [0, 3, 16, 20])
+def test_codec_penalty_carries_previous_segment_through_reordered_slots(device, output_count):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _apply_batched_repetition_penalty,
+        _apply_codec_window_penalty_gpu,
+    )
+
+    prompt_lens = torch.tensor([3, 0, 2], device=device)
+    lengths = prompt_lens + output_count
+    tokens = torch.zeros(3, 64, dtype=torch.long, device=device)
+    prefixes = torch.full((3, 16), -1, dtype=torch.long, device=device)
+    histories = []
+    for slot, prefix in [(2, [5, 5, 5, 9]), (0, [7, 7])]:
+        output = ([1, 7, 2] * 7)[:output_count]
+        start = int(prompt_lens[slot])
+        tokens[slot, start : start + output_count] = torch.tensor(output, device=device)
+        prefixes[slot, -len(prefix) :] = torch.tensor(prefix, device=device)
+        histories.append(torch.tensor(prefix + output))
+    logits = torch.linspace(-3, 3, 32, device=device).repeat(2, 1)
+    expected = _apply_batched_repetition_penalty(logits.cpu(), histories, penalty=1.05, window_size=16)
+    _apply_codec_window_penalty_gpu(
+        logits,
+        torch.tensor([2, 0], device=device),
+        tokens,
+        lengths,
+        prompt_lens,
+        torch.full((3,), 1.05, device=device),
+        window_size=16,
+        history_prefix=prefixes,
+    )
+    torch.testing.assert_close(logits.cpu(), expected)
+
+
+def test_mrv2_prefill_seeds_codec_history_for_the_actual_slot(mocker):
+    talker = _talker()
+    talker._mrv2_penalty_state = mocker.Mock()
+    batch, _ = _batch([dict(slot=3, prompt_len=2, computed=0, span=[0, 0], prefill=True)])
+    talker.make_omni_output_mrv2(
+        torch.zeros(2, 4),
+        input_batch=batch,
+        req_states=_req_states({3: 2}),
+        model_intermediate_buffer=[{"audio_state": {"recent_codes": [5, 7, 5]}}],
+    )
+    talker._mrv2_penalty_state.set_history_prefix.assert_called_once_with([3], [[5, 7, 5]])

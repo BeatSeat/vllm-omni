@@ -192,6 +192,31 @@ def test_duplex_final_segment_preserves_all_codec_steps_and_flushes_once() -> No
     assert not duplicate.meta.last_chunk
 
 
+@pytest.mark.parametrize("frame_count", [1, 24, 25, 26, 60])
+def test_duplex_final_segment_preserves_every_code_and_closes_once(frame_count: int) -> None:
+    manager = _manager()
+    request = _request("final-segment")
+    emitted = []
+    for code in range(frame_count):
+        payload = tts2code2wav_async_chunk(manager, _duplex_delta(code, turn_end=True), request, False)
+        if payload is not None:
+            assert payload.meta.last_chunk is False
+            assert payload.meta.turn_end is False
+            emitted.extend(_codes(payload)[payload.meta.codec_left_context_frames :])
+
+    final = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert final is not None
+    assert final.meta.last_chunk is True
+    assert final.meta.turn_end is True
+    emitted.extend(_codes(final)[final.meta.codec_left_context_frames :])
+    assert emitted == list(range(frame_count))
+
+    duplicate = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert duplicate is not None
+    assert duplicate.codes is None
+    assert not duplicate.meta.last_chunk
+
+
 def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     manager = _manager()
     request = _request("req")
@@ -546,3 +571,24 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert payload is not None
     assert payload.meta.cache_epoch == 1
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+
+
+@pytest.mark.parametrize("turn_end", [False, True])
+def test_mrv2_sampled_codec_eos_flushes_resumable_segment(turn_end: bool) -> None:
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    state = _NativeRequestState(
+        request_id="native",
+        external_req_id="native",
+        prompt_token_ids=[0] * 3,
+        resumable=True,
+        sampling_params=SimpleNamespace(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    request = state.snapshot(include_token_history=True)
+    assert not request.is_finished()  # The session remains available for another unit.
+    payload = tts2code2wav_async_chunk(_manager(), _duplex_delta(*range(7), turn_end=turn_end), request)
+    assert payload is not None
+    assert _codes(payload) == [4218] * 3 + list(range(7))
+    assert payload.meta.tts_is_last_chunk is True
+    assert payload.meta.last_chunk is turn_end

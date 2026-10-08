@@ -1147,7 +1147,8 @@ def test_native_duplex_rollover_matches_official_sliding_recompute(mocker) -> No
     assert build_condition.call_count == 3
 
 
-def test_native_duplex_condition_advance_without_rollover_updates_window_state(mocker) -> None:
+@pytest.mark.parametrize("mrv2", [False, True])
+def test_native_duplex_condition_advance_without_rollover_updates_window_state(mocker, mrv2) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)
     talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
@@ -1172,7 +1173,10 @@ def test_native_duplex_condition_advance_without_rollover_updates_window_state(m
     initial_state = talker._request_condition_states["req-history"]
     assert initial_state["condition_seq"] == 0
     assert torch.equal(initial_state["condition"], first_condition)
-    talker._request_audio_states["req-history"]["recent_codes"] = [1, 2, 3]
+    if not mrv2:
+        talker._request_audio_states["req-history"]["recent_codes"] = [1, 2, 3]
+    else:
+        common["ids"] = {"streaming_prompt_previous_codes": [1, 2, 3]}
 
     _, embeds, _ = talker.preprocess(
         torch.zeros(4, dtype=torch.long),
@@ -1201,6 +1205,7 @@ def test_native_duplex_condition_advance_without_rollover_updates_window_state(m
     assert torch.equal(retry_embeds, second_condition)
     assert talker._request_condition_states["req-history"]["base_recent_codes"] == (1, 2, 3)
 
+    common.pop("ids", None)
     previous_codes = [4, 5]
     expected_rollover = torch.cat(
         [

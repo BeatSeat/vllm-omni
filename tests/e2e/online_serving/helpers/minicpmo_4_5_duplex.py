@@ -66,6 +66,22 @@ CORE_SERVER_PARAMS = [
     )
 ]
 
+# Exercise the opt-in three-stage MRv2 path in the same live-client CI test.
+MRV2_CORE_SERVER_PARAMS = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=modify_stage_config(
+                get_deploy_config_path("minicpmo_4_5_duplex_mrv2.yaml"),
+                updates={"stages": {0: {"enforce_eager": True}, 1: {"enforce_eager": True}}},
+            ),
+            use_stage_cli=False,
+            server_args=["--trust-remote-code"],
+        ),
+        id="three-stage-mrv2-single-gpu",
+    )
+]
+
 
 def deploy_max_sessions() -> int:
     """Concurrent duplex sessions the deploy config under test admits.

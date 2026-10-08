@@ -349,6 +349,12 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    # MRv2 materializes sampled ids before publishing this payload. A
+    # resumable request is still alive at codec EOS; flush the segment using
+    # its confirmed host-side token rather than closing on every turn_end row.
+    if native_duplex:
+        stop_ids = getattr(getattr(request, "sampling_params", None), "stop_token_ids", ()) or ()
+        finished = finished or getattr(request, "last_output_token_id", None) in stop_ids
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))

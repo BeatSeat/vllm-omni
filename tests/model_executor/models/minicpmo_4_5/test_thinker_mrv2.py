@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     [
         ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2, [True, True, True]),
         ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4, [True, True, True]),
-        ("minicpmo_4_5_duplex_mrv2.yaml", [16, 16, 16], 4, [True, False, True]),
+        ("minicpmo_4_5_duplex_mrv2.yaml", [16, 16, 16], 4, [True, True, True]),
     ],
 )
 def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, runners, monkeypatch):

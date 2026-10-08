@@ -146,12 +146,9 @@ def _coerce_int(value):
         if flat.numel() == 0:
             return None
         value = flat[0].item()
-    if isinstance(value, float):
-        if not (-(2**63) <= value <= 2**63 - 1) or value != value:
-            return None
     try:
         return int(value)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError):
         return None
 
 

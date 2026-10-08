@@ -56,18 +56,16 @@ rounding and does not promise identical waveforms.
 `minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2.
 It inherits the default duplex profile's sampling, codec chunk size, cache
 precision, TF32 policy, 16-session capacity and 4 GiB Talker KV budget.
-Non-CUDA platforms retain V1. No separate H200 or BF16-cache profile is needed.
+Non-CUDA platforms retain V1.
 
 CUDA merge and nightly duplex jobs select this profile through
 `VLLM_TEST_MINICPMO_DUPLEX_DEPLOY_CONFIG`. They use real weights and the profile's
 graph settings. The nightly CUDA Seed-TTS performance case also selects MRv2;
-NPU jobs retain their existing profile. Ready live-client CI keeps both V1 and
-V2 dummy-weight/eager cases for comparison.
+NPU and ready live-client jobs retain their existing profiles.
 
 The required overrides are Stage 0 `async_chunk: false` for the completed
 Thinker-to-Talker handoff and Stage 1/2 `async_scheduling: false` to serialize
-segment completion with subsequent input. Stage 0's audio graph bucket sizing
-is optional memory tuning; it follows the session capacity.
+segment completion with subsequent input.
 
 The Talker reuses the existing streaming prompt recipe: full attention extends
 its KV prefix until capacity, while sliding recompute rebuilds the previous

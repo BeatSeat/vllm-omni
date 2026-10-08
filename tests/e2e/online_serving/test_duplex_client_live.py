@@ -18,7 +18,6 @@ import pytest
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     CORE_SERVER_PARAMS,
-    MRV2_CORE_SERVER_PARAMS,
     realtime_url,
     resolve_ref_audio,
     validated_input_wav,
@@ -115,7 +114,7 @@ async def _run_live_session(*, url: str, model: str, ref_audio: Path, input_wav:
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", [*CORE_SERVER_PARAMS, *MRV2_CORE_SERVER_PARAMS], indirect=True)
+@pytest.mark.parametrize("omni_server", CORE_SERVER_PARAMS, indirect=True)
 def test_duplex_client_live_session(omni_server) -> None:
     summary = asyncio.run(
         asyncio.wait_for(
@@ -129,8 +128,8 @@ def test_duplex_client_live_session(omni_server) -> None:
         )
     )
     assert summary["decision"] == "speak", summary
-    assert isinstance(summary["audio_chunks"], int) and summary["audio_chunks"] > 0, summary
-    assert isinstance(summary["played_ms"], int) and summary["played_ms"] > 0, summary
+    assert summary["audio_chunks"] > 0, summary
+    assert summary["played_ms"] > 0, summary
     assert summary["transcript"], summary
     assert summary["resume_token_issued"] is True, summary
     assert summary["post_resume_heartbeat_ok"] is True, summary

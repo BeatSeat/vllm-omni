@@ -67,8 +67,9 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
             custom_process_input_func=f"{_PROC}.llm2tts",
             custom_process_next_stage_input_func=f"{_PROC}.tts2code2wav_full_payload",
             async_chunk_process_next_stage_input_func=f"{_PROC}.tts2code2wav_async_chunk",
+            # Takes effect only when the deploy selects model_runner v2 for
+            # this stage (turn sessions only; duplex stays on V1).
             supports_native_mrv2_data_plane=True,
-            supports_duplex_mrv2=True,
             sampling_constraints={
                 "detokenize": False,
                 # MiniCPM-o 4.5 codec EOS is tts_config.num_audio_tokens - 1.

@@ -42,9 +42,25 @@ def _resolve_cuda_stages(monkeypatch):
 def test_duplex_mrv2_profile_requests_duplex_and_v2(monkeypatch) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch)
     assert config.session_mode == "duplex"
-    # Thinker (0), Talker (1) and Code2Wav (2) all execute on Model Runner V2;
-    # an unset runner (malformed profile) would surface here as ``use_v2_model_runner`` False.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    # Talker needs the V1 streaming prompt-window replacement path.
+    # Thinker and Code2Wav opt in to MRv2.
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, False, True]
+
+
+def test_duplex_mrv2_profile_rejects_talker_v2_override(monkeypatch) -> None:
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="cuda")
+    next(stage for stage in config.stages if stage.stage_id == 1).model_runner = "v2"
+    with pytest.raises(ValueError, match="stage 1: model_runner v2 supports session_mode 'turn' only"):
+        merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+
+
+@pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
+def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
 
 
 def test_duplex_mrv2_profile_carries_h200_capacity(monkeypatch) -> None:

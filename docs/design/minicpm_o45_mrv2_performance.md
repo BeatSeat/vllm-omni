@@ -44,8 +44,8 @@ We structure native duplex deployment on H200 into distinct profile sets matchin
 2. **`minicpmo_4_5_duplex_bf16_h200.yaml` (Max Concurrency / Memory-Saving Profile)**:
    - Uses compressed BF16 DiT attention cache (`code2wav_bfloat16_attention_cache: true`) to halve DiT attention memory consumption.
    - Disables `cfm_fused_body` and `cfm_slot_pool` to avoid silent fallback warnings, using WholeEuler standard arena allocation instead.
-3. **`minicpmo_4_5_duplex_mrv2.yaml` (MRv2 Unified Profile)**:
-   - Unifies all 3 stages under Model Runner V2 (`model_runner: v2`). It inherits the H200 capacity numbers directly from `minicpmo_4_5.yaml` (Stage 1 `max_num_seqs: 16` and the CUDA `kv_cache_memory_bytes: 4 GiB` overlay), so a separate `*_h200.yaml` MRv2 overlay is redundant and intentionally not provided.
+3. **`minicpmo_4_5_duplex_mrv2.yaml` (MRv2 Duplex Profile)**:
+   - Selects Model Runner V2 for Thinker and Code2Wav, with a required stage-1 `model_runner: v1` override for Talker streaming prompt-window replacement. It inherits the H200 capacity numbers directly from `minicpmo_4_5.yaml` (Stage 1 `max_num_seqs: 16` and the CUDA `kv_cache_memory_bytes: 4 GiB` overlay), so a separate `*_h200.yaml` MRv2 overlay is redundant and intentionally not provided.
 
 The default duplex profile keeps the mainline V1 session path. Turn results do
 not establish duplex performance or interruption correctness.
@@ -55,18 +55,26 @@ not establish duplex performance or interruption correctness.
 Full-duplex serving (`session_mode: duplex`) is adapted to Model Runner V2
 via `minicpmo_4_5_duplex_mrv2.yaml`, which already carries the H200 Stage-1
 capacity (16 sessions / 4 GiB KV) inherited from `minicpmo_4_5.yaml`.
-Thinker (stage 0), Talker (stage 1) and Code2Wav (stage 2) execute through MRv2 runners.
-The audio encoder graph buckets follow `duplex_session.max_sessions`, avoiding
-unreachable larger batches that consume Code2Wav's graph-memory headroom.
+Thinker (stage 0) and Code2Wav (stage 2) execute through MRv2 runners.
+Talker (stage 1) uses V1 because its streaming prompt-window replacement still
+depends on the V1 chunk adapter.
+The explicit `session_mode: duplex` repeats the inherited mode for clarity.
+Stage 0 `async_chunk: false` selects the synchronous Thinker-to-Talker handoff;
+Stage 2 `async_scheduling: false` explicitly requests synchronous scheduling.
+The stage-0 handoff and stage-1 V1 override preserve the streaming contracts.
+The audio encoder graph bucket override is optional memory tuning:
+buckets follow `duplex_session.max_sessions`, avoiding unreachable larger
+batches that consume Code2Wav's graph-memory headroom. Non-CUDA platforms
+explicitly retain V1 for all stages.
 
 - Thinker: reuses native Stage-0 duplex preprocessing, window KV compaction
   and reanchor (`MiniCPMO45DuplexWorkerHelper`), and the latest batched/deferred
   sampling policy via the model-registered `MiniCPMO45DuplexSampler`. Outputs `duplex_prompt_token_ids` and
   special boundary token metadata within `make_omni_output_mrv2` for `llm2tts`.
-- Talker: runs on `OmniARModelRunner` with native duplex metadata propagation
+- Talker: runs on the V1 runner with native duplex metadata propagation
   (`duplex_epoch`, `duplex_turn_id`, `llm_output_text_utf8`, `turn_end`).
   It preserves the V1 codec floor and turn-end cadence EOS mask. Streaming
-  conditions share the V1 prompt-window recipe: full attention recomputes at
+  conditions use the V1 prompt-window recipe: full attention recomputes at
   capacity, while `sliding_recompute` rebuilds on every condition boundary.
 - Code2Wav: receives full-payload duplex metadata on MRv2 generation runner.
 

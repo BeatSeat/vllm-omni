@@ -165,6 +165,33 @@ def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
     assert final.meta.turn_end is True
 
 
+def test_duplex_final_segment_preserves_all_codec_steps_and_flushes_once() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+    chunks = []
+    for start in (0, 25):
+        chunk = tts2code2wav_async_chunk(
+            manager, _duplex_delta(*range(start, start + 25), turn_end=True), request, False
+        )
+        assert chunk is not None
+        assert chunk.meta.last_chunk is False
+        assert chunk.meta.turn_end is False
+        chunks.append(chunk)
+
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(50, 51, turn_end=True), request, False) is None
+    final = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert final is not None
+    chunks.append(final)
+    # Each payload includes three left-context frames (silence on the first).
+    assert [code for chunk in chunks for code in _codes(chunk)[3:]] == list(range(52))
+    assert sum(chunk.meta.last_chunk for chunk in chunks) == 1
+    assert final.meta.turn_end is True
+    duplicate = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
+    assert duplicate is not None
+    assert duplicate.codes is None
+    assert not duplicate.meta.last_chunk
+
+
 def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     manager = _manager()
     request = _request("req")

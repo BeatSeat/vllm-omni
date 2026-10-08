@@ -136,13 +136,14 @@ def _to_transport_list(value):
 
 
 def _coerce_int(value):
+    # Output accumulation can concatenate repeated scalar metadata snapshots.
     while isinstance(value, (list, tuple)):
-        if len(value) != 1:
+        if len(value) == 0:
             return None
         value = value[0]
     if hasattr(value, "detach"):
         flat = value.detach().cpu().reshape(-1)
-        if flat.numel() != 1:
+        if flat.numel() == 0:
             return None
         value = flat[0].item()
     if isinstance(value, float):

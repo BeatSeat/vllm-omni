@@ -81,3 +81,16 @@ def test_no_redundant_duplex_mrv2_h200_overlay() -> None:
         "(16 seqs / 4 GiB KV) from minicpmo_4_5.yaml; a separate *_duplex_mrv2_h200.yaml "
         "overlay is a redundant duplicate that resolves to the same effective config."
     )
+
+
+def test_ready_mrv2_temporary_deploy_resolves_its_base(monkeypatch) -> None:
+    from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import MRV2_CORE_SERVER_PARAMS
+    from tests.helpers.stage_config import stage_config_path_for_run_level
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    path = stage_config_path_for_run_level(MRV2_CORE_SERVER_PARAMS[0].values[0].stage_config_path, "core_model")
+    assert path is not None
+    config = _apply_platform_overrides(load_deploy_config(path), platform="cuda")
+    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    assert all(s.yaml_engine_args["load_format"] == "dummy" for s in stages)

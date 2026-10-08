@@ -174,6 +174,8 @@ steps:
 
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
+        env:
+          VLLM_TEST_MINICPMO_DUPLEX_DEPLOY_CONFIG: minicpmo_4_5_duplex_mrv2.yaml
         timeout_in_minutes: 50
         commands:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_minicpmo_4_5_window.py -m 'advanced_model and cuda' --run-level 'advanced_model'

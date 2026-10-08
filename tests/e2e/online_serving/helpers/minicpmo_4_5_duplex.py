@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 import wave
 from pathlib import Path
@@ -22,12 +23,14 @@ from tests.helpers.stage_config import (
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 MODEL = "openbmb/MiniCPM-o-4_5"
-DEPLOY_CONFIG_REL = "minicpmo_4_5.yaml"
+# CUDA merge/nightly jobs select the real-weight MRv2 profile explicitly.
+# Other jobs, including NPU and the ready V1/V2 comparison, keep their defaults.
+DEPLOY_CONFIG_REL = os.environ.get("VLLM_TEST_MINICPMO_DUPLEX_DEPLOY_CONFIG", "minicpmo_4_5.yaml")
 DEPLOY_CONFIG = get_deploy_config_path(DEPLOY_CONFIG_REL)
 # Eager-execution variant for fast-startup core-tier probes (e.g. the duplex
 # client live test): skips CUDA-graph capture on the LLM and Talker stages.
 CORE_DEPLOY_CONFIG = modify_stage_config(
-    DEPLOY_CONFIG,
+    get_deploy_config_path("minicpmo_4_5.yaml"),
     updates={
         "stages": {
             0: {"enforce_eager": True},
@@ -50,7 +53,11 @@ SERVER_PARAMS = [
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
-        id="three-stage-single-gpu",
+        id=(
+            "three-stage-single-gpu"
+            if DEPLOY_CONFIG_REL == "minicpmo_4_5.yaml"
+            else f"three-stage-single-gpu-{Path(DEPLOY_CONFIG_REL).stem}"
+        ),
     )
 ]
 
@@ -73,7 +80,12 @@ MRV2_CORE_SERVER_PARAMS = [
             model=MODEL,
             stage_config_path=modify_stage_config(
                 get_deploy_config_path("minicpmo_4_5_duplex_mrv2.yaml"),
-                updates={"stages": {0: {"enforce_eager": True}, 1: {"enforce_eager": True}}},
+                updates={
+                    # modify_stage_config writes under /tmp; keep inheritance
+                    # anchored to the repository rather than the temp folder.
+                    "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
+                    "stages": {0: {"enforce_eager": True}, 1: {"enforce_eager": True}},
+                },
             ),
             use_stage_cli=False,
             server_args=["--trust-remote-code"],

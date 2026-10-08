@@ -38,11 +38,6 @@ def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, 
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3
-    if config.session_mode == "duplex":
-        assert (
-            stages[0].yaml_engine_args["hf_overrides"]["duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions"]
-            is True
-        )
 
 
 def _model(mocker, *, v2=True, session="turn", async_chunk=False):

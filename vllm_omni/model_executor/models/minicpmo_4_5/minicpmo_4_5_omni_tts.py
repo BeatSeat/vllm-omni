@@ -1013,6 +1013,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             native_duplex_flags: list[torch.Tensor] = []
             duplex_epochs: list[torch.Tensor] = []
             duplex_turn_ids: list[torch.Tensor] = []
+            condition_seqs: list[torch.Tensor] = []
             segment_texts_utf8: list[torch.Tensor] = []
             turn_end_flags: list[torch.Tensor] = []
             for info in model_intermediate_buffer:
@@ -1022,6 +1023,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 epoch = duplex_info.get("epoch", -1)
                 turn_id = duplex_info.get("turn_id", -1)
                 meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
+                condition_seq = meta_info.get("streaming_condition_seq", -1)
+                condition_seqs.append(
+                    torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
+                )
                 segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
                 if not isinstance(segment_text, str):
                     segment_text = ""
@@ -1044,6 +1049,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             meta_outputs["native_duplex"] = native_duplex_flags
             meta_outputs["duplex_epoch"] = duplex_epochs
             meta_outputs["duplex_turn_id"] = duplex_turn_ids
+            meta_outputs["streaming_condition_seq"] = condition_seqs
             # Key matching Stage 2 and tts2code2wav_async_chunk expectations:
             meta_outputs["llm_output_text_utf8"] = segment_texts_utf8
             meta_outputs["native_duplex_segment_text"] = segment_texts_utf8

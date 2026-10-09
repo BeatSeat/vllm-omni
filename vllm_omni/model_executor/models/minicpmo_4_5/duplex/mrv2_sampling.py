@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
+from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 
@@ -23,6 +24,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         self.generators: dict[str, torch.Generator] = {}
         self._helper = DuplexSamplingHelper()
         self._histories: dict[str, tuple[tuple[int, int, int | None], list[int]]] = {}
+        self._pending_history: Any = None
         model._mrv2_duplex_sampler = self
 
     def forget_requests(self, request_ids) -> None:
@@ -32,23 +34,57 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             self._helper.active_request_ids.discard(request_id)
             getattr(self.model, "_mrv2_sampling_infos", {}).pop(request_id, None)
 
-    def _metadata(self, input_batch, rows, infos, device):
-        """Read the accepted history, excluding graph padding and uncomputed tokens.
+    def _commit_history(self):
+        pending, self._pending_history = self._pending_history, None
+        if pending is None:
+            return
+        entries, host, ready = pending
+        if ready is not None:
+            # Wait only for the previous sample, never for this step's forward.
+            ready.synchronize()
+        for (req_id, cached), token in zip(entries, host.tolist()):
+            if self._histories.get(req_id) is cached:
+                cached[1].append(int(token))
 
-        Copy only newly accepted tokens. Condition changes, slot replacement
-        and ledger rollback invalidate the cached prefix. The exact device
-        lengths still require a host read; this is not a device-only sampler.
+    def _defer_history(self, rows, sampled_ids):
+        pending = getattr(self.model, "_minicpmo45_duplex_pending_samples", None)
+        if pending is not None and pending.row_idxs == list(range(len(rows))):
+            # The normal policy already snapshots final IDs with its latch
+            # updates. Share that owned host buffer/event; do not copy twice.
+            host, ready = pending.host[:, 0], pending.event
+        else:
+            # Mixed lookahead/re-emitted EOS rows or the synchronous policy
+            # fallback still need one owned snapshot of the final result.
+            tokens = sampled_ids.reshape(-1)
+            host = torch.empty(tokens.shape, dtype=tokens.dtype, pin_memory=tokens.device.type == "cuda")
+            host.copy_(tokens, non_blocking=True)
+            ready = torch.Event(device=tokens.device) if tokens.device.type == "cuda" else None
+            if ready is not None:
+                ready.record()
+        self._pending_history = ([(row.request_id, self._histories[row.request_id]) for row in rows], host, ready)
+
+    def _metadata(self, input_batch, rows, infos, device):
+        """Reuse prior sampled IDs instead of synchronously reading the device ledger.
+
+        Without speculative decoding, the CPU scheduled lengths are exact.
+        Only admission/replay with an uncached output prefix needs a ledger read.
+        The normal prefill and decode paths use host metadata and the previous
+        step's asynchronous sampled-ID snapshot.
         """
-        seq_lens = input_batch.seq_lens[: input_batch.num_reqs].tolist()
+        self._commit_history()
         histories, params, generators = [], [], {}
         for local_row, row in enumerate(rows):
             slot = int(input_batch.idx_mapping_np[row.row_idx])
             prompt_len = int(self.req_states.prompt_len.np[slot])
-            end = int(seq_lens[row.row_idx])
+            end = int(input_batch.num_computed_tokens_np[row.row_idx]) + int(
+                input_batch.num_scheduled_tokens[row.row_idx]
+            )
             key = (slot, prompt_len, row.seq)
             previous_key, history = self._histories.get(row.request_id, (None, []))
-            if key != previous_key or end - prompt_len < len(history):
+            if key != previous_key:
                 history = []
+            elif end - prompt_len < len(history):
+                del history[max(0, end - prompt_len) :]
             start = prompt_len + len(history)
             if end > start:
                 history.extend(self.req_states.all_token_ids.gpu[slot, start:end].tolist())
@@ -91,7 +127,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             >= int(input_batch.prefill_len_np[row.row_idx])
         )
         metadata = self._metadata(input_batch, rows, infos, logits.device) if rows else None
-        selected = torch.tensor([row.row_idx for row in rows], device=logits.device, dtype=torch.long)
+        selected = index_to_device([row.row_idx for row in rows], logits.device)
         policy_logits = logits.index_select(0, selected)
         self.model.prepare_duplex_sampling(
             policy_logits, metadata, tuple(replace(row, row_idx=i) for i, row in enumerate(rows))
@@ -101,6 +137,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         policy_output = self.model.sample(policy_logits, metadata)
         if policy_output is None:
             return self.base_sampler(logits, input_batch)
+        self._defer_history(rows, policy_output.sampled_token_ids)
         if len(rows) != input_batch.num_reqs:
             # The stock sampler owns counts/logprobs for any ordinary rows.
             output = self.base_sampler(logits, input_batch)

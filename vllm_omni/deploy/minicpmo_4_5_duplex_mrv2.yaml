@@ -11,11 +11,6 @@ model_runner: v2
 stages:
   - stage_id: 0
     async_chunk: false
-  # Serialize segment EOS publication before admitting the next Talker condition.
-  - stage_id: 1
-    async_scheduling: false
-  - stage_id: 2
-    async_scheduling: false
 
 platforms:
   npu:

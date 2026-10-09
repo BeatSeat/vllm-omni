@@ -140,7 +140,8 @@ def test_sampler_adapter_keeps_upstream_counts_and_only_forces_codec_eos(mocker,
     talker.take_mrv2_forced_eos.assert_called_once_with(batch, base.req_states, 2)
 
 
-def test_mrv2_talker_native_duplex_output() -> None:
+@pytest.mark.parametrize("condition_seq", [9, None])
+def test_mrv2_talker_native_duplex_output(condition_seq) -> None:
     talker = _talker()
     rows = [
         dict(slot=0, prompt_len=4, computed=6, span=[17], prefill=False),
@@ -150,7 +151,7 @@ def test_mrv2_talker_native_duplex_output() -> None:
         {
             "native_duplex": True,
             "duplex": {"epoch": 2, "turn_id": 5},
-            "meta": {"native_duplex_segment_text": "hello"},
+            "meta": {"native_duplex_segment_text": "hello", "streaming_condition_seq": condition_seq},
         }
     ]
     hidden = torch.zeros((1, 4))
@@ -165,6 +166,7 @@ def test_mrv2_talker_native_duplex_output() -> None:
     assert meta["native_duplex"][0].item() is True
     assert meta["duplex_epoch"][0].item() == 2
     assert meta["duplex_turn_id"][0].item() == 5
+    assert meta["streaming_condition_seq"][0].item() == (9 if condition_seq is not None else -1)
     assert bytes(meta["llm_output_text_utf8"][0].tolist()).decode("utf-8") == "hello"
     assert bytes(meta["native_duplex_segment_text"][0].tolist()).decode("utf-8") == "hello"
 

@@ -654,3 +654,34 @@ def test_old_sampled_eos_cannot_close_the_next_turn():
     )
     assert tail is not None and tail.meta.last_chunk is True
     assert _codes(body)[3:] + _codes(tail)[3:] == list(range(30))
+
+
+@pytest.mark.parametrize("lookahead", [1, 2, 4])
+def test_mrv2_async_lookahead_cannot_reopen_a_completed_condition(lookahead):
+    manager = _manager()
+    requests = [_request("a"), _request("b")]
+    for request in requests:
+        request.sampling_params = SimpleNamespace(stop_token_ids=[6561])
+
+    def output(request, seq, codes, *, eos=False, turn_end=False):
+        payload = _duplex_delta(*codes, text=f"condition-{seq}", turn_end=turn_end)
+        payload["meta"]["streaming_condition_seq"] = torch.tensor(seq)
+        request.sampled_token_ids = [6561] if eos else []
+        return tts2code2wav_async_chunk(manager, payload, request, False)
+
+    for request in requests:
+        first = output(request, 0, range(25), eos=True)
+        assert first is not None and first.meta.tts_is_last_chunk
+        assert _codes(first)[3:] == list(range(25))
+    for request in reversed(requests):
+        for _ in range(lookahead):
+            assert output(request, 0, [999], eos=True) is None
+        assert output(request, 1, range(25, 35)) is None
+        # Even after a new condition starts, an old snapshot must not close it
+        # or contaminate its queued codes/text.
+        assert output(request, 0, [999], eos=True) is None
+        last = output(request, 1, range(35, 50), eos=True, turn_end=True)
+        assert last is not None and last.meta.last_chunk
+        assert _codes(last)[3:] == list(range(25, 50))
+        assert last.meta.chunk_seq == 1
+        assert output(request, 1, [999], eos=True, turn_end=True) is None

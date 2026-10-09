@@ -303,12 +303,24 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         record["last_terminal_turn"] = None
+        record.pop("last_closed_condition", None)
         _drop_codec_state(transfer_manager, request_id)
 
     if _is_aborted(request):
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
         return None
+
+    # Async scheduling can publish lookahead outputs after this condition's
+    # EOS, including after the next condition starts. Fence by the identity
+    # captured with the output, not the request's mutable current metadata.
+    condition_seq = _coerce_int(output_meta.get("streaming_condition_seq"))
+    condition_key = None
+    if native_duplex and all(isinstance(value, int) and value >= 0 for value in (*duplex_turn_key, condition_seq)):
+        condition_key = (*duplex_turn_key, condition_seq)
+        closed = record.get("last_closed_condition")
+        if closed is not None and condition_key <= closed:
+            return None
 
     if native_duplex and turn_end and record.get("last_terminal_turn") == duplex_turn_key:
         # Emit an empty replacement snapshot so Code2Wav cannot replay the
@@ -355,6 +367,8 @@ def tts2code2wav_async_chunk(
     if native_duplex:
         stop_ids = getattr(getattr(request, "sampling_params", None), "stop_token_ids", ()) or ()
         finished = finished or any(token in stop_ids for token in getattr(request, "sampled_token_ids", ()))
+    if finished and condition_key is not None:
+        record["last_closed_condition"] = condition_key
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))

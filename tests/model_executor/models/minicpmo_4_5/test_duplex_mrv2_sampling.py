@@ -65,6 +65,7 @@ def test_mrv2_sampler_preserves_history_seed_counts_and_prefill_eligibility(mock
         cu_num_logits=torch.tensor([0, 1], device=device),
         is_prefilling_np=np.array([partial_prefill]),
         num_computed_prefill_tokens_np=np.array([5]),
+        num_computed_tokens_np=np.array([5]),
         num_scheduled_tokens=np.array([1]),
         prefill_len_np=np.array([7 if partial_prefill else 4]),
     )
@@ -110,18 +111,23 @@ def test_thinker_history_copies_only_new_ids_and_resets_at_condition_change():
     model = SimpleNamespace(_mrv2_sampling_infos={})
     sampler = MiniCPMO45DuplexSampler(SimpleNamespace(req_states=states), model)
     row = SimpleNamespace(row_idx=0, request_id="a", seq=1)
-    batch = SimpleNamespace(num_reqs=1, idx_mapping_np=np.array([2]), seq_lens=torch.tensor([4]))
+    batch = SimpleNamespace(
+        num_reqs=1,
+        idx_mapping_np=np.array([2]),
+        num_computed_tokens_np=np.array([3]),
+        num_scheduled_tokens=np.array([1]),
+    )
     infos = {"a": {"sampling_params": SamplingParams()}}
     first = sampler._metadata(batch, [row], infos, "cpu")
     first.output_token_ids[0].append(999)  # A consumer cannot mutate the cache.
-    batch.seq_lens[0] = 5
+    batch.num_computed_tokens_np[0] = 4
     second = sampler._metadata(batch, [row], infos, "cpu")
     assert second.output_token_ids == [[18, 19, 20]]
     assert reads == [(2, 2, 4), (2, 4, 5)]
     row.seq = 2
     sampler._metadata(batch, [row], infos, "cpu")
     assert reads[-1] == (2, 2, 5)
-    batch.seq_lens[0] = 3
+    batch.num_computed_tokens_np[0] = 2
     assert sampler._metadata(batch, [row], infos, "cpu").output_token_ids == [[18]]
     sampler.forget_requests(["a"])
     assert sampler._histories == {}
@@ -162,7 +168,12 @@ def test_thinker_histories_and_rng_follow_requests_across_reorder_and_slot_reuse
             SimpleNamespace(row_idx=row, request_id=request_ids[slot], seq=int(step == 3))
             for row, slot in enumerate(slots)
         ]
-        batch = SimpleNamespace(num_reqs=4, idx_mapping_np=slots, seq_lens=torch.tensor(lengths, device=device))
+        batch = SimpleNamespace(
+            num_reqs=4,
+            idx_mapping_np=slots,
+            num_computed_tokens_np=np.array(lengths) - 1,
+            num_scheduled_tokens=np.ones(4, dtype=int),
+        )
         metadata = sampler._metadata(batch, rows, infos, device)
         for row, slot in enumerate(slots):
             assert metadata.output_token_ids[row] == tokens[slot, 2 : lengths[row]].tolist()
@@ -172,3 +183,58 @@ def test_thinker_histories_and_rng_follow_requests_across_reorder_and_slot_reuse
             )
     sampler.forget_requests(request_ids)
     assert sampler._histories == sampler.generators == infos == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_thinker_decode_reuses_deferred_samples_without_device_ledger_reads(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    class NoLedgerReads:
+        def __getitem__(self, index):
+            raise AssertionError("steady-state sampling must not read back the device token ledger")
+
+    states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([2, 2])),
+        all_token_ids=SimpleNamespace(gpu=NoLedgerReads()),
+    )
+    infos = {req_id: {"sampling_params": SamplingParams(seed=seed)} for seed, req_id in enumerate(("a", "b"))}
+    sampler = MiniCPMO45DuplexSampler(SimpleNamespace(req_states=states), SimpleNamespace(_mrv2_sampling_infos=infos))
+    expected: dict[str, list[int]] = {"a": [], "b": []}
+    for step in range(8):
+        slots = [0, 1] if step % 2 == 0 else [1, 0]
+        rows = [SimpleNamespace(row_idx=i, request_id=("a", "b")[slot], seq=0) for i, slot in enumerate(slots)]
+        batch = SimpleNamespace(
+            num_reqs=2,
+            idx_mapping_np=np.array(slots),
+            num_computed_tokens_np=np.full(2, 1 + step),
+            num_scheduled_tokens=np.ones(2, dtype=int),
+        )
+        metadata = sampler._metadata(batch, rows, infos, device)
+        assert metadata.output_token_ids == [expected[row.request_id] for row in rows]
+        sampled = [step * 10 + slot for slot in slots]
+        sampler._defer_history(rows, torch.tensor(sampled, device=device))
+        for row, token in zip(rows, sampled):
+            expected[row.request_id].append(token)
+    # Finishing a request before the pending copy is consumed cannot restore
+    # its history or append that sample to another request reusing its slot.
+    sampler.forget_requests(["a"])
+    sampler._commit_history()
+    assert "a" not in sampler._histories
+    assert sampler._histories["b"][1] == expected["b"]
+
+
+@pytest.mark.cpu
+def test_thinker_reuses_policy_snapshot_without_another_device_copy(mocker):
+    pending = SimpleNamespace(host=torch.tensor([[7, 3, 0], [9, 4, 1]]), event=mocker.Mock(), row_idxs=[0, 1])
+    model = SimpleNamespace(_minicpmo45_duplex_pending_samples=pending)
+    sampler = MiniCPMO45DuplexSampler(SimpleNamespace(), model)
+    sampler._histories = {"a": ((0, 2, 0), []), "b": ((1, 2, 0), [])}
+    rows = [SimpleNamespace(request_id=req_id) for req_id in ("a", "b")]
+    # No device tensor is needed: the policy has already captured the result.
+    sampler._defer_history(rows, None)
+    sampler._commit_history()
+    assert sampler._histories["a"][1] == [7]
+    assert sampler._histories["b"][1] == [9]
+    pending.event.synchronize.assert_called_once()

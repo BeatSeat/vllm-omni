@@ -63,9 +63,14 @@ original graph settings, at concurrency 1, 2 and 4 with two turns per session,
 plus a staggered pair of unequal responses.
 Existing V1 ready, merge, nightly, and performance jobs keep their profiles.
 
-The required overrides are Stage 0 `async_chunk: false` for the completed
-Thinker-to-Talker handoff and Stage 1/2 `async_scheduling: false` to serialize
-segment completion with subsequent input.
+Stage 0 uses `async_chunk: false` for the completed Thinker-to-Talker handoff.
+AR stages retain asynchronous scheduling. Talker outputs carry their condition
+sequence so late lookahead outputs cannot reopen an already completed segment.
+Thinker sampling reuses the previous step's asynchronous host snapshot and CPU
+scheduled lengths (speculative decoding is unsupported). It no longer reads
+current-step device lengths/history in steady-state decode. Admission/replay
+with an uncached output prefix still reads that prefix once; the shared policy
+can also use its synchronous fallback when tokenizer or RNG semantics require it.
 
 The Talker reuses the existing streaming prompt recipe: full attention extends
 its KV prefix until capacity, while sliding recompute rebuilds the previous

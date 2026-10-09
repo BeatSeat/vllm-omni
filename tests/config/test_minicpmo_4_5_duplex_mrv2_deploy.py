@@ -45,6 +45,9 @@ def test_duplex_mrv2_profile_preserves_base_capacity(monkeypatch) -> None:
     # Stage 0 duplex preprocessing stays on the synchronous path while the
     # downstream stages keep streaming chunk transfer.
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
+    # Preserve asynchronous AR scheduling, including the Talker.
+    assert all(s.yaml_engine_args["async_scheduling"] for s in stages[:2])
+    assert stages[2].yaml_engine_args.get("async_scheduling") is not False
     # Retain the base profile capacity and Talker KV budget.
     assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == [16, 16, 16]
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3

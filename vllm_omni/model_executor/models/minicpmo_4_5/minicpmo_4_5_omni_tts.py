@@ -33,12 +33,12 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
+from vllm_omni.errors import RequestPreprocessingError
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.request_error import RequestPreprocessingError
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.worker_v2.omni_sampler import OmniSampler

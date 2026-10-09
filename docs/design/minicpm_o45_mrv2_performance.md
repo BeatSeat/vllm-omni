@@ -53,35 +53,12 @@ rounding and does not promise identical waveforms.
 
 ## Full-duplex MRv2
 
-`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2.
-It inherits the default duplex profile's sampling, codec chunk size, cache
-precision, TF32 policy, 16-session capacity and 4 GiB Talker KV budget.
-Non-CUDA platforms retain V1.
-
-Ready CI adds a separate H100 MRv2 job with real weights and the profile's
-original graph settings, at concurrency 1, 2 and 4 with two turns per session,
-plus a staggered pair of unequal responses.
-Existing V1 ready, merge, nightly, and performance jobs keep their profiles.
-
-Stage 0 uses `async_chunk: false` for the completed Thinker-to-Talker handoff.
-AR stages retain asynchronous scheduling. Talker outputs carry their condition
-sequence so late lookahead outputs cannot reopen an already completed segment.
-Thinker sampling reuses the previous step's asynchronous host snapshot and CPU
-scheduled lengths (speculative decoding is unsupported). It no longer reads
-current-step device lengths/history in steady-state decode. Admission/replay
-with an uncached output prefix still reads that prefix once; the shared policy
-can also use its synchronous fallback when tokenizer or RNG semantics require it.
-
-The Talker reuses the existing streaming prompt recipe: full attention extends
-its KV prefix until capacity, while sliding recompute rebuilds the previous
-condition, confirmed codec ids and current condition. Codec history survives
-condition boundaries for the 16-frame penalty. Only an EOS accepted with the current MRv2 output
-flushes a segment; `turn_end` alone never closes it prematurely.
-
-Configuration and unit tests do not establish audio quality or speedup.
-Compare V1 and V2 on matched resolved configurations, input traces, model and
-ASR revisions, concurrency and repeated seeds. Record per-item WER, output
-lengths, errors, first-audio and inter-chunk latency, RTF definition and peak
-memory. The runners use different random-number streams, so equal seeds do
-not guarantee identical codec tokens. Include long AV sessions, residual-input
-commit, turn-end drain, interruption and context rollover in model E2E tests.
+`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2 and
+otherwise inherits the default duplex profile; non-CUDA platforms keep V1.
+Stage 0 keeps `async_chunk: false` because the Thinker has no async producer:
+as on V1, the orchestrator hands each finished segment to `llm2tts`.
+The Talker reuses the streaming prompt recipe (full attention extends its KV
+prefix until capacity; sliding recompute rebuilds the previous condition,
+confirmed codec ids and current condition) and keeps the 16-frame codec
+penalty history across conditions. A segment flushes only on an EOS sampled
+in the current output, never on `turn_end` alone.

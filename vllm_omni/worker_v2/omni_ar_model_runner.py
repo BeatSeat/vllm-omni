@@ -924,8 +924,8 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 f"timed out during dispatch/combine. Mask: {mask.cpu().tolist()}"
             )
 
-        # Route full payloads through pooling_output and streaming client
-        # deltas through multimodal_output:
+        # Pooler output. Populate two channels from the same per-request payloads,
+        # mirroring the V1 runner:
         #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
         #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
         #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
@@ -972,9 +972,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
             self.model_runner_output.pooler_output = pooler_payload
             self.model_runner_output.inter_stage_outputs = pooler_payload
-            # The output processor accumulates pooling_output for AR requests.
-            # Mirroring these rows into multimodal_output would append them twice.
-            self.model_runner_output.multimodal_outputs = None
+            self.model_runner_output.multimodal_outputs = (
+                [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
+            )
 
         # Do not publish generated tokens or audio for a failed preprocess row,
         # including through the native output worker that runs before scheduler ACK.

@@ -820,7 +820,7 @@ def test_mm_embeddings_exclude_zero_length_graph_padding_rows():
 
 
 def test_declared_preprocess_error_is_isolated_to_its_request():
-    from vllm_omni.model_executor.request_error import RequestPreprocessingError
+    from vllm_omni.errors import RequestPreprocessingError
 
     state = _make_state(max_num_reqs=2, has_preprocess=True)
     state.intermediate_buffer.buffers[0] = {"req_id": "bad"}

@@ -37,6 +37,13 @@ class GuardrailViolationError(OmniClientError):
     """Raised when a model guardrail rejects request content."""
 
 
+class RequestPreprocessingError(ValueError):
+    """A model-declared request contract failure, not a device/worker failure.
+
+    The model runner finishes only the offending request with an error.
+    """
+
+
 def client_error_metadata(exc: BaseException) -> tuple[int | None, str | None]:
     if isinstance(exc, OmniClientError):
         return exc.status_code, exc.error_type

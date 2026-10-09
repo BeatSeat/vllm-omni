@@ -35,8 +35,8 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_omni.errors import RequestPreprocessingError
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
-from vllm_omni.model_executor.request_error import RequestPreprocessingError
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState

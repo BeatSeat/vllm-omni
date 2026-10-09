@@ -103,7 +103,7 @@ class _Request:
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
         self.has_encoder_inputs = False
-        self.pooling_params = None
+        self.pooling_params: SimpleNamespace | None = None
         self.resumable = True
         self.stop_reason = None
         self.trace_headers = None
@@ -393,3 +393,36 @@ def test_pooling_decode_failure_finishes_request_with_error() -> None:
     assert output.finish_reason is FinishReason.ERROR
     assert output.pooling_output is None
     assert "pooling output decode failed" in str(request.stop_reason)
+
+
+def test_preprocess_error_finishes_only_failed_request():
+    bad, good = _Request("bad"), _Request("good")
+    bad.sampling_params.num_logprobs = good.sampling_params.num_logprobs = None
+    scheduler = _make_scheduler_stub([bad, good])
+    calls = []
+
+    def update(request, tokens):
+        calls.append(request.request_id)
+        return tokens, False
+
+    _bind_request_lifecycle(scheduler, update_request=update)
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"bad": 1, "good": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    result = OmniModelRunnerOutput(
+        req_ids=["bad", "good"],
+        req_id_to_index={"bad": 0, "good": 1},
+        sampled_token_ids=[[], [8]],
+        prompt_logprobs_dict={},
+        request_errors={"bad": "invalid condition sequence"},
+    )
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduled, result)
+    by_id = {x.request_id: x for x in outputs[0].outputs}
+    assert calls == ["good"]
+    assert bad.status is RequestStatus.FINISHED_ERROR
+    assert by_id["bad"].finish_reason is FinishReason.ERROR
+    assert by_id["bad"].stop_reason == "invalid condition sequence"
+    assert by_id["good"].new_token_ids == [8]
+    assert "bad" not in scheduler.requests and "good" in scheduler.requests

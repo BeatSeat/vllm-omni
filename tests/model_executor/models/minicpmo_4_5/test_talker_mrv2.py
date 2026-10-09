@@ -325,3 +325,21 @@ def test_mrv2_prefill_seeds_codec_history_for_the_actual_slot(mocker):
         model_intermediate_buffer=[{"audio_state": {"recent_codes": [5, 7, 5]}}],
     )
     talker._mrv2_penalty_state.set_history_prefix.assert_called_once_with([3], [[5, 7, 5]])
+
+
+def test_turn_decode_does_not_build_duplex_limit_tensors(monkeypatch):
+    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as module
+
+    def reject_copy(*args, **kwargs):
+        raise AssertionError("ordinary turn decode must not upload duplex limits")
+
+    monkeypatch.setattr(module, "index_to_device", reject_copy)
+    talker = _talker()
+    batch, _ = _batch([dict(slot=0, prompt_len=4, computed=5, span=[1], prefill=False)])
+    talker.make_omni_output_mrv2(
+        torch.zeros(1, 4),
+        input_batch=batch,
+        req_states=_req_states({0: 4}),
+        model_intermediate_buffer=[{}],
+    )
+    assert talker._mrv2_masked_eos is None

@@ -354,7 +354,7 @@ def tts2code2wav_async_chunk(
     # its confirmed host-side token rather than closing on every turn_end row.
     if native_duplex:
         stop_ids = getattr(getattr(request, "sampling_params", None), "stop_token_ids", ()) or ()
-        finished = finished or getattr(request, "last_output_token_id", None) in stop_ids
+        finished = finished or any(token in stop_ids for token in getattr(request, "sampled_token_ids", ()))
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
@@ -1129,3 +1129,50 @@ def llm2tts(
                     duplex_state["model_turn_id"] = current_model_turn_id + 1
 
     return tts_inputs
+
+
+def _update_native_talker_prompt(model_config: Any, session: Any, payload: dict[str, Any]) -> bool | None:
+    """Apply the existing Talker window recipe without a V1 transfer adapter.
+
+    Sender-only MRv2 stages receive conditions through StreamingUpdate.
+    The request already owns the previous condition metadata and confirmed
+    codec ledger, so no parallel request registry is needed.
+    """
+    from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+        _resolve_talker_streaming_prompt_config,
+    )
+
+    limit, previous_chunks, on_capacity = _resolve_talker_streaming_prompt_config(model_config)
+    if previous_chunks != 1 or payload.get("native_duplex") is not True:
+        return None
+    previous_info = getattr(session, "model_intermediate_buffer", None) or {}
+    previous = previous_info.get("meta", {})
+    meta = payload["meta"]
+    previous_seq, seq = previous.get("streaming_condition_seq"), meta.get("streaming_condition_seq")
+    if (
+        not isinstance(previous_seq, int)
+        or isinstance(previous_seq, bool)
+        or not isinstance(seq, int)
+        or isinstance(seq, bool)
+        or seq != previous_seq + 1
+    ):
+        raise ValueError("native Talker streaming_condition_seq must advance by one")
+    # Carry only confirmed codec ids, never the uncomputed sampled EOS.
+    # This also seeds the MRv2 16-code penalty after a new condition.
+    payload.setdefault("ids", {})["streaming_prompt_previous_codes"] = list(
+        session._all_token_ids[session.num_prompt_tokens : session.num_computed_tokens]
+    )
+    return construct_next_stage_streaming_input_prompt(
+        payload,
+        session,
+        max_model_len=limit,
+        previous_condition_len=previous.get("next_stage_prompt_len"),
+        previous_condition_seq=previous_seq,
+        condition_seq=seq,
+        recompute_previous_chunks=previous_chunks,
+        recompute_on_capacity=on_capacity,
+    )
+
+
+setattr(tts2code2wav_async_chunk, "update_streaming_prompt_for_condition", _update_native_talker_prompt)

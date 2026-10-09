@@ -710,7 +710,7 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
     state = plane._native_requests["internal"]
     assert state.resumable is True
     state.accept_tokens([6561])
-    snapshot = state.snapshot(include_token_history=True)
+    snapshot = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
     payload = tts2code2wav_async_chunk(
         SimpleNamespace(),
         {"codes": {"audio": torch.arange(7)}, "meta": {"native_duplex": True, "turn_end": True}},
@@ -719,3 +719,15 @@ def test_native_request_preserves_streaming_flag_and_reference_audio(plane, fact
     assert payload is not None and payload.meta.last_chunk is True
     assert payload.meta.ref_audio_sr == 16000
     torch.testing.assert_close(payload.codes.ref, torch.tensor([0.1, -0.1]))
+
+
+def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
+    plane.register_request(_new_request())
+    _complete(plane, [{"codes.audio": torch.tensor([[1]])}], token=2150)
+    first = plane.record.batches[-1][0][0]
+    assert first.sampled_token_ids == [2150]
+    plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"meta.turn_end": True}], sampled_token_ids=[[]])
+    next_snapshot = plane.record.batches[-1][0][0]
+    assert next_snapshot.last_output_token_id == 2150
+    assert next_snapshot.sampled_token_ids == []
+    assert first.sampled_token_ids == [2150]

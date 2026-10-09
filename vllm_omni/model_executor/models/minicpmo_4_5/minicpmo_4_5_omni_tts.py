@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.request_error import RequestPreprocessingError
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
@@ -620,6 +621,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return full_embeddings
 
     def preprocess(
+        self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info_dict: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        try:
+            return self._preprocess(input_ids, input_embeds, **info_dict)
+        except ValueError as exc:
+            if info_dict.get("native_duplex") is True:
+                raise RequestPreprocessingError(str(exc)) from exc
+            raise
+
+    def _preprocess(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor | None,
@@ -631,7 +642,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
         state = info_dict.get("audio_state")
         first_call = not isinstance(state, dict)
-        request_id = str(info_dict.get("request_id", "0"))
+        request_id = info_dict.get("request_id")
+        request_id = str(info_dict.get("req_id", "0") if request_id is None else request_id)
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
@@ -820,7 +832,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         live_rows: list[tuple[int, str]] = []
         zero_rows: list[int] = []
         for row, info in enumerate(req_infos):
-            request_id = str(info.get("request_id", "0"))
+            request_id = info.get("request_id")
+            request_id = str(info.get("req_id", "0") if request_id is None else request_id)
             state = info.get("audio_state")
             if info.get("_omni_is_prefill", False) or not isinstance(state, dict):
                 # A row without Talker state builds its condition like a prefill.
@@ -957,31 +970,39 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # (see ``preprocess``); the sample after the last allowed code is EOS.
         # For native duplex chunks, limit is _DUPLEX_CODEC_FRAMES_PER_CHUNK (25),
         # unless turn-end drain is active.
-        limits, minimums, draining = [], [], []
-        for i in range(num_reqs):
-            info = model_intermediate_buffer[i] if i < len(model_intermediate_buffer) else {}
-            info_dict = info if isinstance(info, dict) else {}
-            if info_dict.get("native_duplex") is True:
-                meta = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
-                max_tok, min_tok = _native_duplex_chunk_budget(meta)
-                limits.append(max_tok - 1)
-                minimums.append(min_tok)
-                draining.append(bool(meta.get("turn_end")))
-            else:
-                limits.append(_OFFLINE_CODEC_MAX_NEW_TOKENS - 1)
-                minimums.append(0)
-                draining.append(False)
-        device_limits = index_to_device(limits, device, dtype=torch.long)
+        native_duplex_batch = any(
+            isinstance(info, dict) and info.get("native_duplex") is True for info in model_intermediate_buffer
+        )
         remaining = int(self._tts_config.max_position_embeddings) - prompt_len
-        limit = torch.minimum(torch.clamp(remaining - 1, min=0), device_limits)
-        self._mrv2_forced_eos = empty | eos_input | (step >= limit)
-        cadence = (step >= _DUPLEX_CODEC_FRAMES_PER_CHUNK) & (
-            step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
-        )
-        self._mrv2_masked_eos = ~self._mrv2_forced_eos & (
-            (step < index_to_device(minimums, device, dtype=torch.long))
-            | (index_to_device(draining, device, dtype=torch.bool) & cadence)
-        )
+        if not native_duplex_batch:
+            limit = torch.clamp(remaining, min=1, max=_OFFLINE_CODEC_MAX_NEW_TOKENS) - 1
+            self._mrv2_forced_eos = empty | eos_input | (step >= limit)
+            self._mrv2_masked_eos = None
+        else:
+            limits, minimums, draining = [], [], []
+            for i in range(num_reqs):
+                info = model_intermediate_buffer[i] if i < len(model_intermediate_buffer) else {}
+                info_dict = info if isinstance(info, dict) else {}
+                if info_dict.get("native_duplex") is True:
+                    meta = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
+                    max_tok, min_tok = _native_duplex_chunk_budget(meta)
+                    limits.append(max_tok - 1)
+                    minimums.append(min_tok)
+                    draining.append(bool(meta.get("turn_end")))
+                else:
+                    limits.append(_OFFLINE_CODEC_MAX_NEW_TOKENS - 1)
+                    minimums.append(0)
+                    draining.append(False)
+            device_limits = index_to_device(limits, device, dtype=torch.long)
+            limit = torch.minimum(torch.clamp(remaining - 1, min=0), device_limits)
+            self._mrv2_forced_eos = empty | eos_input | (step >= limit)
+            cadence = (step >= _DUPLEX_CODEC_FRAMES_PER_CHUNK) & (
+                step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
+            )
+            self._mrv2_masked_eos = ~self._mrv2_forced_eos & (
+                (step < index_to_device(minimums, device, dtype=torch.long))
+                | (index_to_device(draining, device, dtype=torch.bool) & cadence)
+            )
         frame_valid = torch.zeros(num_tokens, dtype=torch.bool, device=device)
         frame_valid.index_copy_(0, last_rows, valid)
         if not self._mrv2_decode_rows_logged and not input_batch.has_prefill:
@@ -989,9 +1010,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             logger.info("MiniCPM-o Talker: MRv2 device-side codec output active (no host read of sampled ids)")
 
         meta_outputs: dict[str, Any] = {"codec_frame_valid": frame_valid}
-        if model_intermediate_buffer and any(
-            isinstance(info, dict) and info.get("native_duplex") is True for info in model_intermediate_buffer
-        ):
+        if native_duplex_batch:
             native_duplex_flags: list[torch.Tensor] = []
             duplex_epochs: list[torch.Tensor] = []
             duplex_turn_ids: list[torch.Tensor] = []

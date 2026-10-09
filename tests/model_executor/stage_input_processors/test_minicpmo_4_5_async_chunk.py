@@ -618,10 +618,39 @@ def test_mrv2_sampled_codec_eos_flushes_resumable_segment(turn_end: bool) -> Non
         sampling_params=SimpleNamespace(stop_token_ids=[6561]),
     )
     state.accept_tokens([6561])
-    request = state.snapshot(include_token_history=True)
+    request = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
     assert not request.is_finished()  # The session remains available for another unit.
     payload = tts2code2wav_async_chunk(_manager(), _duplex_delta(*range(7), turn_end=turn_end), request)
     assert payload is not None
     assert _codes(payload) == [4218] * 3 + list(range(7))
     assert payload.meta.tts_is_last_chunk is True
     assert payload.meta.last_chunk is turn_end
+
+
+def test_old_sampled_eos_cannot_close_the_next_turn():
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    manager = _manager()
+    state = _NativeRequestState(
+        request_id="native",
+        external_req_id="native",
+        prompt_token_ids=[0, 0],
+        resumable=True,
+        sampling_params=SimpleNamespace(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    # The next payload has no newly accepted token, even though the ledger
+    # still ends in the previous segment's EOS.
+    stale = state.snapshot(include_token_history=True)
+    first = tts2code2wav_async_chunk(manager, _duplex_delta(turn_id=8, turn_end=True), stale)
+    assert first is None
+    state.accept_tokens([1])
+    body = tts2code2wav_async_chunk(
+        manager, _duplex_delta(*range(30), turn_id=8, turn_end=True), state.snapshot(include_token_history=True)
+    )
+    assert body is not None and body.meta.last_chunk is False
+    tail = tts2code2wav_async_chunk(
+        manager, _duplex_delta(turn_id=8, turn_end=True), state.snapshot(include_token_history=True), True
+    )
+    assert tail is not None and tail.meta.last_chunk is True
+    assert _codes(body)[3:] + _codes(tail)[3:] == list(range(30))

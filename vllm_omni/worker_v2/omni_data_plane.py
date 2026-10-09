@@ -64,7 +64,7 @@ class _NativeRequestState:
                 self.output_stopped = True
                 break
 
-    def snapshot(self, *, include_token_history: bool) -> SimpleNamespace:
+    def snapshot(self, *, include_token_history: bool, sampled_token_ids: list[int] | None = None) -> SimpleNamespace:
         prompt = list(self.prompt_token_ids) if include_token_history else []
         output = list(self.output_token_ids) if include_token_history else []
         finished = self.finished
@@ -77,6 +77,9 @@ class _NativeRequestState:
             all_token_ids=prompt + output,
             output_token_count=len(self.output_token_ids),
             last_output_token_id=self.output_token_ids[-1] if self.output_token_ids else None,
+            # A ledger tail can belong to an earlier segment. Only these ids
+            # were accepted with the payload being published now.
+            sampled_token_ids=list(sampled_token_ids or ()),
             additional_information=self.additional_information,
             model_intermediate_buffer=self.model_intermediate_buffer,
             sampling_params=self.sampling_params,
@@ -561,7 +564,10 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             )
             entries.append(
                 (
-                    state.snapshot(include_token_history=include_token_history),
+                    state.snapshot(
+                        include_token_history=include_token_history,
+                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                    ),
                     payload,
                 )
             )

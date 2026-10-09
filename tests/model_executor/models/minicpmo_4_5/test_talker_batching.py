@@ -1436,3 +1436,74 @@ def test_sample_keeps_general_penalties_without_codec_history(mocker):
     )
     assert captured["metadata"].no_penalties is False
     assert captured["metadata"].repetition_penalties.tolist() == [pytest.approx(1.05)]
+
+
+@pytest.mark.parametrize("legacy_none", [False, True])
+def test_mrv2_overlapping_native_conditions_use_distinct_request_ids(mocker, legacy_none):
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(2, 2))
+
+    def condition(req_id, seq, turn_start=False):
+        return talker.preprocess(
+            torch.zeros(2, dtype=torch.long),
+            None,
+            **({"request_id": None} if legacy_none else {}),
+            req_id=req_id,
+            native_duplex=True,
+            _omni_is_prefill=True,
+            _omni_prompt_len=2,
+            tts_token_ids=torch.tensor([1]),
+            tts_hidden_states=torch.ones(1, 2),
+            meta={"streaming_condition_seq": seq, "turn_start": turn_start},
+        )
+
+    condition("session-a", 0, True)
+    for seq in (1, 2, 3):
+        condition("session-a", seq)
+    condition("session-b", 0, True)
+    condition("session-a", 4)
+    assert talker._request_condition_states["session-a"]["condition_seq"] == 4
+    assert talker._request_condition_states["session-b"]["condition_seq"] == 0
+    assert set(talker._request_audio_states) == {"session-a", "session-b"}
+
+
+def test_mrv2_runner_isolates_a_real_talker_condition_failure(mocker):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from tests.worker_v2.test_omni_model_state import _add, _DummyInputBatch, _make_state
+
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=torch.ones(2, 2))
+    state = _make_state(max_num_reqs=2, has_preprocess=True)
+    state.model.preprocess = talker.preprocess
+    for slot, req_id in enumerate(("session-a", "session-b")):
+        _add(
+            state,
+            req_id=req_id,
+            idx=slot,
+            model_intermediate_buffer={
+                "native_duplex": True,
+                "tts_token_ids": torch.tensor([1]),
+                "tts_hidden_states": torch.ones(1, 2),
+                "meta": {"streaming_condition_seq": 0},
+            },
+        )
+    batch = _DummyInputBatch([0, 1], num_computed_tokens_cpu=[0, 0])
+    reqs = SimpleNamespace(prompt_len=np.array([2, 2]))
+    state.run_preprocess(
+        batch, {"input_ids": torch.zeros(2, dtype=torch.long), "inputs_embeds": torch.ones(2, 2)}, reqs
+    )
+    assert state.take_preprocess_errors() == {}
+    state.intermediate_buffer.buffers[0]["meta"]["streaming_condition_seq"] = 4
+    state.intermediate_buffer.buffers[1]["meta"]["streaming_condition_seq"] = 1
+    state.run_preprocess(
+        batch, {"input_ids": torch.zeros(2, dtype=torch.long), "inputs_embeds": torch.ones(2, 2)}, reqs
+    )
+    errors = state.take_preprocess_errors()
+    assert set(errors) == {"session-a"}
+    assert "skipped a condition sequence" in errors["session-a"]
+    assert talker._request_condition_states["session-b"]["condition_seq"] == 1

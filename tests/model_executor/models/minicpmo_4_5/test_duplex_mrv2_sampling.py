@@ -91,3 +91,37 @@ def test_mrv2_sampler_preserves_history_seed_counts_and_prefill_eligibility(mock
         assert model.sample.call_args.args[1].generators[0] is generator
         sampler.forget_requests(["a"])
         assert sampler.generators == {}
+
+
+@pytest.mark.cpu
+def test_thinker_history_copies_only_new_ids_and_resets_at_condition_change():
+    reads = []
+    values = torch.arange(24).reshape(3, 8)
+
+    class Ledger:
+        def __getitem__(self, index):
+            reads.append((index[0], index[1].start, index[1].stop))
+            return values[index]
+
+    states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.array([0, 0, 2])),
+        all_token_ids=SimpleNamespace(gpu=Ledger()),
+    )
+    model = SimpleNamespace(_mrv2_sampling_infos={})
+    sampler = MiniCPMO45DuplexSampler(SimpleNamespace(req_states=states), model)
+    row = SimpleNamespace(row_idx=0, request_id="a", seq=1)
+    batch = SimpleNamespace(num_reqs=1, idx_mapping_np=np.array([2]), seq_lens=torch.tensor([4]))
+    infos = {"a": {"sampling_params": SamplingParams()}}
+    first = sampler._metadata(batch, [row], infos, "cpu")
+    first.output_token_ids[0].append(999)  # A consumer cannot mutate the cache.
+    batch.seq_lens[0] = 5
+    second = sampler._metadata(batch, [row], infos, "cpu")
+    assert second.output_token_ids == [[18, 19, 20]]
+    assert reads == [(2, 2, 4), (2, 4, 5)]
+    row.seq = 2
+    sampler._metadata(batch, [row], infos, "cpu")
+    assert reads[-1] == (2, 2, 5)
+    batch.seq_lens[0] = 3
+    assert sampler._metadata(batch, [row], infos, "cpu").output_token_ids == [[18]]
+    sampler.forget_requests(["a"])
+    assert sampler._histories == {}

@@ -564,6 +564,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False
+            request_errors = getattr(model_runner_output, "request_errors", None)
+            preprocess_error = request_errors.get(req_id) if isinstance(request_errors, dict) else None
+            if preprocess_error is not None:
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = preprocess_error
+                request.resumable = False
+                generated_token_ids = []
 
             # Validate before mutating request token state. A bad runner output
             # is request-local: terminate only this request and keep processing
@@ -612,7 +619,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = logprob_validation_failed
+            stopped = logprob_validation_failed or preprocess_error is not None
             is_segment_finished = False
             finished = False
             new_token_ids = generated_token_ids
@@ -1099,47 +1106,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.model_intermediate_buffer = update.model_intermediate_buffer
 
     def _update_native_streaming_prompt(self, session: Request, payload: dict[str, Any]) -> bool | None:
-        """Apply the existing Talker window recipe without a V1 transfer adapter.
+        """Delegate streaming prompt policy to the stage's payload processor."""
+        from vllm.utils.import_utils import resolve_obj_by_qualname
 
-        Sender-only MRv2 stages receive conditions through StreamingUpdate.
-        The request already owns the previous condition metadata and confirmed
-        codec ledger, so no parallel request registry is needed.
-        """
-        from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
-        from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
-            _resolve_talker_streaming_prompt_config,
-        )
-
-        limit, previous_chunks, on_capacity = _resolve_talker_streaming_prompt_config(self.vllm_config.model_config)
-        if previous_chunks != 1 or payload.get("native_duplex") is not True:
+        if not hasattr(self, "_native_prompt_hook"):
+            path = getattr(self.vllm_config.model_config, "custom_process_next_stage_input_func", None)
+            processor = resolve_obj_by_qualname(path) if path else None
+            self._native_prompt_hook = getattr(processor, "update_streaming_prompt_for_condition", None)
+        if self._native_prompt_hook is None:
             return None
-        previous_info = getattr(session, "model_intermediate_buffer", None) or {}
-        previous = previous_info.get("meta", {})
-        meta = payload["meta"]
-        previous_seq, seq = previous.get("streaming_condition_seq"), meta.get("streaming_condition_seq")
-        if (
-            not isinstance(previous_seq, int)
-            or isinstance(previous_seq, bool)
-            or not isinstance(seq, int)
-            or isinstance(seq, bool)
-            or seq != previous_seq + 1
-        ):
-            raise ValueError("native Talker streaming_condition_seq must advance by one")
-        # Carry only confirmed codec ids, never the uncomputed sampled EOS.
-        # This also seeds the MRv2 16-code penalty after a new condition.
-        payload.setdefault("ids", {})["streaming_prompt_previous_codes"] = list(
-            session._all_token_ids[session.num_prompt_tokens : session.num_computed_tokens]
-        )
-        return construct_next_stage_streaming_input_prompt(
-            payload,
-            session,
-            max_model_len=limit,
-            previous_condition_len=previous.get("next_stage_prompt_len"),
-            previous_condition_seq=previous_seq,
-            condition_seq=seq,
-            recompute_previous_chunks=previous_chunks,
-            recompute_on_capacity=on_capacity,
-        )
+        return self._native_prompt_hook(self.vllm_config.model_config, session, payload)
 
     def _maybe_reanchor_streaming_window(
         self,

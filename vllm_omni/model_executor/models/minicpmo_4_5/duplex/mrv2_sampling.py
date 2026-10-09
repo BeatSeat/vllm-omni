@@ -21,19 +21,23 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         super().__init__(base_sampler)
         self.model = model
         self.generators: dict[str, torch.Generator] = {}
+        self._helper = DuplexSamplingHelper()
+        self._histories: dict[str, tuple[tuple[int, int, int | None], list[int]]] = {}
         model._mrv2_duplex_sampler = self
 
     def forget_requests(self, request_ids) -> None:
         for request_id in request_ids:
             self.generators.pop(request_id, None)
+            self._histories.pop(request_id, None)
+            self._helper.active_request_ids.discard(request_id)
             getattr(self.model, "_mrv2_sampling_infos", {}).pop(request_id, None)
 
     def _metadata(self, input_batch, rows, infos, device):
         """Read the accepted history, excluding graph padding and uncomputed tokens.
 
-        MRv2 stores its token ledger on device. This compatibility path copies
-        the needed histories before policy evaluation; it favors correctness
-        over avoiding that read. Per-request generators survive batch reorder.
+        Copy only newly accepted tokens. Condition changes, slot replacement
+        and ledger rollback invalidate the cached prefix. The exact device
+        lengths still require a host read; this is not a device-only sampler.
         """
         seq_lens = input_batch.seq_lens[: input_batch.num_reqs].tolist()
         histories, params, generators = [], [], {}
@@ -41,7 +45,15 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             slot = int(input_batch.idx_mapping_np[row.row_idx])
             prompt_len = int(self.req_states.prompt_len.np[slot])
             end = int(seq_lens[row.row_idx])
-            histories.append(self.req_states.all_token_ids.gpu[slot, prompt_len:end].tolist())
+            key = (slot, prompt_len, row.seq)
+            previous_key, history = self._histories.get(row.request_id, (None, []))
+            if key != previous_key or end - prompt_len < len(history):
+                history = []
+            start = prompt_len + len(history)
+            if end > start:
+                history.extend(self.req_states.all_token_ids.gpu[slot, start:end].tolist())
+            self._histories[row.request_id] = (key, history)
+            histories.append(list(history))
             sp = infos[row.request_id]["sampling_params"]
             params.append(sp)
             if sp.seed is not None:
@@ -61,7 +73,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:
         infos = getattr(self.model, "_mrv2_sampling_infos", {})
-        helper = DuplexSamplingHelper()
+        helper = self._helper
         runner = SimpleNamespace(input_batch=input_batch, model_intermediate_buffer=infos)
         for request_id in input_batch.req_ids:
             helper.refresh_active_request(runner, request_id)

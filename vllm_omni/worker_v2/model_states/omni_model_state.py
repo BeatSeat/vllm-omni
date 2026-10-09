@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
+from vllm_omni.model_executor.request_error import RequestPreprocessingError
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
@@ -698,6 +699,11 @@ class OmniModelState(DefaultModelState):
         remaining = [(i, req_indices[i]) for i in np.flatnonzero(~is_settled).tolist()]
         return settled_rows, remaining
 
+    def take_preprocess_errors(self) -> dict[str, str]:
+        errors = getattr(self, "_preprocess_errors", {})
+        self._preprocess_errors: dict[str, str] = {}
+        return errors
+
     def run_preprocess(
         self,
         input_batch: InputBatch,
@@ -908,7 +914,16 @@ class OmniModelState(DefaultModelState):
 
             ids_slice = input_ids[start : start + n_tok]
             emb_slice = embeds[start : start + n_tok]
-            new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
+            try:
+                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
+            except RequestPreprocessingError as exc:
+                # Preserve the batch layout for healthy rows. The failed row's
+                # forward output is discarded and the scheduler terminates it.
+                if not hasattr(self, "_preprocess_errors"):
+                    self._preprocess_errors = {}
+                self._preprocess_errors[str(info["req_id"])] = str(exc)
+                emb_slice.zero_()
+                continue
 
             # Write back in-place
             seg = min(n_tok, new_ids.shape[0])

@@ -1596,6 +1596,9 @@ def test_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch, nati
 def test_mrv2_talker_reuses_confirmed_prompt_window(attention_type, prompt_len, recompute) -> None:
     sched = _make_scheduler(stage_id=1, session_mode="duplex")
     sched._native_data_plane = True
+    sched.vllm_config.model_config.custom_process_next_stage_input_func = (
+        "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_async_chunk"
+    )
     sched.max_model_len = 100
     sched.vllm_config.model_config.hf_config_name = "tts_config"
     sched.vllm_config.model_config.max_model_len = 100

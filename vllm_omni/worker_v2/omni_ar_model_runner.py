@@ -277,6 +277,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             kv_connector_output=None,
         )
+        take_errors = getattr(type(self.model_state), "take_preprocess_errors", None)
+        if take_errors is not None:
+            model_runner_output.request_errors = take_errors(self.model_state)
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
@@ -972,6 +975,18 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             # The output processor accumulates pooling_output for AR requests.
             # Mirroring these rows into multimodal_output would append them twice.
             self.model_runner_output.multimodal_outputs = None
+
+        # Do not publish generated tokens or audio for a failed preprocess row,
+        # including through the native output worker that runs before scheduler ACK.
+        for req_id in getattr(self.model_runner_output, "request_errors", {}):
+            row = self.model_runner_output.req_id_to_index[req_id]
+            self.model_runner_output.sampled_token_ids[row] = []
+            for name in ("pooler_output", "inter_stage_outputs", "multimodal_outputs"):
+                values = getattr(self.model_runner_output, name, None)
+                if values is not None:
+                    values = list(values)
+                    values[row] = None
+                    setattr(self.model_runner_output, name, values)
 
         if self._finalize_output is not None:
             return self._finalize_output(self.model_runner_output)

@@ -59,7 +59,8 @@ precision, TF32 policy, 16-session capacity and 4 GiB Talker KV budget.
 Non-CUDA platforms retain V1.
 
 Ready CI adds a separate H100 MRv2 job with real weights and the profile's
-original graph settings, at concurrency 1 and 2 with two turns per session.
+original graph settings, at concurrency 1, 2 and 4 with two turns per session,
+plus a staggered pair of unequal responses.
 Existing V1 ready, merge, nightly, and performance jobs keep their profiles.
 
 The required overrides are Stage 0 `async_chunk: false` for the completed

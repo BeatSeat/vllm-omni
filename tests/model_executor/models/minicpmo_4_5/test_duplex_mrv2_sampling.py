@@ -125,3 +125,50 @@ def test_thinker_history_copies_only_new_ids_and_resets_at_condition_change():
     assert sampler._metadata(batch, [row], infos, "cpu").output_token_ids == [[18]]
     sampler.forget_requests(["a"])
     assert sampler._histories == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_thinker_histories_and_rng_follow_requests_across_reorder_and_slot_reuse(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    request_ids = [f"request-{slot}" for slot in range(4)]
+    tokens = torch.arange(32, device=device).reshape(4, 8)
+    states = SimpleNamespace(
+        prompt_len=SimpleNamespace(np=np.full(4, 2)),
+        all_token_ids=SimpleNamespace(gpu=tokens),
+    )
+    infos = {req_id: {"sampling_params": SamplingParams(seed=slot)} for slot, req_id in enumerate(request_ids)}
+    sampler = MiniCPMO45DuplexSampler(SimpleNamespace(req_states=states), SimpleNamespace(_mrv2_sampling_infos=infos))
+    reference_rng = {
+        req_id: torch.Generator(device=device).manual_seed(slot) for slot, req_id in enumerate(request_ids)
+    }
+    for step in range(4):
+        if step == 2:
+            sampler.forget_requests([request_ids[0]])
+            assert request_ids[0] not in sampler.generators
+            assert request_ids[0] not in sampler._histories
+            request_ids[0] = "replacement"
+            tokens[0].add_(100)
+            infos["replacement"] = {"sampling_params": SamplingParams(seed=31)}
+            reference_rng["replacement"] = torch.Generator(device=device).manual_seed(31)
+        slots = np.roll(np.arange(4)[::-1], step)
+        # Each request has a different accepted length; a new condition can
+        # replace tokens without changing either the slot or the prompt length.
+        lengths = [3 + (int(slot) + step) % 4 for slot in slots]
+        if step == 3:
+            tokens.add_(1000)
+        rows = [
+            SimpleNamespace(row_idx=row, request_id=request_ids[slot], seq=int(step == 3))
+            for row, slot in enumerate(slots)
+        ]
+        batch = SimpleNamespace(num_reqs=4, idx_mapping_np=slots, seq_lens=torch.tensor(lengths, device=device))
+        metadata = sampler._metadata(batch, rows, infos, device)
+        for row, slot in enumerate(slots):
+            assert metadata.output_token_ids[row] == tokens[slot, 2 : lengths[row]].tolist()
+            torch.testing.assert_close(
+                torch.rand(4, device=device, generator=metadata.generators[row]),
+                torch.rand(4, device=device, generator=reference_rng[request_ids[slot]]),
+            )
+    sampler.forget_requests(request_ids)
+    assert sampler._histories == sampler.generators == infos == {}

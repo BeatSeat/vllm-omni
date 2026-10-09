@@ -832,8 +832,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         live_rows: list[tuple[int, str]] = []
         zero_rows: list[int] = []
         for row, info in enumerate(req_infos):
-            request_id = info.get("request_id")
-            request_id = str(info.get("req_id", "0") if request_id is None else request_id)
+            request_id = str(info.get("request_id", "0"))
             state = info.get("audio_state")
             if info.get("_omni_is_prefill", False) or not isinstance(state, dict):
                 # A row without Talker state builds its condition like a prefill.

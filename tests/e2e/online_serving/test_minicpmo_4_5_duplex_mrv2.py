@@ -32,7 +32,7 @@ _SERVER = OmniServerParams(
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
-@pytest.mark.parametrize("sessions", [1, 2])
+@pytest.mark.parametrize("sessions", [1, 2, 4])
 def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: int):
     args = multi_session_args(
         omni_server=omni_server,

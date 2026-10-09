@@ -19,6 +19,26 @@ def _keep_thinker_payload(payload: dict[str, Any], num_sampled: list[int]) -> di
     return payload
 
 
+def _v1_shaped_runner(input_batch: Any, infos: dict[str, Any]) -> SimpleNamespace:
+    """Present MRv2 request params in the V1 runner shape DuplexSamplingHelper reads."""
+    params = [
+        (infos.get(str(request_id)) or {}).get("sampling_params") or SimpleNamespace()
+        for request_id in input_batch.req_ids
+    ]
+    return SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_ids=input_batch.req_ids,
+            temperature_cpu=[getattr(sp, "temperature", None) for sp in params],
+            top_k_cpu=[getattr(sp, "top_k", None) for sp in params],
+            top_p_cpu=[getattr(sp, "top_p", None) for sp in params],
+        ),
+        model_intermediate_buffer=infos,
+        requests={
+            str(request_id): SimpleNamespace(sampling_params=sp) for request_id, sp in zip(input_batch.req_ids, params)
+        },
+    )
+
+
 class MiniCPMO45DuplexSampler(OmniSampler):
     """Keep policy RNG/session state separate from the stock MRv2 sampler."""
 
@@ -125,7 +145,7 @@ class MiniCPMO45DuplexSampler(OmniSampler):
         runner = SimpleNamespace(input_batch=input_batch, model_intermediate_buffer=infos)
         for request_id in input_batch.req_ids:
             helper.refresh_active_request(runner, request_id)
-        rows = helper.rows(runner)
+        rows = helper.rows(_v1_shaped_runner(input_batch, infos))
         if rows and input_batch.num_draft_tokens:
             raise NotImplementedError("MiniCPM-o MRv2 duplex sampling does not support speculative decoding")
         # Partial prefills are discarded by the runner and must not mutate the

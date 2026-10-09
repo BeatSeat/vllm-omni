@@ -75,18 +75,6 @@ def _mean_time_per_output_token_ms(stats: RequestStateStats) -> float:
     return decode_time_s * 1000.0 / float(output_intervals)
 
 
-def _without_mirrored_keys(pooling_output: Any, multimodal_output: Any) -> Any:
-    """Drop pooling keys already carried by this step's multimodal_output.
-
-    MRv2 full-payload AR stages publish the same per-request payload on both
-    channels (mirroring the V1 runner); accumulating both appends each row twice.
-    """
-    if not isinstance(pooling_output, dict) or not isinstance(multimodal_output, dict):
-        return pooling_output
-    remaining = {key: value for key, value in pooling_output.items() if key not in multimodal_output}
-    return remaining or None
-
-
 def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, new_tokens: int) -> None:
     """Weight one decode step by its token count. ITL stays one sample per step."""
     if new_tokens <= 0:
@@ -710,7 +698,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # pooling_output. Preserve the payload, then clear the field so
                 # upstream still runs the normal detokenization path.
                 if eco.pooling_output is not None and req_state.detokenizer is not None:
-                    req_state.add_multimodal_tensor(_without_mirrored_keys(eco.pooling_output, mm_output), mm_type)
+                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                     eco.pooling_output = None
 
             # Route: if no detokenizer and no pooling output, handle locally

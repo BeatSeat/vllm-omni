@@ -15,6 +15,10 @@ from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 
+def _keep_thinker_payload(payload: dict[str, Any], num_sampled: list[int]) -> dict[str, Any]:
+    return payload
+
+
 class MiniCPMO45DuplexSampler(OmniSampler):
     """Keep policy RNG/session state separate from the stock MRv2 sampler."""
 
@@ -106,6 +110,14 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             top_p=torch.tensor([sp.top_p for sp in params]),
             all_greedy=all(sp.temperature <= 0 for sp in params),
         )
+
+    def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
+        # Publish the Thinker payload through the MRv2 output-channel contract:
+        # its latent row ledger is inter-stage only. The full-payload fallback
+        # mirrors it into multimodal_output too, so every llm2tts row would be
+        # accumulated twice and the per-unit ledger lookup would fail.
+        output = super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
+        return replace(output, include_hidden_states=False, finalize_multimodal=_keep_thinker_payload)
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:
         infos = getattr(self.model, "_mrv2_sampling_infos", {})

@@ -32,6 +32,18 @@ def test_mrv2_rows_read_sampling_params_from_intermediate_buffers():
     assert all(row.max_tokens == 16 for row in rows)
 
 
+@pytest.mark.cpu
+def test_mrv2_thinker_payload_uses_output_channel_contract():
+    sampler = MiniCPMO45DuplexSampler(object(), SimpleNamespace())
+    tokens = torch.tensor([[7]])
+    standard = (SimpleNamespace(sampled_token_ids=tokens), torch.ones(1), torch.zeros(1))
+    output = sampler.sample_step(None, None, None, None, lambda *_args: standard)
+    payload = {"latent": torch.ones(1, 2)}
+    assert output.sampler_output is standard[0]
+    assert output.include_hidden_states is False
+    assert output.finalize_multimodal(payload, [1]) is payload
+
+
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("partial_prefill", [True, False])

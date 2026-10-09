@@ -392,7 +392,7 @@ def test_async_output_slices_request_payloads_with_graph_padding(
             torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
 
 
-def test_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
+def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
     from tests.engine.test_output_processor_mrv2_text import (
         _Detokenizer,
         _make_processor,
@@ -410,13 +410,16 @@ def test_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
         num_reqs=1,
         num_tokens_after_padding=3,
     )
+    # The MiniCPM-o duplex Thinker sampler publishes through finalize_multimodal
+    # instead of the full-payload fallback that mirrors rows into both channels.
     output = _async_output(
         req_ids=["r"],
-        text_hidden=hidden,
         multimodal_outputs={"latent": hidden, "latent_input_ids": ids, "latent_positions": positions},
         input_batch=batch,
         async_chunk=False,
+        finalize_multimodal=lambda payload, _num_sampled: payload,
     ).get_output()
+    assert output.multimodal_outputs is None
     engine_output = _rehydrated_output(pooling_output=output.pooler_output[0])
     if output.multimodal_outputs:
         engine_output.multimodal_output = output.multimodal_outputs[0]

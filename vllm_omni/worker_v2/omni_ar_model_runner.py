@@ -277,9 +277,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             kv_connector_output=None,
         )
-        take_errors = getattr(type(self.model_state), "take_preprocess_errors", None)
-        if take_errors is not None:
-            model_runner_output.request_errors = take_errors(self.model_state)
+        preprocess_errors = getattr(type(self.model_state), "preprocess_errors", None)
+        if preprocess_errors is not None:
+            model_runner_output.request_errors = {
+                req_id: error
+                for req_id, error in preprocess_errors(self.model_state).items()
+                if req_id in model_runner_output.req_id_to_index
+            }
         model_runner_output.kv_extracted_req_ids = kv_extracted
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 

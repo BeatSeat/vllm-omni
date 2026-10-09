@@ -1512,15 +1512,16 @@ def test_mrv2_runner_isolates_a_real_talker_condition_failure(mocker, sessions):
     reqs = SimpleNamespace(prompt_len=np.full(sessions, 2))
     inputs = {"input_ids": torch.zeros(sessions, dtype=torch.long), "inputs_embeds": torch.ones(sessions, 2)}
     state.run_preprocess(batch, inputs, reqs)
-    assert state.take_preprocess_errors() == {}
+    assert state.preprocess_errors() == {}
     for slot in range(sessions):
         state.intermediate_buffer.buffers[slot]["meta"]["streaming_condition_seq"] = 4 if slot == 0 else 1
     batch = _DummyInputBatch(list(reversed(range(sessions))), num_computed_tokens_cpu=[0] * sessions)
     state.run_preprocess(batch, inputs, reqs)
-    errors = state.take_preprocess_errors()
+    errors = state.preprocess_errors()
     assert set(errors) == {"session-0"}
     assert "skipped a condition sequence" in errors["session-0"]
     assert all(talker._request_condition_states[req_id]["condition_seq"] == 1 for req_id in request_ids[1:])
     assert inputs["inputs_embeds"][-1].count_nonzero() == 0
     assert inputs["inputs_embeds"][:-1].eq(1).all()
-    assert state.take_preprocess_errors() == {}
+    state.on_requests_finished({"session-0"})
+    assert state.preprocess_errors() == {}

@@ -235,6 +235,10 @@ class OmniModelState(DefaultModelState):
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._eager_state.finish_audio(req_ids)
+        errors = getattr(self, "_preprocess_errors", None)
+        if errors:
+            for req_id in req_ids:
+                errors.pop(req_id, None)
 
     def on_request_preempted(self, req_id: str, req_index: int) -> None:
         self._eager_state.suspend_audio(req_id, req_index)
@@ -699,10 +703,10 @@ class OmniModelState(DefaultModelState):
         remaining = [(i, req_indices[i]) for i in np.flatnonzero(~is_settled).tolist()]
         return settled_rows, remaining
 
-    def take_preprocess_errors(self) -> dict[str, str]:
-        errors = getattr(self, "_preprocess_errors", {})
-        self._preprocess_errors: dict[str, str] = {}
-        return errors
+    def preprocess_errors(self) -> dict[str, str]:
+        # Kept until the request is cleaned up: with async scheduling, steps
+        # already queued after the failed one must be suppressed as well.
+        return dict(getattr(self, "_preprocess_errors", {}))
 
     def run_preprocess(
         self,

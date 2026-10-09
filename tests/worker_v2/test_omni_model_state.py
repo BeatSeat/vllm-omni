@@ -842,8 +842,11 @@ def test_declared_preprocess_error_is_isolated_to_its_request():
     )
     assert calls == ["bad", "good"]
     torch.testing.assert_close(inputs["inputs_embeds"], torch.tensor([[0.0, 0.0, 0.0], [5.0, 5.0, 5.0]]))
-    assert state.take_preprocess_errors() == {"bad": "invalid condition sequence"}
-    assert state.take_preprocess_errors() == {}
+    # Async scheduling may already have queued the next step for "bad".
+    assert state.preprocess_errors() == {"bad": "invalid condition sequence"}
+    assert state.preprocess_errors() == {"bad": "invalid condition sequence"}
+    state.on_requests_finished({"bad"})
+    assert state.preprocess_errors() == {}
 
 
 def test_unexpected_preprocess_error_is_not_swallowed():

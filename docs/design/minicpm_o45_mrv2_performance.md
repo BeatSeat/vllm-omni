@@ -58,10 +58,9 @@ It inherits the default duplex profile's sampling, codec chunk size, cache
 precision, TF32 policy, 16-session capacity and 4 GiB Talker KV budget.
 Non-CUDA platforms retain V1.
 
-CUDA merge and nightly duplex jobs select this profile through
-`VLLM_TEST_MINICPMO_DUPLEX_DEPLOY_CONFIG`. They use real weights and the profile's
-graph settings. The nightly CUDA Seed-TTS performance case also selects MRv2;
-NPU and ready live-client jobs retain their existing profiles.
+Ready CI adds a separate H100 MRv2 job with real weights and the profile's
+original graph settings, at concurrency 1 and 2 with two turns per session.
+Existing V1 ready, merge, nightly, and performance jobs keep their profiles.
 
 The required overrides are Stage 0 `async_chunk: false` for the completed
 Thinker-to-Talker handoff and Stage 1/2 `async_scheduling: false` to serialize
@@ -70,7 +69,7 @@ segment completion with subsequent input.
 The Talker reuses the existing streaming prompt recipe: full attention extends
 its KV prefix until capacity, while sliding recompute rebuilds the previous
 condition, confirmed codec ids and current condition. Codec history survives
-condition boundaries for the 16-frame penalty. The MRv2 host-side sampled EOS
+condition boundaries for the 16-frame penalty. Only an EOS accepted with the current MRv2 output
 flushes a segment; `turn_end` alone never closes it prematurely.
 
 Configuration and unit tests do not establish audio quality or speedup.

@@ -52,6 +52,47 @@ from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 logger = init_logger(__name__)
 
 
+def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
+    """Build the per-row duplex handoff metadata shared by the V1 and MRv2 Thinker outputs."""
+    duplex_rows = []
+    for req_info in request_infos:
+        duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
+        duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
+
+    outputs: dict[str, Any] = {}
+    prompt_rows = []
+    for duplex_info in duplex_rows:
+        prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
+        # This is a complete per-handoff snapshot, not a generated
+        # tensor delta. Keep it as row-local metadata so output
+        # accumulation replaces the previous value instead of
+        # attempting to concatenate variable-length prompts.
+        prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
+    if any(row is not None for row in prompt_rows):
+        outputs["duplex_prompt_token_ids"] = prompt_rows
+
+    special_rows = [
+        info if isinstance(info := duplex_info.get("special_token_ids"), dict) else {} for duplex_info in duplex_rows
+    ]
+    special_keys = {
+        key
+        for special in special_rows
+        for key, value in special.items()
+        if isinstance(key, str) and isinstance(value, int) and value >= 0
+    }
+    if special_keys:
+        # Host tensors: every consumer reads them on the host, and a pageable
+        # host->device copy per row and key would wait for the whole forward.
+        outputs["meta"] = {
+            key: [
+                torch.tensor([value], dtype=torch.long) if isinstance(value, int) and value >= 0 else None
+                for value in (special.get(key) for special in special_rows)
+            ]
+            for key in sorted(special_keys)
+        }
+    return outputs
+
+
 @dataclass(slots=True)
 class _MiniCPMO45PendingSamples:
     """A deferred Stage-0 duplex step awaiting its host commit."""
@@ -772,51 +813,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
-                duplex_rows = []
-                for req_info in runtime_info:
-                    duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
-                    duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
-
-                prompt_rows = []
-                for duplex_info in duplex_rows:
-                    prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
-                    # This is a complete per-handoff snapshot, not a generated
-                    # tensor delta. Keep it as row-local metadata so output
-                    # accumulation replaces the previous value instead of
-                    # attempting to concatenate variable-length prompts.
-                    prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
-                if any(row is not None for row in prompt_rows):
-                    multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
-
-                special_keys = {
-                    key
-                    for duplex_info in duplex_rows
-                    for key, value in (
-                        duplex_info.get("special_token_ids", {}).items()
-                        if isinstance(duplex_info.get("special_token_ids"), dict)
-                        else ()
-                    )
-                    if isinstance(key, str) and isinstance(value, int) and value >= 0
-                }
-                if special_keys:
-                    # Host tensors: every consumer reads them on the host, and a pageable
-                    # host->device copy per row and key would wait for the whole forward.
-                    multimodal_outputs["meta"] = {
-                        key: [
-                            torch.tensor([int(value)], dtype=torch.long)
-                            if isinstance(value, int) and value >= 0
-                            else None
-                            for duplex_info in duplex_rows
-                            for value in [
-                                (
-                                    duplex_info.get("special_token_ids", {}).get(key)
-                                    if isinstance(duplex_info.get("special_token_ids"), dict)
-                                    else None
-                                )
-                            ]
-                        ]
-                        for key in sorted(special_keys)
-                    }
+                multimodal_outputs.update(_duplex_row_outputs(runtime_info))
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
@@ -853,49 +850,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if model_intermediate_buffer and any(
             isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer
         ):
-            duplex_rows = []
-            for req_info in model_intermediate_buffer:
-                duplex_info = req_info.get("duplex") if isinstance(req_info, dict) else None
-                duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
-
-            prompt_rows = []
-            for duplex_info in duplex_rows:
-                prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
-                prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
-            if any(row is not None for row in prompt_rows):
-                multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
-
-            special_keys = {
-                key
-                for duplex_info in duplex_rows
-                for key, value in (
-                    duplex_info.get("special_token_ids", {}).items()
-                    if isinstance(duplex_info.get("special_token_ids"), dict)
-                    else ()
-                )
-                if isinstance(key, str) and isinstance(value, int) and value >= 0
-            }
-            if special_keys:
-                multimodal_outputs["meta"] = {
-                    key: [
-                        torch.tensor(
-                            [int(value)],
-                            dtype=torch.long,
-                            device=model_outputs.device,
-                        )
-                        if isinstance(value, int) and value >= 0
-                        else None
-                        for duplex_info in duplex_rows
-                        for value in [
-                            (
-                                duplex_info.get("special_token_ids", {}).get(key)
-                                if isinstance(duplex_info.get("special_token_ids"), dict)
-                                else None
-                            )
-                        ]
-                    ]
-                    for key in sorted(special_keys)
-                }
+            multimodal_outputs.update(_duplex_row_outputs(model_intermediate_buffer))
 
         return OmniOutput(
             text_hidden_states=model_outputs,

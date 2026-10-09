@@ -142,10 +142,10 @@ class MiniCPMO45DuplexSampler(OmniSampler):
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> SamplerOutput:
         infos = getattr(self.model, "_mrv2_sampling_infos", {})
         helper = self._helper
-        runner = SimpleNamespace(input_batch=input_batch, model_intermediate_buffer=infos)
+        runner = _v1_shaped_runner(input_batch, infos)
         for request_id in input_batch.req_ids:
             helper.refresh_active_request(runner, request_id)
-        rows = helper.rows(_v1_shaped_runner(input_batch, infos))
+        rows = helper.rows(runner)
         if rows and input_batch.num_draft_tokens:
             raise NotImplementedError("MiniCPM-o MRv2 duplex sampling does not support speculative decoding")
         # Partial prefills are discarded by the runner and must not mutate the

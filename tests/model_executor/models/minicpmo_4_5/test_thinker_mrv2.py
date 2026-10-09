@@ -132,6 +132,8 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     assert "tts_bos_token_id" in out.multimodal_outputs["meta"]
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1] is None
+    # Host-only metadata: a device tensor would cost a blocking H2D per row and key.
+    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].device.type == "cpu"
 
 
 def test_mrv2_turn_thinker_retains_native_multimodal_path(mocker):

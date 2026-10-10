@@ -685,3 +685,35 @@ def test_mrv2_async_lookahead_cannot_reopen_a_completed_condition(lookahead):
         assert _codes(last)[3:] == list(range(25, 50))
         assert last.meta.chunk_seq == 1
         assert output(request, 1, [999], eos=True, turn_end=True) is None
+
+
+@pytest.mark.parametrize("request_terminal", [False, True])
+def test_mrv2_duplex_turn_end_keeps_live_code2wav_stream_open(request_terminal: bool) -> None:
+    # A turn end must not close the Code2Wav stream of a live resumable request,
+    # or the next turn's chunks are never received.
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin as OmniConnectorPayloadTransport,
+    )
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    state = _NativeRequestState(
+        request_id="native",
+        external_req_id="native",
+        prompt_token_ids=[0] * 3,
+        resumable=True,
+        sampling_params=SimpleNamespace(stop_token_ids=[6561]),
+    )
+    state.accept_tokens([6561])
+    state.finished = request_terminal
+    request = state.snapshot(include_token_history=True, sampled_token_ids=None if request_terminal else [6561])
+    payload = tts2code2wav_async_chunk(
+        _manager(), _duplex_delta(*range(7), turn_end=True), request, request.is_finished()
+    )
+
+    assert payload is not None
+    assert payload.meta.last_chunk is True
+    assert payload.meta.turn_end is True
+    assert payload.meta.is_segment_finished.item() is True
+    assert payload.meta.finished.item() is request_terminal
+    metadata = OmniConnectorPayloadTransport._extract_scheduling_metadata({"meta": {"finished": payload.meta.finished}})
+    assert metadata.get("input_terminal", False) is request_terminal

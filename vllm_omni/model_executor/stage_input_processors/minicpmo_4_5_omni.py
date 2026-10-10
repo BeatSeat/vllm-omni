@@ -361,6 +361,11 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    # A native-duplex turn end closes one Code2Wav turn, not the resumable
+    # request. meta.finished is the whole-stream terminal on the MRv2 native
+    # transport (the V1 chunk adapter overwrites it with the scheduler's
+    # request finish), so it must follow the request, not last_chunk.
+    request_terminal = finished
     # MRv2 materializes sampled ids before publishing this payload. A
     # resumable request is still alive at codec EOS; flush the segment using
     # its confirmed host-side token rather than closing on every turn_end row.
@@ -443,7 +448,7 @@ def tts2code2wav_async_chunk(
             left_context_size=len(context),
             last_chunk=last_chunk,
             stream_finished=finished_tensor,
-            finished=finished_tensor,
+            finished=torch.tensor(request_terminal, dtype=torch.bool) if native_duplex else finished_tensor,
             is_segment_finished=finished_tensor,
             req_id=[request_id],
             duplex_epoch=duplex_epoch,

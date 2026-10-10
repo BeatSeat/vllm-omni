@@ -171,6 +171,19 @@ def test_mrv2_talker_native_duplex_output(condition_seq) -> None:
     assert bytes(meta["native_duplex_segment_text"][0].tolist()).decode("utf-8") == "hello"
 
 
+@pytest.mark.parametrize("fence", [{"epoch": -1, "turn_id": 5}, {"epoch": True, "turn_id": 5}, {"turn_id": 5}])
+def test_mrv2_talker_rejects_native_duplex_without_fence_identity(fence) -> None:
+    """Same contract as V1 make_omni_output: condition fencing needs non-negative int identities."""
+    batch, _ = _batch([dict(slot=0, prompt_len=4, computed=6, span=[17], prefill=False)], pad_to=1)
+    with pytest.raises(RuntimeError, match="requires non-negative integer epoch and turn_id"):
+        _talker().make_omni_output_mrv2(
+            torch.zeros((1, 4)),
+            input_batch=batch,
+            req_states=_req_states({0: 4}),
+            model_intermediate_buffer=[{"native_duplex": True, "duplex": fence}],
+        )
+
+
 def test_mrv2_context_with_only_eos_slot_forces_eos_at_prefill():
     talker = _talker(max_position_embeddings=5)
     batch, _ = _batch([dict(slot=2, prompt_len=4, computed=0, span=[0] * 4, prefill=True)])

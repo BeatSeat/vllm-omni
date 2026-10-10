@@ -107,6 +107,45 @@ def blank_scheduler_prompt_for_penalties(
     return torch.full_like(prompt_token_ids, int(vocab_size))
 
 
+def _native_duplex_row_meta(info_dict: Mapping[str, Any]) -> tuple[bool, int, int, str, bool]:
+    """One Talker row's native-duplex fence identity, segment text and turn end, shared by V1 and MRv2 outputs."""
+    native_duplex = info_dict.get("native_duplex") is True
+    duplex_info = info_dict.get("duplex")
+    if not isinstance(duplex_info, dict):
+        duplex_info = {}
+    epoch = duplex_info.get("epoch", -1)
+    turn_id = duplex_info.get("turn_id", -1)
+    if native_duplex and not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
+    ):
+        raise RuntimeError(
+            "MiniCPM-o native duplex Talker requires non-negative integer "
+            f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
+        )
+    meta_info = info_dict.get("meta")
+    if not isinstance(meta_info, dict):
+        meta_info = {}
+    segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
+    if not isinstance(segment_text, str):
+        segment_text = ""
+    turn_eos_id = meta_info.get("turn_eos_token_id")
+    ids_info = info_dict.get("ids")
+    tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
+    if isinstance(tts_ids, torch.Tensor):
+        contains_turn_eos = isinstance(turn_eos_id, int) and bool(torch.any(tts_ids.reshape(-1) == turn_eos_id).item())
+    elif isinstance(tts_ids, (list, tuple)):
+        contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
+    else:
+        contains_turn_eos = False
+    return (
+        native_duplex,
+        epoch if isinstance(epoch, int) else -1,
+        turn_id if isinstance(turn_id, int) else -1,
+        segment_text,
+        native_duplex and contains_turn_eos,
+    )
+
+
 def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) -> torch.Tensor:
     """Materialize ``weight_norm(..., dim=0)`` checkpoint parameters."""
     return torch._weight_norm(weight_v, weight_g, dim=0)
@@ -1007,34 +1046,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             turn_end_flags: list[torch.Tensor] = []
             for info in model_intermediate_buffer:
                 info_dict = info if isinstance(info, dict) else {}
-                native_duplex = info_dict.get("native_duplex") is True
-                duplex_info = info_dict.get("duplex") if isinstance(info_dict.get("duplex"), dict) else {}
-                epoch = duplex_info.get("epoch", -1)
-                turn_id = duplex_info.get("turn_id", -1)
+                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
                 meta_info = info_dict.get("meta") if isinstance(info_dict.get("meta"), dict) else {}
                 condition_seq = meta_info.get("streaming_condition_seq", -1)
                 condition_seqs.append(
                     torch.tensor(condition_seq if isinstance(condition_seq, int) else -1, dtype=torch.long)
                 )
-                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
-                if not isinstance(segment_text, str):
-                    segment_text = ""
-                turn_eos_id = meta_info.get("turn_eos_token_id")
-                ids_info = info_dict.get("ids") if isinstance(info_dict.get("ids"), dict) else {}
-                tts_ids = ids_info.get("tts") if native_duplex else None
-                if isinstance(tts_ids, torch.Tensor):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
-                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
-                    )
-                elif isinstance(tts_ids, (list, tuple)):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
-                else:
-                    contains_turn_eos = False
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                duplex_epochs.append(torch.tensor(epoch, dtype=torch.long))
+                duplex_turn_ids.append(torch.tensor(turn_id, dtype=torch.long))
                 segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
             meta_outputs["native_duplex"] = native_duplex_flags
             meta_outputs["duplex_epoch"] = duplex_epochs
             meta_outputs["duplex_turn_id"] = duplex_turn_ids
@@ -1092,47 +1114,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         frame_valid = [torch.empty(0, dtype=torch.bool, device="cpu") for _ in infos]
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
-            native_duplex = info_dict.get("native_duplex") is True
             if emit_duplex_metadata:
-                duplex_info = info_dict.get("duplex")
-                if not isinstance(duplex_info, dict):
-                    duplex_info = {}
-                epoch = duplex_info.get("epoch", -1)
-                turn_id = duplex_info.get("turn_id", -1)
-                if native_duplex and not all(
-                    isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
-                ):
-                    raise RuntimeError(
-                        "MiniCPM-o native duplex Talker requires non-negative integer "
-                        f"epoch and turn_id, got epoch={epoch!r}, turn_id={turn_id!r}"
-                    )
-                meta_info = info_dict.get("meta")
-                if not isinstance(meta_info, dict):
-                    meta_info = {}
-                segment_text = meta_info.get("native_duplex_segment_text", "") if native_duplex else ""
-                if not isinstance(segment_text, str):
-                    segment_text = ""
-                turn_eos_id = meta_info.get("turn_eos_token_id")
-                ids_info = info_dict.get("ids")
-                tts_ids = ids_info.get("tts") if native_duplex and isinstance(ids_info, dict) else None
-                if isinstance(tts_ids, torch.Tensor):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and bool(
-                        torch.any(tts_ids.reshape(-1) == turn_eos_id).item()
-                    )
-                elif isinstance(tts_ids, (list, tuple)):
-                    contains_turn_eos = isinstance(turn_eos_id, int) and turn_eos_id in tts_ids
-                else:
-                    contains_turn_eos = False
+                native_duplex, epoch, turn_id, segment_text, turn_end = _native_duplex_row_meta(info_dict)
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
-                duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
-                duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
-                segment_texts_utf8.append(
-                    torch.tensor(
-                        list(segment_text.encode("utf-8")),
-                        dtype=torch.uint8,
-                    )
-                )
-                turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
+                duplex_epochs.append(torch.tensor(epoch, dtype=torch.long))
+                duplex_turn_ids.append(torch.tensor(turn_id, dtype=torch.long))
+                segment_texts_utf8.append(torch.tensor(list(segment_text.encode("utf-8")), dtype=torch.uint8))
+                turn_end_flags.append(torch.tensor(turn_end, dtype=torch.bool))
 
             if not isinstance(info, dict):
                 continue

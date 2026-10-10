@@ -988,8 +988,16 @@ def llm2tts(
             unit_start = 0
             while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
                 unit_start += 1
-            if tts_bos_idx is not None:
-                out_start = max(unit_start, tts_bos_idx - prompt_token_ids_len)
+            # Only the unit's opening decision (or a boundary folded as the last
+            # prompt token) starts the slice. The policy also rewrites a mid-unit
+            # <|listen|> into <|tts_bos|>; like the official loop, that token is
+            # fed and handed to the Talker with the text before it, not used as
+            # a new start that would drop the unit's earlier words.
+            folded_boundary = (
+                unit_start == 0 and prompt_token_ids_len > 0 and full_token_ids[prompt_token_ids_len - 1] == tts_bos_id
+            )
+            if folded_boundary:
+                out_start = 0
             elif unit_start < len(out_ids) and out_ids[unit_start] not in tts_end_ids:
                 out_start = unit_start + 1
             else:

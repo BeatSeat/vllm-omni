@@ -717,3 +717,25 @@ def test_mrv2_duplex_turn_end_keeps_live_code2wav_stream_open(request_terminal: 
     assert payload.meta.finished.item() is request_terminal
     metadata = OmniConnectorPayloadTransport._extract_scheduling_metadata({"meta": {"finished": payload.meta.finished}})
     assert metadata.get("input_terminal", False) is request_terminal
+
+
+@pytest.mark.parametrize("last_valid", [False, True])
+def test_full_payload_accumulates_codec_validity_per_frame(last_valid):
+    """A final invalid/EOS row must not invalidate the whole utterance."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    request = _request("req")
+    for code, valid in [(10, True), (0, False), (11, True), (12, last_valid)]:
+        transport.accumulate_full_payload_output(
+            "req",
+            {"codes.audio": torch.tensor([[code]]), "meta.codec_frame_valid": torch.tensor([valid])},
+            request,
+        )
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["req"])
+    payload = tts2code2wav_full_payload(_manager(), full, request)
+    assert _codes(payload) == [4218, 4218, 4218, 10, 11] + ([12] if last_valid else [])

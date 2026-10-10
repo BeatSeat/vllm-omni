@@ -33,7 +33,6 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
-from vllm_omni.errors import RequestPreprocessingError
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
@@ -621,16 +620,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return full_embeddings
 
     def preprocess(
-        self, input_ids: torch.Tensor, input_embeds: torch.Tensor | None, **info_dict: Any
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        try:
-            return self._preprocess(input_ids, input_embeds, **info_dict)
-        except ValueError as exc:
-            if info_dict.get("native_duplex") is True:
-                raise RequestPreprocessingError(str(exc)) from exc
-            raise
-
-    def _preprocess(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor | None,

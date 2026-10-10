@@ -35,7 +35,6 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_omni.errors import RequestPreprocessingError
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
@@ -235,10 +234,6 @@ class OmniModelState(DefaultModelState):
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._eager_state.finish_audio(req_ids)
-        errors = getattr(self, "_preprocess_errors", None)
-        if errors:
-            for req_id in req_ids:
-                errors.pop(req_id, None)
 
     def on_request_preempted(self, req_id: str, req_index: int) -> None:
         self._eager_state.suspend_audio(req_id, req_index)
@@ -703,11 +698,6 @@ class OmniModelState(DefaultModelState):
         remaining = [(i, req_indices[i]) for i in np.flatnonzero(~is_settled).tolist()]
         return settled_rows, remaining
 
-    def preprocess_errors(self) -> dict[str, str]:
-        # Kept until the request is cleaned up: with async scheduling, steps
-        # already queued after the failed one must be suppressed as well.
-        return dict(getattr(self, "_preprocess_errors", {}))
-
     def run_preprocess(
         self,
         input_batch: InputBatch,
@@ -918,16 +908,7 @@ class OmniModelState(DefaultModelState):
 
             ids_slice = input_ids[start : start + n_tok]
             emb_slice = embeds[start : start + n_tok]
-            try:
-                new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
-            except RequestPreprocessingError as exc:
-                # Preserve the batch layout for healthy rows. The failed row's
-                # forward output is discarded and the scheduler terminates it.
-                if not hasattr(self, "_preprocess_errors"):
-                    self._preprocess_errors = {}
-                self._preprocess_errors[str(info["req_id"])] = str(exc)
-                emb_slice.zero_()
-                continue
+            new_ids, new_emb, updates = self.model.preprocess(ids_slice, emb_slice, **info)
 
             # Write back in-place
             seg = min(n_tok, new_ids.shape[0])

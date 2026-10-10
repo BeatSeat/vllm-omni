@@ -564,13 +564,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             status_before_stop = request.status
             new_logprobs = None
             logprob_validation_failed = False
-            request_errors = getattr(model_runner_output, "request_errors", None)
-            preprocess_error = request_errors.get(req_id) if isinstance(request_errors, dict) else None
-            if preprocess_error is not None:
-                request.status = RequestStatus.FINISHED_ERROR
-                request.stop_reason = preprocess_error
-                request.resumable = False
-                generated_token_ids = []
 
             # Validate before mutating request token state. A bad runner output
             # is request-local: terminate only this request and keep processing
@@ -619,7 +612,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = logprob_validation_failed or preprocess_error is not None
+            stopped = logprob_validation_failed
             is_segment_finished = False
             finished = False
             new_token_ids = generated_token_ids

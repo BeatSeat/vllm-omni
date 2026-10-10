@@ -901,30 +901,3 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
-
-
-def test_failed_preprocess_row_is_not_published_to_native_transport(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
-    batch = SimpleNamespace(
-        query_start_loc_np=np.array([0, 1, 2]),
-        num_scheduled_tokens=np.array([1, 1]),
-        num_reqs=2,
-        num_tokens_after_padding=2,
-    )
-    sampler = SamplerOutput(
-        torch.tensor([[7], [8]]), None, None, torch.ones(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32)
-    )
-    pending = _async_output(
-        req_ids=["bad", "good"],
-        sampler_output=sampler,
-        text_hidden=torch.ones(2, 4),
-        multimodal_outputs={"codes": {"audio": torch.tensor([[7], [8]])}},
-        input_batch=batch,
-        async_chunk=True,
-    )
-    pending.model_runner_output.request_errors = {"bad": "invalid condition sequence"}
-    output = pending.get_output()
-    assert output.sampled_token_ids == [[], [8]]
-    assert output.inter_stage_outputs[0] is None
-    assert output.inter_stage_outputs[1] is not None
-    assert output.request_errors == {"bad": "invalid condition sequence"}

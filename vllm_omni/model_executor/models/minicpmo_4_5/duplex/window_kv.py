@@ -959,9 +959,14 @@ class MiniCPMO45DuplexWorkerHelper:
                 inv_freq = cls.get_rope_inv_freq(runner)
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
                 block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
+                # Layers share their KV group's table; on MRv2 each lookup is a device read.
+                group_block_ids: dict[int, list[int]] = {}
                 for layer_idx, kv_cache in enumerate(runner.kv_caches):
                     group_idx = kv_groups[layer_idx] if (kv_groups and layer_idx < len(kv_groups)) else 0
-                    layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                    layer_block_ids = group_block_ids.get(group_idx)
+                    if layer_block_ids is None:
+                        layer_block_ids = cls.resolve_group_block_ids(runner, req_id, req_idx, group_idx=group_idx)
+                        group_block_ids[group_idx] = layer_block_ids
                     rotate_cached_keys(
                         kv_cache,
                         block_ids=layer_block_ids,

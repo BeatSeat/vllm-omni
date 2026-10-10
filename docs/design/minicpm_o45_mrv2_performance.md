@@ -17,8 +17,9 @@ ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 `input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
 The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
-Duplex keeps the mainline V1 session path. Turn results do not establish duplex
-performance or interruption correctness.
+Duplex defaults to the V1 session path; `minicpmo_4_5_duplex_mrv2.yaml` is the
+opt-in CUDA overlay that runs all three duplex stages on MRv2. Turn results do
+not establish duplex performance or interruption correctness.
 
 The shared Code2Wav backend defaults to the existing fused CFM body on CUDA
 when TF32 is allowed, subject to architecture and FP32 attention-cache

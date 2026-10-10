@@ -40,6 +40,10 @@ class _NativeRequestState:
     output_token_ids: list[int] = field(default_factory=list)
     finished: bool = False
     output_stopped: bool = False
+    # Set by ``abort_requests``: the scheduler ended the request outside its
+    # own output (cancel, error or a parked close), so the runner has no
+    # finish reason. MiniCPM-o duplex Talkers only end this way.
+    aborted: bool = False
 
     def accept_tokens(self, token_ids: list[int]) -> None:
         """Fence publications past the sampled stop, before scheduler ACK.
@@ -85,6 +89,7 @@ class _NativeRequestState:
             sampling_params=self.sampling_params,
             num_computed_tokens=self.num_computed_tokens,
             resumable=self.resumable,
+            aborted=self.aborted,
         )
         request.is_finished = lambda: finished
         return request
@@ -333,6 +338,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             if not active_req_ids:
                 return 0
             for req_id in active_req_ids:
+                self._native_requests[req_id].aborted = True
                 self._native_outputs_in_flight.pop(req_id, None)
                 self._native_terminal_pending.discard(req_id)
                 # Cancellation must not flush a partially accumulated utterance.

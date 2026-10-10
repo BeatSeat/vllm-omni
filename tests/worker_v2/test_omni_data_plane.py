@@ -105,6 +105,7 @@ def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
 
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished()
+    assert snapshot.aborted is False
     assert snapshot.output_token_ids == [21, 2150]
     torch.testing.assert_close(payload["codes.audio"], torch.cat([first, last]))
     torch.testing.assert_close(payload["codes.ref"], ref)
@@ -122,6 +123,7 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert plane.abort_requests({"internal"}) == 1
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished() and payload is None
+    assert snapshot.aborted is True
     assert _complete(plane, [{"codes.audio": torch.tensor([[3, 4]])}]) == 0
     assert len(plane.record.batches) == 1
     assert not plane._pending_full_payload_send

@@ -597,6 +597,26 @@ def test_cancel_drops_epoch_state_and_stale_request_cannot_publish() -> None:
     assert _codes(payload) == [4218, 4218, 4218, *range(25)]
 
 
+@pytest.mark.parametrize("aborted", [False, True])
+def test_mrv2_abort_terminal_drops_pending_codec_frames(aborted: bool) -> None:
+    """The MRv2 snapshot has no scheduler status; its abort mark must behave like V1's FINISHED_ABORTED."""
+    from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
+
+    manager = _manager()
+    state = _NativeRequestState(request_id="native", external_req_id="native", prompt_token_ids=[0] * 3)
+    pending = state.snapshot(include_token_history=True, sampled_token_ids=[])
+    assert tts2code2wav_async_chunk(manager, _duplex_delta(*range(10)), pending) is None
+    state.finished = True
+    state.aborted = aborted
+    terminal = tts2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=True))
+    if aborted:
+        assert terminal is None
+        assert "native" not in manager.code_prompt_token_ids
+    else:
+        assert terminal is not None
+        assert _codes(terminal)[3:] == list(range(10))
+
+
 @pytest.mark.parametrize("turn_end", [False, True])
 def test_mrv2_sampled_codec_eos_flushes_resumable_segment(turn_end: bool) -> None:
     from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState

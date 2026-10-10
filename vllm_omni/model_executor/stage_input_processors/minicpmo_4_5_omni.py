@@ -275,6 +275,10 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
 
 
 def _is_aborted(request: Any) -> bool:
+    # V1 passes the scheduler request; the MRv2 native transport passes a
+    # snapshot that carries no status and marks a cancelled terminal instead.
+    if getattr(request, "aborted", False) is True:
+        return True
     status_name = getattr(getattr(request, "status", None), "name", "")
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
 

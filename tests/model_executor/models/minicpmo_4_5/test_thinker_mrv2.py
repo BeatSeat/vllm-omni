@@ -137,7 +137,9 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     assert out.multimodal_outputs["duplex_prompt_token_ids"] == [[1, 2, 3], None]
     assert "tts_bos_token_id" in out.multimodal_outputs["meta"]
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
-    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1] is None
+    # Tokenizer constants fill rows that carry none (e.g. an append that built
+    # no unit); a None entry would stick in that request's accumulated meta.
+    assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1].item() == 151703
     # Host-only metadata: a device tensor would cost a blocking H2D per row and key.
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].device.type == "cpu"
 

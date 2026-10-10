@@ -74,21 +74,23 @@ def _duplex_row_outputs(request_infos: list[Any]) -> dict[str, Any]:
     special_rows = [
         info if isinstance(info := duplex_info.get("special_token_ids"), dict) else {} for duplex_info in duplex_rows
     ]
-    special_keys = {
-        key
-        for special in special_rows
-        for key, value in special.items()
-        if isinstance(key, str) and isinstance(value, int) and value >= 0
-    }
-    if special_keys:
+    special_values: dict[str, int] = {}
+    for special in special_rows:
+        for key, value in special.items():
+            if isinstance(key, str) and isinstance(value, int) and value >= 0:
+                special_values.setdefault(key, value)
+    if special_values:
+        # These are tokenizer constants. A row whose append built no unit has
+        # none on MRv2, and a None entry would stay in that request's
+        # accumulated metadata over the values later appends publish.
         # Host tensors: every consumer reads them on the host, and a pageable
         # host->device copy per row and key would wait for the whole forward.
         outputs["meta"] = {
             key: [
-                torch.tensor([value], dtype=torch.long) if isinstance(value, int) and value >= 0 else None
+                torch.tensor([value if isinstance(value, int) and value >= 0 else constant], dtype=torch.long)
                 for value in (special.get(key) for special in special_rows)
             ]
-            for key in sorted(special_keys)
+            for key, constant in sorted(special_values.items())
         }
     return outputs
 

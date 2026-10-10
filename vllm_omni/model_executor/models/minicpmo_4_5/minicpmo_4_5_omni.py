@@ -271,6 +271,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.has_preprocess = (
             self.model_stage == "tts" or not self._use_v2_model_runner or (self.model_stage == "llm" and is_duplex)
         )
+        # The duplex Thinker also serves media chat requests, whose image,
+        # audio and video features come from the native MRv2 encoder.
+        self.preprocess_keeps_mm_inputs = self.model_stage == "llm" and is_duplex and self._use_v2_model_runner
         # Neither AR stage has a postprocess, so step outputs can use the
         # runner's async snapshot instead of a blocking per-step D2H.
         self.use_async_omni_output = self.model_stage in {"llm", "tts"}

@@ -359,8 +359,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
 
-        # Preprocess models own embedding buffers; encoder_runner sizing would mismatch.
-        if getattr(self.model, "has_preprocess", False) and self.supports_mm_inputs:
+        # Preprocess models own embedding buffers; encoder_runner sizing would
+        # mismatch unless the model builds its preprocess on the encoder output.
+        if (
+            getattr(self.model, "has_preprocess", False)
+            and self.supports_mm_inputs
+            and not getattr(self.model_state, "preprocess_keeps_mm_inputs", False)
+        ):
             self.supports_mm_inputs = False
             self.encoder_cache = None
 

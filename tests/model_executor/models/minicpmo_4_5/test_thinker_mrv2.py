@@ -236,6 +236,12 @@ def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
     batch.assert_not_called()
 
 
+@pytest.mark.parametrize("v2,session,keeps", [(True, "duplex", True), (True, "turn", False), (False, "duplex", False)])
+def test_only_the_mrv2_duplex_thinker_keeps_native_multimodal_inputs(mocker, v2, session, keeps):
+    # Chat requests with media share the duplex Thinker; turn MRv2 has no preprocess and V1 encodes first.
+    assert _model(mocker, v2=v2, session=session).preprocess_keeps_mm_inputs is keeps
+
+
 @pytest.mark.parametrize("v2,session", [(True, "turn"), (False, "duplex")])
 def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker, v2, session):
     assert not hasattr(_model(mocker, v2=v2, session=session), "preprocess_batch_mrv2")

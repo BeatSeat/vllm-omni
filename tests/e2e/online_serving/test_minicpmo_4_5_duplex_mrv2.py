@@ -88,3 +88,34 @@ def test_mrv2_duplex_new_session_during_long_response(omni_server):
         assert str(result["transcript"]).strip(), result
     assert first["audio_bytes"] > 96_000, first
     assert str(first["transcript"]).strip() != str(second["transcript"]).strip()
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
+def test_mrv2_duplex_server_answers_image_chat_from_the_image(omni_server, openai_client):
+    """The duplex Thinker also serves /v1/chat/completions: its image features must reach the prompt."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (224, 224), (255, 0, 0)).save(buffer, format="JPEG")
+    image_url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    request_config = {
+        "model": omni_server.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": "What color is this image? Answer with one word."},
+                ],
+            }
+        ],
+        "stream": True,
+        "modalities": ["text"],
+        "key_words": {"text": ["red"]},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+    }
+    openai_client.send_omni_request(request_config)

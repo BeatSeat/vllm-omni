@@ -194,44 +194,35 @@ def test_duplex_turn_end_waits_for_terminal_codec_flush() -> None:
     assert final.meta.turn_end is True
 
 
-def test_duplex_final_segment_preserves_all_codec_steps_and_flushes_once() -> None:
-    manager = _manager()
-    request = _request("req-duplex")
-    chunks = []
-    for start in (0, 25):
-        chunk = tts2code2wav_async_chunk(
-            manager, _duplex_delta(*range(start, start + 25), turn_end=True), request, False
-        )
-        assert chunk is not None
-        assert chunk.meta.last_chunk is False
-        assert chunk.meta.turn_end is False
-        chunks.append(chunk)
-
-    assert tts2code2wav_async_chunk(manager, _duplex_delta(50, 51, turn_end=True), request, False) is None
-    final = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
-    assert final is not None
-    chunks.append(final)
-    # Each payload includes three left-context frames (silence on the first).
-    assert [code for chunk in chunks for code in _codes(chunk)[3:]] == list(range(52))
-    assert sum(chunk.meta.last_chunk for chunk in chunks) == 1
-    assert final.meta.turn_end is True
-    duplicate = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
-    assert duplicate is not None
-    assert duplicate.codes is None
-    assert not duplicate.meta.last_chunk
-
-
-@pytest.mark.parametrize("frame_count", [1, 24, 25, 26, 60])
-def test_duplex_final_segment_preserves_every_code_and_closes_once(frame_count: int) -> None:
+@pytest.mark.parametrize(
+    "frame_count,delta_frames,body_chunks",
+    [
+        # Single-frame deltas across the 25-frame chunk boundary.
+        (1, 1, 0),
+        (24, 1, 0),
+        (25, 1, 1),
+        (26, 1, 1),
+        (60, 1, 2),
+        # Batched deltas: two full chunks, then a short tail held for the final flush.
+        (52, 25, 2),
+    ],
+)
+def test_duplex_final_segment_preserves_every_code_and_closes_once(
+    frame_count: int, delta_frames: int, body_chunks: int
+) -> None:
     manager = _manager()
     request = _request("final-segment")
     emitted = []
-    for code in range(frame_count):
-        payload = tts2code2wav_async_chunk(manager, _duplex_delta(code, turn_end=True), request, False)
+    bodies = 0
+    for start in range(0, frame_count, delta_frames):
+        codes = range(start, min(start + delta_frames, frame_count))
+        payload = tts2code2wav_async_chunk(manager, _duplex_delta(*codes, turn_end=True), request, False)
         if payload is not None:
             assert payload.meta.last_chunk is False
             assert payload.meta.turn_end is False
+            bodies += 1
             emitted.extend(_codes(payload)[payload.meta.codec_left_context_frames :])
+    assert bodies == body_chunks
 
     final = tts2code2wav_async_chunk(manager, _duplex_delta(turn_end=True), request, True)
     assert final is not None

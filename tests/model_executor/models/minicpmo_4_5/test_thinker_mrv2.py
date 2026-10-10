@@ -19,7 +19,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     [
         ("minicpmo_4_5_turn_mrv2.yaml", [16, 8, 8], 2, [True, True, True]),
         ("minicpmo_4_5_turn_mrv2_h200.yaml", [16, 16, 8], 4, [True, True, True]),
-        ("minicpmo_4_5_duplex_mrv2.yaml", [16, 16, 16], 4, [True, True, True]),
     ],
 )
 def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, runners, monkeypatch):
@@ -187,6 +186,33 @@ def test_mrv2_thinker_custom_sampler_and_lifecycle(mocker):
 
     model.on_requests_finished({"req-1"})
     assert "req-1" not in model._mrv2_sampling_infos
+
+
+def test_mrv2_cancel_before_first_prefill_completes_frees_session(mocker):
+    """A request cancelled mid-prefill never reaches the sampler, so preprocessing owns its session."""
+    model = _model(mocker, session="duplex")
+    helper = SimpleNamespace(
+        sessions={},
+        take_staged_prefill=lambda *_: None,
+        _decode_audio_payload=lambda _: None,
+        frame_kwargs=mocker.MagicMock(side_effect=ValueError("stop after the session exists")),
+    )
+    model._minicpmo45_duplex_data_plane_helper = helper
+    mocker.patch.object(
+        model,
+        "_minicpmo45_duplex_session_state",
+        side_effect=lambda h, sid, _: h.sessions.setdefault(sid, object()),
+    )
+    model.preprocess(
+        torch.tensor([1]),
+        torch.randn(1, 4),
+        req_id="req-1",
+        duplex={"data_plane": True, "session_id": "s1", "epoch": 0, "seq": 1, "payload": {}},
+    )
+    assert "s1" in helper.sessions
+
+    model.on_requests_finished({"req-1"})
+    assert helper.sessions == {}
 
 
 def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):

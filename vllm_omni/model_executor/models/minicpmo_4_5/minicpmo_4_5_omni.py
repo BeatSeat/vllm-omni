@@ -322,11 +322,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_row_sessions = {
             row.row_idx: row.session_id for row in rows if row.session_id is not None
         }
-        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
-        if not isinstance(request_sessions, dict):
-            request_sessions = {}
-            self._minicpmo45_duplex_request_sessions = request_sessions
-        request_sessions.update({row.request_id: row.session_id for row in rows if row.session_id is not None})
+        self._minicpmo45_duplex_request_session_map().update(
+            {row.request_id: row.session_id for row in rows if row.session_id is not None}
+        )
         self._minicpmo45_duplex_row_payloads = {row.row_idx: row.payload for row in rows if row.payload is not None}
         self._minicpmo45_duplex_row_max_tokens = {
             row.row_idx: row.max_tokens for row in rows if row.max_tokens is not None
@@ -507,6 +505,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # A deferred sample of this session updates the latches its append reads.
         self._commit_minicpmo45_duplex_pending_samples(session_ids={session_id})
         state = self._minicpmo45_duplex_session_state(helper, session_id, duplex)
+        req_id = kwargs.get("req_id")
+        if req_id is not None:
+            # Own the session from its first append: MRv2 samples no partial
+            # prefill row, so a request cancelled mid-prefill never reaches
+            # prepare_duplex_sampling and on_requests_finished must still free it.
+            self._minicpmo45_duplex_request_session_map()[str(req_id)] = session_id
         prefill_kwargs = self._minicpmo45_duplex_prefill_kwargs(duplex, payload)
         seq = prefill_kwargs["seq"]
         result = helper.take_staged_prefill(state, prefill_kwargs["epoch"], seq)
@@ -677,6 +681,14 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         }
         if buffers:
             self.preprocess_batch(req_ids=list(buffers), model_intermediate_buffer=buffers, device=device)
+
+    def _minicpmo45_duplex_request_session_map(self) -> dict[str, str]:
+        """Request id -> Stage-0 session id, read by ``on_requests_finished`` to free the session."""
+        request_sessions = getattr(self, "_minicpmo45_duplex_request_sessions", None)
+        if not isinstance(request_sessions, dict):
+            request_sessions = {}
+            self._minicpmo45_duplex_request_sessions = request_sessions
+        return request_sessions
 
     def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
         """The Stage-0 state of ``session_id``, created with its session context on first use."""

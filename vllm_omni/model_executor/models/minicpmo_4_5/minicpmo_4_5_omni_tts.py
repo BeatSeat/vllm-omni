@@ -1047,7 +1047,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={
-                "codes": {"audio": token_ids.to(dtype=torch.long).reshape(num_tokens, 1)},
+                "codes": {"audio": token_ids.to(dtype=torch.long, copy=True).reshape(num_tokens, 1)},
                 "meta": meta_outputs,
             },
         )

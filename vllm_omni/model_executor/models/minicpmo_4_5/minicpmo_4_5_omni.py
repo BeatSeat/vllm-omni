@@ -273,6 +273,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # runner's async snapshot instead of a blocking per-step D2H.
         self.use_async_omni_output = self.model_stage in {"llm", "tts"}
 
+        if self.model_stage == "llm" and is_duplex and self._use_v2_model_runner:
+            # Only the duplex Thinker exposes the MRv2 batch-preprocess hook.
+            self.preprocess_batch_mrv2 = self._preprocess_batch_mrv2
+
         if self.model_stage == "llm" and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex":
             # Build the Stage-0 duplex runtime (remote-code processor and
             # tokenizer) with the model. Built lazily, it costs several seconds
@@ -659,6 +663,21 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if len(staged) >= 2:
             helper.stage_prefill_batch(staged)
 
+    def _preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
+        """MRv2 ``preprocess_batch_mrv2`` hook (prefill rows only): ``preprocess_batch``'s cross-session batching.
+
+        Without it MRv2 builds every duplex append in ``preprocess`` one session
+        at a time: one batch-1 streaming-encoder pass per unit and no shared
+        vision-tower call for camera frames.
+        """
+        buffers = {
+            str(info["req_id"]): info
+            for info in req_infos
+            if isinstance(info, dict) and info.get("req_id") is not None and isinstance(info.get("duplex"), dict)
+        }
+        if buffers:
+            self.preprocess_batch(req_ids=list(buffers), model_intermediate_buffer=buffers, device=device)
+
     def _minicpmo45_duplex_session_state(self, helper, session_id: str, duplex: dict[str, Any]):
         """The Stage-0 state of ``session_id``, created with its session context on first use."""
         state = helper.sessions.get(session_id)
@@ -850,12 +869,27 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if model_intermediate_buffer and any(
             isinstance(info, dict) and info.get("duplex") for info in model_intermediate_buffer
         ):
-            multimodal_outputs.update(_duplex_row_outputs(model_intermediate_buffer))
+            # The prompt snapshot and special ids change only with an append,
+            # and the output accumulator keeps the last value of a missing key.
+            # Publish them on steps that complete an append's prefill instead
+            # of copying every row's whole prompt on every decode step.
+            num_reqs = int(input_batch.num_reqs)
+            completes_prefill = input_batch.is_prefilling_np[:num_reqs] & (
+                input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+                >= input_batch.prefill_len_np[:num_reqs]
+            )
+            if completes_prefill.any():
+                multimodal_outputs.update(_duplex_row_outputs(model_intermediate_buffer))
 
         return OmniOutput(
             text_hidden_states=model_outputs,
             multimodal_outputs=multimodal_outputs,
         )
+
+    @property
+    def mm_outputs_fresh_per_step(self) -> bool:
+        """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
+        return self.model_stage == "tts" and self._use_v2_model_runner
 
     def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
         if self.model_stage == "tts":

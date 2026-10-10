@@ -159,8 +159,15 @@ class MiniCPMO45DuplexSampler(OmniSampler):
             >= int(input_batch.prefill_len_np[row.row_idx])
         )
         metadata = self._metadata(input_batch, rows, infos, logits.device) if rows else None
-        selected = index_to_device([row.row_idx for row in rows], logits.device)
-        policy_logits = logits.index_select(0, selected)
+        row_idxs = [row.row_idx for row in rows]
+        if logits.shape[0] == input_batch.num_reqs and row_idxs == list(range(input_batch.num_reqs)):
+            # Every row follows the policy: skip the index upload and the
+            # full-vocabulary gather. As on V1, the policy's force-listen mask
+            # then lands on the logits a fallback sampler would read.
+            selected, policy_logits = None, logits
+        else:
+            selected = index_to_device(row_idxs, logits.device)
+            policy_logits = logits.index_select(0, selected)
         self.model.prepare_duplex_sampling(
             policy_logits, metadata, tuple(replace(row, row_idx=i) for i, row in enumerate(rows))
         )

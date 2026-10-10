@@ -253,3 +253,35 @@ def test_thinker_reuses_policy_snapshot_without_another_device_copy(mocker):
     assert sampler._histories["a"][1] == [7]
     assert sampler._histories["b"][1] == [9]
     pending.event.synchronize.assert_called_once()
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("all_policy_rows", [True, False])
+def test_thinker_policy_reads_logits_in_place_when_every_row_is_duplex(mocker, all_policy_rows):
+    params = SamplingParams(temperature=0.0)
+    infos = {"a": {"duplex": {"data_plane": True, "session_id": "s"}, "sampling_params": params}}
+    infos["b"] = dict(infos["a"]) if all_policy_rows else {"sampling_params": params}
+    model = SimpleNamespace(_mrv2_sampling_infos=infos, prepare_duplex_sampling=mocker.Mock(), sample=mocker.Mock())
+    model.sample.return_value = None  # the stock sampler takes over
+    states = SimpleNamespace(prompt_len=SimpleNamespace(np=np.array([4, 4])))
+    batch = SimpleNamespace(
+        req_ids=["a", "b"],
+        num_reqs=2,
+        num_draft_tokens=0,
+        idx_mapping_np=np.array([0, 1]),
+        is_prefilling_np=np.array([False, False]),
+        num_computed_tokens_np=np.array([3, 3]),
+        num_scheduled_tokens=np.array([1, 1]),
+    )
+    base = mocker.Mock(return_value="stock")
+    base.req_states = states
+    sampler = MiniCPMO45DuplexSampler(base, model)
+    logits = torch.randn(2, 8)
+    assert sampler(logits, batch) == "stock"
+    policy_logits = model.prepare_duplex_sampling.call_args.args[0]
+    if all_policy_rows:
+        assert policy_logits is logits
+    else:
+        assert policy_logits is not logits
+        torch.testing.assert_close(policy_logits, logits[:1])
+    assert base.call_args.args[0] is logits

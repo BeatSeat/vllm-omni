@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -105,10 +106,16 @@ def test_row_ledger_uses_live_batch_after_replay(mocker):
 def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     model = _model(mocker, session="duplex")
     assert model.has_preprocess is True
+    # Row "a" completes its append prefill on this step; row "b" decodes.
     batch = SimpleNamespace(
         req_ids=["a", "b"],
+        num_reqs=2,
         input_ids=torch.tensor([101, 102]),
         positions=torch.tensor([0, 1]),
+        is_prefilling_np=np.array([True, False]),
+        num_computed_prefill_tokens_np=np.array([2, 0]),
+        num_scheduled_tokens=np.array([1, 1]),
+        prefill_len_np=np.array([3, 5]),
     )
     hidden = torch.randn(2, 8)
     buffers = [
@@ -134,6 +141,18 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1] is None
     # Host-only metadata: a device tensor would cost a blocking H2D per row and key.
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].device.type == "cpu"
+
+    # Pure decode steps leave the accumulated prompt/meta snapshot untouched.
+    batch.is_prefilling_np = np.array([False, False])
+    out = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=buffers,
+    )
+    assert "duplex_prompt_token_ids" not in out.multimodal_outputs
+    assert "meta" not in out.multimodal_outputs
+    assert out.multimodal_outputs["latent"] is hidden
 
 
 def test_mrv2_turn_thinker_retains_native_multimodal_path(mocker):
@@ -168,3 +187,27 @@ def test_mrv2_thinker_custom_sampler_and_lifecycle(mocker):
 
     model.on_requests_finished({"req-1"})
     assert "req-1" not in model._mrv2_sampling_infos
+
+
+def test_mrv2_duplex_thinker_batches_prefill_appends(mocker):
+    """MRv2 hands its prefill rows to the V1 cross-session ``preprocess_batch``."""
+    model = _model(mocker, session="duplex")
+    batch = mocker.patch.object(model, "preprocess_batch")
+    infos = [
+        {"req_id": "a", "duplex": {"data_plane": True, "session_id": "s1"}},
+        {"req_id": "b", "duplex": {"data_plane": True, "session_id": "s2"}},
+        {"req_id": "c"},  # not a duplex row
+        {},
+    ]
+    model.preprocess_batch_mrv2(req_infos=infos, device=torch.device("cpu"))
+    kwargs = batch.call_args.kwargs
+    assert kwargs["req_ids"] == ["a", "b"]
+    assert kwargs["model_intermediate_buffer"] == {"a": infos[0], "b": infos[1]}
+    batch.reset_mock()
+    model.preprocess_batch_mrv2(req_infos=[{"req_id": "c"}], device=torch.device("cpu"))
+    batch.assert_not_called()
+
+
+@pytest.mark.parametrize("v2,session", [(True, "turn"), (False, "duplex")])
+def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker, v2, session):
+    assert not hasattr(_model(mocker, v2=v2, session=session), "preprocess_batch_mrv2")

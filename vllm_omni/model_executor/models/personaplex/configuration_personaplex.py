@@ -227,6 +227,16 @@ class PersonaPlexConfig(PretrainedConfig):
         num_audio_codebooks: int = 16,
         mimi_name: str | None = None,
         mimi_cuda_graphs: bool = False,
+        mimi_encode_stream: bool = False,
+        mimi_encoder_hoist_frame: bool = False,
+        mimi_encoder_attention: str = "sdpa",
+        mimi_encoder_fused_kernels: bool = False,
+        mimi_encoder_tf32_linears: bool = False,
+        depformer_cuda_graphs: bool = False,
+        depformer_kv_buffer: bool = False,
+        depformer_fused_norm: bool = False,
+        depformer_decode_attention: bool = False,
+        mimi_decode_tf32: bool = True,
         **kwargs: Any,
     ) -> None:
         if temporal_config is None:
@@ -263,6 +273,16 @@ class PersonaPlexConfig(PretrainedConfig):
             self.mimi_config.mimi_name = mimi_name
         self.mimi_name = self.mimi_config.mimi_name
         self.mimi_cuda_graphs = mimi_cuda_graphs
+        self.mimi_encode_stream = mimi_encode_stream
+        self.mimi_encoder_hoist_frame = mimi_encoder_hoist_frame
+        self.mimi_encoder_attention = mimi_encoder_attention
+        self.mimi_encoder_fused_kernels = mimi_encoder_fused_kernels
+        self.mimi_encoder_tf32_linears = mimi_encoder_tf32_linears
+        self.depformer_cuda_graphs = depformer_cuda_graphs
+        self.depformer_kv_buffer = depformer_kv_buffer
+        self.depformer_fused_norm = depformer_fused_norm
+        self.depformer_decode_attention = depformer_decode_attention
+        self.mimi_decode_tf32 = mimi_decode_tf32
 
     @staticmethod
     def _coerce(value: Any, config_cls: type[PretrainedConfig]) -> PretrainedConfig:

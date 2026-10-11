@@ -1,0 +1,30 @@
+# Opt-in CUDA Model Runner V2 profile for PersonaPlex full-duplex serving.
+# Stage 0 (Talker) and Stage 1 (Code2Wav) opt into MRv2 while retaining
+# native streaming Mimi encoder/decoder CUDA graphs, acoustic de-delay,
+# and shared-memory chunk streaming.
+base_config: personaplex.yaml
+
+session_mode: duplex
+model_runner: v2
+
+stages:
+  - stage_id: 0
+    # Stage 0 talker on MRv2
+    async_scheduling: false
+    hf_overrides:
+      mimi_cuda_graphs: true
+  - stage_id: 1
+    # Stage 1 Code2Wav (Mimi decoder) on MRv2
+    async_scheduling: true
+    hf_overrides:
+      mimi_cuda_graphs: true
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

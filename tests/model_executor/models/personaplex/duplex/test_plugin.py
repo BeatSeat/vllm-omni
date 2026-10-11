@@ -108,6 +108,30 @@ def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stage
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 
+def test_the_perf_switches_deploy_changes_only_stage0_hf_overrides_to_real_switches() -> None:
+    import inspect
+
+    default = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH))
+    switched = merge_pipeline_deploy(
+        PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH.with_name("personaplex_perf_switches.yaml"))
+    )
+    overrides = switched[0].yaml_engine_args["hf_overrides"]
+
+    # PersonaPlexConfig takes **kwargs, so a misspelled switch would be ignored silently.
+    assert set(overrides) <= set(inspect.signature(PersonaPlexConfig.__init__).parameters)
+    assert all(
+        overrides[key] == value
+        for key, value in default[0].yaml_engine_args["hf_overrides"].items()
+        if key != "mimi_encode_stream"
+    )
+
+    def without_overrides(args: dict[str, object]) -> dict[str, object]:
+        return {key: value for key, value in args.items() if key != "hf_overrides"}
+
+    assert without_overrides(switched[0].yaml_engine_args) == without_overrides(default[0].yaml_engine_args)
+    assert switched[1].yaml_engine_args == default[1].yaml_engine_args
+
+
 def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_path: Path) -> None:
     # The checkpoint ships an empty config.json; each stage's engine args build
     # its PersonaPlexConfig from that plus the deploy YAML's hf_overrides.

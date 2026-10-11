@@ -1,0 +1,34 @@
+# PersonaPlex with Stage 0's opt-in performance switches on, for A/B runs
+# against personaplex.yaml. Only Stage 0's hf_overrides differ; every switch
+# below defaults off there.
+#
+# Bitwise equal to the default path (codes checked on the real checkpoint at
+# every graph size):
+#   * depformer_kv_buffer, depformer_fused_norm: depformer step at 80 rows on
+#     an A100, 8.62 -> 6.75 ms.
+#   * mimi_encoder_hoist_frame, mimi_encoder_fused_kernels: encode graph at
+#     80 rows, 7.17 -> 6.09 ms.
+# mimi_encode_stream is off: at 80 sessions on one A800 the encode on its own
+# stream lost to the encode on the step stream (2/2 runs failed vs 4/5 passed).
+#
+# Close to, not bitwise equal with, the default path (a small share of codes
+# differs, below the 2-3 % that a change of batch size already flips); add them
+# for a quality eval:
+#   depformer_decode_attention: true      # depformer 6.75 -> 4.42 ms
+#   mimi_encoder_attention: triton        # encode 6.09 -> 5.31 ms
+#   mimi_encoder_tf32_linears: true       # encode 5.31 -> 4.33 ms
+#
+# A stage's hf_overrides replace, not extend, the base's, so the base's own
+# switches are repeated here.
+base_config: personaplex.yaml
+
+stages:
+  - stage_id: 0
+    hf_overrides:
+      mimi_cuda_graphs: true
+      mimi_encode_stream: false
+      depformer_cuda_graphs: true
+      depformer_kv_buffer: true
+      depformer_fused_norm: true
+      mimi_encoder_hoist_frame: true
+      mimi_encoder_fused_kernels: true

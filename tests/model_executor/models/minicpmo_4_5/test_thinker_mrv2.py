@@ -129,3 +129,35 @@ def test_mrv2_thinker_duplex_output_and_prompt_rows(mocker):
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][0].item() == 151703
     assert out.multimodal_outputs["meta"]["tts_bos_token_id"][1] is None
 
+
+def test_mrv2_thinker_duplex_rebase_and_incremental_prefill_meta(mocker):
+    model = _model(mocker, session="duplex")
+    batch = SimpleNamespace(
+        input_ids=torch.tensor([101, 102]),
+        positions=torch.tensor([0, 1]),
+    )
+    hidden = torch.randn(2, 8)
+    buffers = [
+        {
+            "duplex": {
+                "duplex_prompt_token_ids": [1, 2],
+                "position_base": 256,
+                "incremental_prefill": True,
+            }
+        },
+        {
+            "duplex": {
+                "position_base": 0,
+                "incremental_prefill": False,
+            }
+        },
+    ]
+    out = model.make_omni_output_mrv2(
+        hidden,
+        input_batch=batch,
+        req_states=None,
+        model_intermediate_buffer=buffers,
+    )
+    assert out.multimodal_outputs["position_base"] == [256, 0]
+    assert out.multimodal_outputs["incremental_prefill"] == [True, False]
+

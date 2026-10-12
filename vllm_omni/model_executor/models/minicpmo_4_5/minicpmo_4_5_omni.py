@@ -426,6 +426,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         prompt_len_meta = kwargs.get("duplex_prompt_len")
         token_offset_meta = kwargs.get("duplex_token_offset", 0)
+        position_base = int(kwargs.get("duplex_position_base", 0) or 0)
         if (
             isinstance(prompt_len_meta, int)
             and isinstance(token_offset_meta, int)
@@ -437,7 +438,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # would come up empty and pad-fill, feeding a </unit> embedding in
             # place of every sampled token and corrupting generation.
             embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
-            return input_ids, embeds, {}
+            return input_ids, embeds, {"duplex": {"position_base": position_base}}
 
         helper = self._duplex_data_plane_helper()
         session_id = str(duplex.get("session_id") or "")
@@ -542,6 +543,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             update_result["duplex_prompt_token_ids"] = full_input_token_ids
         else:
             req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
+        update_result["position_base"] = position_base
+        if bool(payload.get("incremental_prefill", False)):
+            update_result["incremental_prefill"] = True
         return req_input_ids, req_embeds, {"duplex": update_result}
 
     def preprocess_batch(
@@ -842,11 +846,19 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 duplex_rows.append(duplex_info if isinstance(duplex_info, dict) else {})
 
             prompt_rows = []
+            position_base_rows = []
+            incremental_rows = []
             for duplex_info in duplex_rows:
                 prompt_token_ids = duplex_info.get("duplex_prompt_token_ids")
                 prompt_rows.append(list(prompt_token_ids) if isinstance(prompt_token_ids, list) else None)
+                position_base_rows.append(int(duplex_info.get("position_base", 0) or 0))
+                incremental_rows.append(bool(duplex_info.get("incremental_prefill", False)))
             if any(row is not None for row in prompt_rows):
                 multimodal_outputs["duplex_prompt_token_ids"] = prompt_rows
+            if any(base > 0 for base in position_base_rows):
+                multimodal_outputs["position_base"] = position_base_rows
+            if any(incremental_rows):
+                multimodal_outputs["incremental_prefill"] = incremental_rows
 
             special_keys = {
                 key

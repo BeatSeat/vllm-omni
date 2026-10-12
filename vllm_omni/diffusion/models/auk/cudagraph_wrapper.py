@@ -59,6 +59,15 @@ class AuKCUDAGraphWrapper:
     _TARGET_ALIGNMENT = 32
     _TEXT_ALIGNMENT = 32
     _REF_ALIGNMENT = 50
+    _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+
+    @classmethod
+    def _batch_bucket(cls, batch_size: int) -> int:
+        """Find the smallest batch ladder step >= batch_size."""
+        for b in cls._BATCH_LADDER:
+            if batch_size <= b:
+                return b
+        return batch_size
 
     def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
         self.dit = dit
@@ -328,7 +337,8 @@ class AuKCUDAGraphWrapper:
         x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
             x, text, c_mask, ref, ref_mask
         )
-        key = (x_buck.shape[0], x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
+        batch_bucket = self._batch_bucket(x_buck.shape[0])
+        key = (batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
         if key in self._uncapturable_loop_keys:
             return self._run_eager_loop(
                 x=x,
@@ -343,10 +353,17 @@ class AuKCUDAGraphWrapper:
         hit_key = key if entry is not None else None
         if entry is None:
             hit_key, entry = self._larger_loop_entry(
-                x_buck.shape[0], x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps
+                batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps
             )
         if entry is None:
             self._retire_graph_generation_if_full()
+            if batch_bucket > x_buck.shape[0]:
+                x_buck = self._pad_batch_time(x_buck, batch_bucket, x_buck.shape[1])
+                x_mask = self._pad_batch_time(x_mask, batch_bucket, x_mask.shape[1], mask=True)
+                text_buck = self._pad_batch_time(text_buck, batch_bucket, text_buck.shape[1])
+                c_mask_buck = self._pad_batch_time(c_mask_buck, batch_bucket, c_mask_buck.shape[1], mask=True)
+                ref_buck = self._pad_batch_time(ref_buck, batch_bucket, ref_buck.shape[1])
+                ref_mask_buck = self._pad_batch_time(ref_mask_buck, batch_bucket, ref_mask_buck.shape[1], mask=True)
             ctx = self._prepare(
                 x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
             )

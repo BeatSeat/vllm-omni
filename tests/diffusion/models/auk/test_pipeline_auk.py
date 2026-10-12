@@ -637,6 +637,41 @@ class TestRequestParsing:
         pipeline.forward(_batch(_prompt(audio=_silence(1.0), knobs={"gen_seconds": 1.0}), seed=1))
         assert states == [True]
 
+    def test_mixed_target_lengths_batch_together_and_slice_correctly(self, build_pipeline):
+        pipeline, calls = build_pipeline()
+        # 2.9s -> round(2.9*50) = 145 frames; 3.1s -> round(3.1*50) = 155 frames
+        # Both round up to target_bucket = round_up(..., 32) = 160 frames!
+        req1 = _batch(
+            _prompt(audio=_silence(0.5), knobs={"gen_seconds": 2.9}),
+            seed=7,
+            output_type="latent",
+        ).requests[0]
+        req2 = _batch(
+            _prompt(audio=_silence(0.5), knobs={"gen_seconds": 3.1}),
+            seed=11,
+            output_type="latent",
+        ).requests[0]
+
+        outputs = pipeline.forward(DiffusionRequestBatch([req1, req2]))
+
+        # Both should be batched together in a SINGLE sampler call
+        assert len(calls) == 1
+        assert calls[0]["text"].shape[0] == 2
+        assert calls[0]["gen_frames"] == 160  # target_bucket
+
+        # Each request must get sliced to its own exact requested frame count
+        expected_f1 = int(round(2.9 * SAMPLE_RATE / HOP))  # 145
+        expected_f2 = int(round(3.1 * SAMPLE_RATE / HOP))  # 155
+        assert outputs[0].output.shape == (1, expected_f1, LATENT_DIM)
+        assert outputs[1].output.shape == (1, expected_f2, LATENT_DIM)
+
+        expected_latents1 = torch.randn(1, 160, LATENT_DIM, generator=torch.Generator().manual_seed(7))[:, :expected_f1]
+        expected_latents2 = torch.randn(1, 160, LATENT_DIM, generator=torch.Generator().manual_seed(11))[
+            :, :expected_f2
+        ]
+        torch.testing.assert_close(outputs[0].output, expected_latents1, atol=0, rtol=0)
+        torch.testing.assert_close(outputs[1].output, expected_latents2, atol=0, rtol=0)
+
 
 def _reference_audio_path(messages: list[dict[str, Any]]) -> str:
     for message in messages:

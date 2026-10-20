@@ -213,7 +213,7 @@ def vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor):
     hidden_states = self.patch_embed(hidden_states)
     pos_embeds, position_embeddings, cu_seqlens = self.preprocess_grid_thw(grid_thw)
 
-    hidden_states = hidden_states + pos_embeds
+    hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
 

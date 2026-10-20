@@ -75,6 +75,7 @@ class LingBotVLAV2Config:
     use_lm_head: bool = False
     use_cache: bool = True
     qwen3vl_use_vision_boundaries: bool = True
+    use_cuda_graph: bool = True
     align_params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):

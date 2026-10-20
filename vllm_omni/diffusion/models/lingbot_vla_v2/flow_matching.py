@@ -38,8 +38,9 @@ class FlowMatching(nn.Module):
         bsize = state.shape[0]  # state_bs = img_bs
         device = state.device
         dtype = state.dtype
-        _fp32 = self.config.action_fp32
-        # embed state
+        w_dtype = self.action_in_proj.weight.dtype
+        noisy_actions = noisy_actions.to(w_dtype)
+        _fp32 = getattr(self.config, "action_fp32", False)
         state_emb = self._fp32_linear(self.state_proj, state) if _fp32 else self.state_proj(state)
 
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
@@ -50,7 +51,7 @@ class FlowMatching(nn.Module):
             max_period=4.0,
             device=device,
         )
-        time_emb = time_emb.type(dtype=dtype)
+        time_emb = time_emb.type(dtype=w_dtype)
 
         time_emb_ori = time_emb
 
@@ -183,6 +184,20 @@ class FlowMatching(nn.Module):
                 raise ValueError(f"Expected noise shape {shape}, got {tuple(noise.shape)}")
             x_t = noise.to(device=state.device, dtype=state.dtype).clone()
         masks, positions, kv = self._embed_and_fill_prefix(images, img_masks, lang_tokens, lang_masks, image_grid_thw)
+        use_graph = (
+            getattr(self.config, "use_cuda_graph", False)
+            and state.is_cuda
+            and state.shape[0] == 1
+        )
+        if use_graph:
+            from .cudagraph import LingBotActionLoopCUDAGraph
+            runner = getattr(self, "_action_graph_runner", None)
+            if runner is None or runner.num_steps != steps or runner.device != state.device:
+                runner = LingBotActionLoopCUDAGraph(self, batch_size=state.shape[0], num_steps=steps, device=state.device)
+                runner.capture(state, masks, kv, positions)
+                self._action_graph_runner = runner
+            return runner.replay(state, masks, kv, positions, noise=x_t)
+
         dt = torch.tensor(-1.0 / steps, device=state.device, dtype=state.dtype)
         time = torch.tensor(1.0, device=state.device, dtype=state.dtype)
         cache = {}

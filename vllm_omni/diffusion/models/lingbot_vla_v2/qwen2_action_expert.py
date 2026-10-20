@@ -152,6 +152,9 @@ class AdaRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.gamma = nn.Linear(cond_dim, hidden_size)
         self.beta = nn.Linear(cond_dim, hidden_size)
+        self.register_buffer("_fused_gb_weight", None, persistent=False)
+        self.register_buffer("_fused_gb_bias", None, persistent=False)
+        self._fused_gb_version = None
 
         # Zero-initialized modulation starts as a plain RMSNorm.
         nn.init.zeros_(self.gamma.weight)
@@ -159,17 +162,26 @@ class AdaRMSNorm(nn.Module):
         nn.init.zeros_(self.beta.weight)
         nn.init.zeros_(self.beta.bias)
 
+    def _get_fused_gb(self):
+        v = (self.gamma.weight._version, self.beta.weight._version)
+        if self._fused_gb_weight is None or self._fused_gb_version != v:
+            with torch.no_grad():
+                self._fused_gb_weight = torch.cat([self.gamma.weight, self.beta.weight], dim=0)
+                self._fused_gb_bias = torch.cat([self.gamma.bias, self.beta.bias], dim=0)
+            self._fused_gb_version = v
+        return self._fused_gb_weight, self._fused_gb_bias
+
     def forward(self, hidden_states, cond):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        normed = (hidden_states * torch.rsqrt(variance + self.variance_epsilon) * self.weight.to(torch.float32)).to(input_dtype)
 
-        hidden_states = self.weight * hidden_states
-        cond = cond.to(torch.float32)
-        gamma = self.gamma(cond).unsqueeze(1)  # [B, 1, H]
-        beta = self.beta(cond).unsqueeze(1)  # [B, 1, H]
-        hidden_states = (1 + gamma.to(torch.float32)) * hidden_states + beta.to(torch.float32)
+        w_gb, b_gb = self._get_fused_gb()
+        cond_in = cond.to(w_gb.dtype)
+        gb = F.linear(cond_in, w_gb, b_gb).unsqueeze(1)
+        gamma, beta = gb.split(self.weight.shape[0], dim=-1)
+        hidden_states = (1.0 + gamma) * normed + beta
         return hidden_states.to(input_dtype)
 
 

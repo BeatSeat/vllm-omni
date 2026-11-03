@@ -27,10 +27,12 @@ previous KV-cache loop -- causal attention, only the last position is read.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorBaseModel,
@@ -38,6 +40,9 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
 from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalTransformerConfig,
 )
+
+logger = init_logger(__name__)
+_MAX_LOCAL_CUDA_GRAPHS = 16
 
 
 class MossTTSRealtimeLocalTransformer(nn.Module):
@@ -65,6 +70,12 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
             use_parallel_embedding=False,
             prefix="model",
         )
+        self.register_buffer("_pos_ids", torch.arange(cfg.rvq, dtype=torch.long).unsqueeze(0), persistent=False)
+        self._cuda_graphs: dict[
+            tuple[Any, ...],
+            tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._uncapturable_keys: set[tuple[Any, ...]] = set()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Delegate ``model.*`` tensors to ``CodePredictorBaseModel.load_weights``.
@@ -82,6 +93,71 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         loaded = self.model.load_weights(iter(model_weights))
         return {f"model.{n}" for n in loaded}
 
+    def _populate_rep_mask(
+        self,
+        rep_mask: torch.Tensor,
+        *,
+        history_tensors: Sequence[torch.Tensor | None] | None,
+        history_per_codebook: list[list[int]] | None,
+    ) -> bool:
+        rvq = self.config.rvq
+        vocab_size = self.config.audio_vocab_size
+        device = rep_mask.device
+        has_any = False
+        if history_tensors is not None:
+            for b, t in enumerate(history_tensors):
+                if b >= rep_mask.shape[0] or not isinstance(t, torch.Tensor) or t.numel() == 0:
+                    continue
+                tail = t if (t.device == device and t.dtype == torch.long) else t.to(device=device, dtype=torch.long)
+                if tail.dim() == 1 and tail.numel() % rvq == 0:
+                    tail = tail.view(-1, rvq)
+                if tail.dim() == 2 and tail.shape[1] == rvq:
+                    rep_mask[b].scatter_(1, tail.t().clamp(0, vocab_size - 1), True)
+                    has_any = True
+        elif history_per_codebook is not None:
+            for step in range(min(rvq, len(history_per_codebook))):
+                hist = history_per_codebook[step]
+                if hist:
+                    hist_t = torch.tensor(hist, dtype=torch.long, device=device).clamp_(0, vocab_size - 1)
+                    rep_mask[:, step, :].scatter_(1, hist_t.unsqueeze(0).expand(rep_mask.shape[0], -1), True)
+                    has_any = True
+        return has_any
+
+    def _run_loop(
+        self,
+        embeds: torch.Tensor,
+        pos_ids_full: torch.Tensor,
+        rep_mask: torch.Tensor | None,
+        codes: torch.Tensor,
+        lm_heads: nn.ModuleList,
+        *,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        do_sample: bool,
+        repetition_penalty: float,
+    ) -> None:
+        rvq = self.config.rvq
+        hidden_size = self.config.hidden_size
+        B = embeds.shape[0]
+        codec_embeds = self.model.codec_embedding
+        apply_rep = rep_mask is not None and repetition_penalty != 1.0
+
+        for step in range(rvq):
+            seq_len = step + 1
+            hidden = self.model(embeds[:, :seq_len, :], pos_ids_full[:, :seq_len])
+            logits = lm_heads[step](hidden[:, step, :]).float()
+
+            if apply_rep and rep_mask is not None:
+                step_mask = rep_mask[:, step, :]
+                penalized = torch.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty)
+                logits = torch.where(step_mask, penalized, logits)
+
+            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
+
+            if step + 1 < rvq:
+                embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)
+
     @torch.no_grad()
     def generate_frame(
         self,
@@ -94,50 +170,150 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
+        history_tensors: Sequence[torch.Tensor | None] | None = None,
+        use_cuda_graph: bool = False,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
 
         Returns a ``(B, rvq)`` LongTensor.
 
-        ``history_per_codebook[i]`` is a list of recently-emitted token ids for
-        codebook ``i``; when ``repetition_penalty != 1.0`` those tokens get
-        their logits scaled down (mirrors upstream's rep-penalty behaviour).
+        ``history_tensors`` provides per-request ``(W, rvq)`` GPU tensors of
+        recently emitted token ids, avoiding host-device synchronization across
+        concurrent requests. ``history_per_codebook`` is retained for direct
+        single-request callers.
         """
         device = backbone_last_hidden.device
         B = backbone_last_hidden.shape[0]
         rvq = self.config.rvq
         hidden_size = self.config.hidden_size
+        vocab_size = self.config.audio_vocab_size
 
-        codec_embeds = self.model.codec_embedding
+        can_graph = (
+            use_cuda_graph
+            and device.type == "cuda"
+            and B > 0
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if can_graph:
+            key = (
+                B,
+                device.index,
+                backbone_last_hidden.dtype,
+                id(lm_heads),
+                float(temperature),
+                int(top_k),
+                float(top_p),
+                bool(do_sample),
+                float(repetition_penalty),
+            )
+            if key not in self._cuda_graphs and key not in self._uncapturable_keys:
+                if len(self._cuda_graphs) < _MAX_LOCAL_CUDA_GRAPHS:
+                    try:
+                        static_embeds = backbone_last_hidden.new_zeros((B, rvq, hidden_size))
+                        static_pos_ids = (
+                            torch.arange(rvq, device=device, dtype=torch.long)
+                            .unsqueeze(0)
+                            .expand(B, -1)
+                            .contiguous()
+                        )
+                        static_rep_mask = torch.zeros((B, rvq, vocab_size), dtype=torch.bool, device=device)
+                        static_codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
 
-        # Re-prefill buffer: position 0 = backbone hidden, position s = embed of
-        # code_{s-1}. At step s we forward positions [0..s] and read the last.
+                        capture_stream = torch.cuda.Stream(device=device)
+                        main_stream = torch.cuda.current_stream(device=device)
+                        capture_stream.wait_stream(main_stream)
+                        with torch.cuda.stream(capture_stream):
+                            for _ in range(2):
+                                self._run_loop(
+                                    static_embeds,
+                                    static_pos_ids,
+                                    static_rep_mask,
+                                    static_codes,
+                                    lm_heads,
+                                    temperature=temperature,
+                                    top_k=top_k,
+                                    top_p=top_p,
+                                    do_sample=do_sample,
+                                    repetition_penalty=repetition_penalty,
+                                )
+                        main_stream.wait_stream(capture_stream)
+
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph, stream=capture_stream):
+                            self._run_loop(
+                                static_embeds,
+                                static_pos_ids,
+                                static_rep_mask,
+                                static_codes,
+                                lm_heads,
+                                temperature=temperature,
+                                top_k=top_k,
+                                top_p=top_p,
+                                do_sample=do_sample,
+                                repetition_penalty=repetition_penalty,
+                            )
+                        main_stream.wait_stream(capture_stream)
+                        self._cuda_graphs[key] = (
+                            graph,
+                            static_embeds,
+                            static_pos_ids,
+                            static_rep_mask,
+                            static_codes,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "MossTTSRealtimeLocalTransformer CUDA graph capture failed for key=%s; using eager loop",
+                            key,
+                            exc_info=True,
+                        )
+                        self._uncapturable_keys.add(key)
+
+            cached = self._cuda_graphs.get(key)
+            if cached is not None:
+                graph, static_embeds, _static_pos_ids, static_rep_mask, static_codes = cached
+                static_embeds[:, 0, :].copy_(backbone_last_hidden)
+                if repetition_penalty != 1.0:
+                    static_rep_mask.zero_()
+                    self._populate_rep_mask(
+                        static_rep_mask,
+                        history_tensors=history_tensors,
+                        history_per_codebook=history_per_codebook,
+                    )
+                graph.replay()
+                return static_codes.clone()
+
         embeds = backbone_last_hidden.new_zeros((B, rvq, hidden_size))
         embeds[:, 0, :] = backbone_last_hidden.to(embeds.dtype)
 
-        pos_ids_full = torch.arange(rvq, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+        pos_ids_buf = getattr(self, "_pos_ids", None)
+        if isinstance(pos_ids_buf, torch.Tensor) and pos_ids_buf.device == device and pos_ids_buf.shape[-1] == rvq:
+            pos_ids_full = pos_ids_buf.expand(B, -1)
+        else:
+            pos_ids_full = torch.arange(rvq, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+
+        rep_mask: torch.Tensor | None = None
+        if repetition_penalty != 1.0 and (history_tensors is not None or history_per_codebook is not None):
+            candidate_mask = torch.zeros((B, rvq, vocab_size), dtype=torch.bool, device=device)
+            if self._populate_rep_mask(
+                candidate_mask,
+                history_tensors=history_tensors,
+                history_per_codebook=history_per_codebook,
+            ):
+                rep_mask = candidate_mask
 
         codes = backbone_last_hidden.new_zeros((B, rvq), dtype=torch.long)
-
-        for step in range(rvq):
-            seq_len = step + 1
-            hidden = self.model(embeds[:, :seq_len, :], pos_ids_full[:, :seq_len])
-            logits = lm_heads[step](hidden[:, step, :]).float()
-
-            if repetition_penalty != 1.0 and history_per_codebook is not None and step < len(history_per_codebook):
-                hist = history_per_codebook[step]
-                if hist:
-                    hist_t = torch.tensor(hist, dtype=torch.long, device=logits.device)
-                    sel = logits.index_select(-1, hist_t)
-                    pos = sel > 0
-                    sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
-                    logits.index_copy_(-1, hist_t, sel)
-
-            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
-
-            if step + 1 < rvq:
-                embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)
-
+        self._run_loop(
+            embeds,
+            pos_ids_full,
+            rep_mask,
+            codes,
+            lm_heads,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+        )
         return codes
 
 

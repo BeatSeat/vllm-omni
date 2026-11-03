@@ -864,6 +864,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # Stacked weight cache built after load_weights().
         # shape: (n_vq, audio_vocab_size, hidden_size)
         self._stacked_audio_emb_w: torch.Tensor | None = None
+        self._n_vq_idx: torch.Tensor | None = None
+        self._local_cuda_graph_enabled: bool = getattr(vllm_config.model_config, "enforce_eager", False) is False
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
@@ -955,13 +957,59 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             return embeds
         if self._stacked_audio_emb_w is not None:
             # Single gather: (n_vq, vocab, H)[arange[:,None], codes.T] → (n_vq, T, H) → sum → (T, H)
-            n_vq_idx = torch.arange(self.n_vq, device=audio_codes.device)
+            n_vq_idx = getattr(self, "_n_vq_idx", None)
+            if n_vq_idx is None or n_vq_idx.device != audio_codes.device:
+                n_vq_idx = torch.arange(self.n_vq, device=audio_codes.device).unsqueeze(1)
+                self._n_vq_idx = n_vq_idx
             codes_t = audio_codes.t().clamp(0, self.audio_vocab_size - 1)  # (n_vq, T)
-            return embeds + self._stacked_audio_emb_w[n_vq_idx.unsqueeze(1), codes_t].sum(0)
+            return embeds + self._stacked_audio_emb_w[n_vq_idx, codes_t].sum(0)
         for i in range(self.n_vq):
             col = audio_codes[:, i].clamp_(0, self.audio_vocab_size - 1)
             embeds = embeds + self.embed_tokens[i + 1](col)
         return embeds
+
+    def preprocess_decode_batch_mrv2(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Batched decode preprocess for MRv2: fuse embedding gather across active requests."""
+        device = input_ids.device
+        batch_size = len(req_infos)
+        if any(not isinstance(info.get("audio_state"), dict) for info in req_infos):
+            out_embeds: list[torch.Tensor] = []
+            updates: list[dict[str, Any]] = []
+            for idx, info in enumerate(req_infos):
+                _, emb, upd = self.preprocess(
+                    input_ids[idx : idx + 1],
+                    input_embeds[idx : idx + 1] if input_embeds is not None else None,
+                    **info,
+                )
+                out_embeds.append(emb.reshape(1, -1))
+                updates.append(upd)
+            stacked_embeds = torch.cat(out_embeds, dim=0) if out_embeds else input_embeds[:0]
+            return input_ids, stacked_embeds, stacked_embeds, stacked_embeds, updates
+
+        pad_row: torch.Tensor | None = None
+        code_rows: list[torch.Tensor] = []
+        for info in req_infos:
+            prev_codes = (info.get("audio_codes", {}) or {}).get("current")
+            if isinstance(prev_codes, torch.Tensor) and prev_codes.numel() == self.n_vq:
+                row = (
+                    prev_codes.reshape(self.n_vq)
+                    if (prev_codes.device == device and prev_codes.dtype == torch.long)
+                    else prev_codes.to(device=device, dtype=torch.long).reshape(self.n_vq)
+                )
+            else:
+                if pad_row is None:
+                    pad_row = torch.full((self.n_vq,), self.audio_pad_token, dtype=torch.long, device=device)
+                row = pad_row
+            code_rows.append(row)
+
+        batch_codes = torch.stack(code_rows, dim=0) if batch_size > 1 else code_rows[0].unsqueeze(0)
+        new_embeds = self._build_input_embeds(input_ids.reshape(-1), batch_codes)
+        return input_ids, new_embeds, new_embeds, new_embeds, [{} for _ in range(batch_size)]
 
     def preprocess(
         self,
@@ -1083,6 +1131,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     "MOSS-TTS make_omni_output requires request_token_spans "
                     f"for {len(info_dicts)} request infos, got {0 if spans is None else len(spans)}"
                 )
+            active_rows: list[tuple[int, dict[str, Any], dict[str, Any], int]] = []
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict):
                     continue
@@ -1096,69 +1145,105 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 state = info.get("audio_state", {}) or {}
                 if state.get("is_stopping"):
                     continue  # already stopped — no more audio frames
+                active_rows.append((i, info, state, row_end - 1))
 
-                last_h = hidden[row_end - 1].unsqueeze(0)  # (1, H)
-                # Sampling parameters mirror upstream ``MossTTSRealtimeInference.generate``:
-                # 0.8 / 0.6 / 30 + 1.1 repetition penalty over a 50-frame window.
+            if active_rows:
                 rep_window = 50
-                hist_per_cb: list[list[int]] = []
-                acc_for_hist = (info.get("audio_codes", {}) or {}).get("accumulated")
-                if isinstance(acc_for_hist, torch.Tensor) and acc_for_hist.numel() > 0:
-                    tail = acc_for_hist[-rep_window:].long().cpu().tolist()
-                    for cb in range(self.n_vq):
-                        hist_per_cb.append([row[cb] for row in tail])
-                else:
-                    hist_per_cb = [[] for _ in range(self.n_vq)]
-                new_codes = self.local_transformer.generate_frame(
-                    last_h,
-                    self.local_lm_heads,
-                    temperature=0.8,
-                    top_p=0.6,
-                    top_k=30,
-                    do_sample=True,
-                    repetition_penalty=1.1,
-                    history_per_codebook=hist_per_cb,
-                ).squeeze(0)  # (n_vq,)
-                if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
-                    logger.debug(
-                        "[MossTTSRealtime make_omni] step=%d ch0=%d cursor=%d/%d",
-                        int(state.get("step", 0)),
-                        int(new_codes[0].item()),
-                        int(state.get("text_cursor", 0)),
-                        len(state.get("remaining_text") or []),
+                is_native_local = isinstance(getattr(self, "local_transformer", None), MossTTSRealtimeLocalTransformer)
+                if is_native_local:
+                    if len(active_rows) == 1:
+                        batch_last_h = hidden[active_rows[0][3]].unsqueeze(0)
+                    else:
+                        batch_last_h = hidden[[r[3] for r in active_rows]]
+                    hist_tensors: list[torch.Tensor | None] = []
+                    for _i, info, _state, _last_row in active_rows:
+                        acc_for_hist = (info.get("audio_codes", {}) or {}).get("accumulated")
+                        if isinstance(acc_for_hist, torch.Tensor) and acc_for_hist.numel() > 0:
+                            hist_tensors.append(acc_for_hist[-rep_window:])
+                        else:
+                            hist_tensors.append(None)
+                    batch_new_codes = self.local_transformer.generate_frame(
+                        batch_last_h,
+                        self.local_lm_heads,
+                        temperature=0.8,
+                        top_p=0.6,
+                        top_k=30,
+                        do_sample=True,
+                        repetition_penalty=1.1,
+                        history_tensors=hist_tensors,
+                        use_cuda_graph=bool(getattr(self, "_local_cuda_graph_enabled", False)),
                     )
-
-                ch0 = int(new_codes[0].item())
-                state["step"] = int(state.get("step", 0)) + 1
-                max_new_frames = int(state.get("max_new_frames", -1))
-                if max_new_frames > 0 and state["step"] >= max_new_frames:
-                    state["is_stopping"] = True
-                # Stop condition mirrors upstream: codebook 0 == eos_audio_id.
-                if ch0 == self.AUDIO_EOS:
-                    state["is_stopping"] = True
-                    info["audio_codes"] = {
-                        "current": new_codes,
-                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
-                    }
-                    continue  # don't append the eos frame to accumulated
-
-                if ch0 in (self.AUDIO_BOS, self.audio_pad_token):
-                    # Skip the bos / pad frames — they don't decode to real audio.
-                    info["audio_codes"] = {
-                        "current": new_codes,
-                        "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
-                    }
-                    continue
-
-                acc = (info.get("audio_codes", {}) or {}).get("accumulated")
-                if isinstance(acc, torch.Tensor) and acc.numel() > 0:
-                    updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
+                    ch0_list = batch_new_codes[:, 0].tolist()
+                    codes_per_active = [batch_new_codes[idx] for idx in range(len(active_rows))]
                 else:
-                    updated_acc = new_codes.unsqueeze(0)
+                    codes_per_active = []
+                    ch0_list = []
+                    for _i, info, _state, last_row in active_rows:
+                        last_h = hidden[last_row].unsqueeze(0)
+                        hist_per_cb: list[list[int]] = []
+                        acc_for_hist = (info.get("audio_codes", {}) or {}).get("accumulated")
+                        if isinstance(acc_for_hist, torch.Tensor) and acc_for_hist.numel() > 0:
+                            tail = acc_for_hist[-rep_window:].long().cpu().tolist()
+                            for cb in range(self.n_vq):
+                                hist_per_cb.append([row[cb] for row in tail])
+                        else:
+                            hist_per_cb = [[] for _ in range(self.n_vq)]
+                        row_codes = self.local_transformer.generate_frame(
+                            last_h,
+                            self.local_lm_heads,
+                            temperature=0.8,
+                            top_p=0.6,
+                            top_k=30,
+                            do_sample=True,
+                            repetition_penalty=1.1,
+                            history_per_codebook=hist_per_cb,
+                        ).squeeze(0)
+                        codes_per_active.append(row_codes)
+                        ch0_list.append(int(row_codes[0].item()))
 
-                info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
-                per_req_codes[i] = new_codes.unsqueeze(0)
-                have_codes = True
+                for (i, info, state, _last_row), new_codes, ch0_val in zip(
+                    active_rows, codes_per_active, ch0_list, strict=True
+                ):
+                    ch0 = int(ch0_val)
+                    if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
+                        logger.debug(
+                            "[MossTTSRealtime make_omni] step=%d ch0=%d cursor=%d/%d",
+                            int(state.get("step", 0)),
+                            ch0,
+                            int(state.get("text_cursor", 0)),
+                            len(state.get("remaining_text") or []),
+                        )
+
+                    state["step"] = int(state.get("step", 0)) + 1
+                    max_new_frames = int(state.get("max_new_frames", -1))
+                    if max_new_frames > 0 and state["step"] >= max_new_frames:
+                        state["is_stopping"] = True
+                    # Stop condition mirrors upstream: codebook 0 == eos_audio_id.
+                    if ch0 == self.AUDIO_EOS:
+                        state["is_stopping"] = True
+                        info["audio_codes"] = {
+                            "current": new_codes,
+                            "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
+                        }
+                        continue  # don't append the eos frame to accumulated
+
+                    if ch0 in (self.AUDIO_BOS, self.audio_pad_token):
+                        # Skip the bos / pad frames — they don't decode to real audio.
+                        info["audio_codes"] = {
+                            "current": new_codes,
+                            "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
+                        }
+                        continue
+
+                    acc = (info.get("audio_codes", {}) or {}).get("accumulated")
+                    if isinstance(acc, torch.Tensor) and acc.numel() > 0:
+                        updated_acc = torch.cat([acc.to(new_codes.device), new_codes.unsqueeze(0)], dim=0)
+                    else:
+                        updated_acc = new_codes.unsqueeze(0)
+
+                    info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
+                    per_req_codes[i] = new_codes.unsqueeze(0)
+                    have_codes = True
 
         if not have_codes:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})

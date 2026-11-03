@@ -31,3 +31,7 @@ stages:
       top_k: 50
       max_tokens: 4096
       seed: 42
+
+platforms:
+  cuda:
+    model_runner: v2

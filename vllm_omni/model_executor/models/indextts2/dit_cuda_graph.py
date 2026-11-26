@@ -201,3 +201,373 @@ class CUDAGraphDiTRunner:
             static_mask=static_mask,
             static_out=static_out,
         )
+
+
+@dataclass
+class _StepGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    static_x: torch.Tensor
+    static_t: torch.Tensor
+    static_prompt_x: torch.Tensor
+    static_style: torch.Tensor
+    static_cond: torch.Tensor
+    static_x_lens: torch.Tensor
+    static_pre_mask: tuple[torch.Tensor, torch.Tensor | None] | None
+    static_unpad_data: tuple[torch.Tensor, torch.Tensor] | None
+    static_out: torch.Tensor
+    static_reflect_cache: dict | None = None
+
+
+class _SolveGraphSession:
+    """Per-solve_euler execution helper backed by CUDAGraphDiTStepRunner."""
+
+    def __init__(
+        self,
+        runner: CUDAGraphDiTStepRunner,
+        *,
+        entry: _StepGraphEntry | None,
+        cache_key: tuple | None,
+        is_ragged: bool,
+        prompt_x: torch.Tensor,
+        x_lens: torch.Tensor,
+        style: torch.Tensor,
+        precomputed_cond: torch.Tensor,
+        pre_mask: tuple[torch.Tensor, torch.Tensor | None] | None,
+        unpad_data: tuple[torch.Tensor, torch.Tensor] | None,
+        autocast_dtype: torch.dtype | None,
+        wavenet_reflect_cache: dict | None,
+    ) -> None:
+        self._runner = runner
+        self._entry = entry
+        self._cache_key = cache_key
+        self._is_ragged = is_ragged
+        self._prompt_x = prompt_x
+        self._x_lens = x_lens
+        self._style = style
+        self._precomputed_cond = precomputed_cond
+        self._pre_mask = pre_mask
+        self._unpad_data = unpad_data
+        self._autocast_dtype = autocast_dtype
+        self._wavenet_reflect_cache = wavenet_reflect_cache
+        self._step = 0
+        self._failed = False
+
+    def _run_eager(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        kw: dict[str, object] = {
+            "pre_mask": self._pre_mask,
+            "unpad_data": self._unpad_data,
+            "precomputed_cond": self._precomputed_cond,
+            "_skip_inner_graph": True,
+        }
+        if self._wavenet_reflect_cache is not None:
+            kw["wavenet_reflect_cache"] = self._wavenet_reflect_cache
+        if self._autocast_dtype is None:
+            return self._runner.estimator(x, self._prompt_x, self._x_lens, t, self._style, self._precomputed_cond, **kw)
+        with torch.autocast(x.device.type, dtype=self._autocast_dtype):
+            out = self._runner.estimator(x, self._prompt_x, self._x_lens, t, self._style, self._precomputed_cond, **kw)
+        return out.float()
+
+    def run_step(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        step = self._step
+        self._step += 1
+        self._runner._stats["calls"] += 1
+
+        if self._failed:
+            self._runner._stats["eager"] += 1
+            return self._run_eager(x, t)
+
+        if self._entry is not None:
+            self._runner._stats["hits"] += 1
+            return self._runner._replay_step(self._entry, x=x, t=t)
+
+        # Step 0 serves as the real eager warm pass (no wasted dummy pass).
+        if step == 0:
+            self._runner._stats["eager"] += 1
+            return self._run_eager(x, t)
+
+        # Step 1 captures the full DiT + WaveNet step and replays it.
+        entry = self._runner._capture_step(
+            x=x,
+            t=t,
+            prompt_x=self._prompt_x,
+            x_lens=self._x_lens,
+            style=self._style,
+            precomputed_cond=self._precomputed_cond,
+            pre_mask=self._pre_mask,
+            unpad_data=self._unpad_data,
+            autocast_dtype=self._autocast_dtype,
+            wavenet_reflect_cache=self._wavenet_reflect_cache,
+            is_ragged=self._is_ragged,
+        )
+        if entry is None:
+            self._failed = True
+            self._runner._stats["capture_failures"] += 1
+            self._runner._stats["eager"] += 1
+            return self._run_eager(x, t)
+
+        self._runner._stats["captures"] += 1
+        self._entry = entry
+        if not self._is_ragged and self._cache_key is not None:
+            self._runner._store_entry(self._cache_key, entry)
+        entry.graph.replay()
+        return entry.static_out
+
+    def close(self) -> None:
+        if self._is_ragged and self._entry is not None:
+            self._entry = None
+
+
+class CUDAGraphDiTStepRunner:
+    """Capture and replay the full DiT + WaveNet + FinalLayer Euler step.
+
+    Unlike ``CUDAGraphDiTRunner`` (which wraps only ``estimator.transformer``),
+    this runner captures the entire per-step ``DiT.forward`` (including
+    ``t_embedder``, ``cond_x_merge_linear``, ``transformer``, ``skip_linear``,
+    ``wavenet``, ``final_layer``, and output ``float()`` cast) so there are zero
+    eager kernel launches between Euler steps.
+
+    - Full-mask shapes (``unpad_data is None``): cached across requests in a
+      bounded LRU; per-request static inputs (``prompt_x``, ``style``,
+      ``precomputed_cond``) are copied once before the Euler loop.
+    - Packed-varlen ragged batches (``unpad_data is not None``): step 0 runs
+      eager as a real warm pass, step 1 captures an ephemeral graph using the
+      shared graph pool, and steps 1..N-1 replay it with zero CPU launch gaps.
+    """
+
+    def __init__(self, estimator: torch.nn.Module, *, max_graphs: int = 8, enabled: bool = True) -> None:
+        self.estimator = estimator
+        self.max_graphs = int(max_graphs)
+        self.enabled = bool(enabled)
+        self.ragged_enabled = bool(enabled)
+        self._cache: OrderedDict[tuple, _StepGraphEntry] = OrderedDict()
+        self._stats = {
+            "calls": 0,
+            "hits": 0,
+            "captures": 0,
+            "capture_failures": 0,
+            "evictions": 0,
+            "eager": 0,
+        }
+
+    def stats_snapshot(self) -> dict[str, object]:
+        return {**self._stats, "cache_size": len(self._cache)}
+
+    @staticmethod
+    def _can_capture_ragged(
+        estimator: torch.nn.Module,
+        device: torch.device,
+        autocast_dtype: torch.dtype | None,
+    ) -> bool:
+        if device.type != "cuda" or autocast_dtype is None:
+            return False
+        transformer = getattr(estimator, "transformer", None)
+        layers = getattr(transformer, "layers", None)
+        if not layers:
+            return False
+        attn = getattr(layers[0], "attention", None)
+        diff_attn = getattr(attn, "diff_attn", None)
+        return hasattr(getattr(diff_attn, "attention", None), "_forward_varlen_packed")
+
+    @staticmethod
+    def _load_per_solve_inputs(
+        entry: _StepGraphEntry,
+        *,
+        prompt_x: torch.Tensor,
+        style: torch.Tensor,
+        precomputed_cond: torch.Tensor,
+    ) -> None:
+        entry.static_prompt_x.copy_(prompt_x)
+        entry.static_style.copy_(style)
+        entry.static_cond.copy_(precomputed_cond)
+
+    @staticmethod
+    def _replay_step(
+        entry: _StepGraphEntry,
+        *,
+        x: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        entry.static_x.copy_(x)
+        entry.static_t.copy_(t)
+        entry.graph.replay()
+        return entry.static_out
+
+    def _store_entry(self, key: tuple, entry: _StepGraphEntry) -> None:
+        self._cache[key] = entry
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.max_graphs:
+            _, evicted = self._cache.popitem(last=False)
+            del evicted
+            self._stats["evictions"] += 1
+
+    def begin_solve(
+        self,
+        *,
+        prompt_x: torch.Tensor,
+        x_lens: torch.Tensor,
+        style: torch.Tensor,
+        precomputed_cond: torch.Tensor,
+        pre_mask: tuple[torch.Tensor, torch.Tensor | None] | None,
+        unpad_data: tuple[torch.Tensor, torch.Tensor] | None,
+        autocast_dtype: torch.dtype | None,
+        num_steps: int,
+        cfg_enabled: bool = True,
+        wavenet_reflect_cache: dict | None = None,
+    ) -> _SolveGraphSession | None:
+        if (
+            not self.enabled
+            or prompt_x.device.type != "cuda"
+            or torch.cuda.is_current_stream_capturing()
+            or num_steps < 2
+        ):
+            return None
+
+        is_ragged = unpad_data is not None
+        if is_ragged:
+            if not self.ragged_enabled or num_steps < 4:
+                return None
+            if not self._can_capture_ragged(self.estimator, prompt_x.device, autocast_dtype):
+                return None
+            return _SolveGraphSession(
+                self,
+                entry=None,
+                cache_key=None,
+                is_ragged=True,
+                prompt_x=prompt_x,
+                x_lens=x_lens,
+                style=style,
+                precomputed_cond=precomputed_cond,
+                pre_mask=pre_mask,
+                unpad_data=unpad_data,
+                autocast_dtype=autocast_dtype,
+                wavenet_reflect_cache=wavenet_reflect_cache,
+            )
+
+        device_key = (prompt_x.device.type, prompt_x.device.index)
+        cache_key = (
+            device_key,
+            tuple(prompt_x.shape),
+            prompt_x.dtype,
+            tuple(style.shape),
+            style.dtype,
+            tuple(precomputed_cond.shape),
+            precomputed_cond.dtype,
+            autocast_dtype,
+            bool(cfg_enabled),
+        )
+        entry = self._cache.get(cache_key)
+        if entry is not None:
+            self._cache.move_to_end(cache_key)
+            self._load_per_solve_inputs(
+                entry,
+                prompt_x=prompt_x,
+                style=style,
+                precomputed_cond=precomputed_cond,
+            )
+        return _SolveGraphSession(
+            self,
+            entry=entry,
+            cache_key=cache_key,
+            is_ragged=False,
+            prompt_x=prompt_x,
+            x_lens=x_lens,
+            style=style,
+            precomputed_cond=precomputed_cond,
+            pre_mask=pre_mask,
+            unpad_data=None,
+            autocast_dtype=autocast_dtype,
+            wavenet_reflect_cache=None,
+        )
+
+    def _capture_step(
+        self,
+        *,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        prompt_x: torch.Tensor,
+        x_lens: torch.Tensor,
+        style: torch.Tensor,
+        precomputed_cond: torch.Tensor,
+        pre_mask: tuple[torch.Tensor, torch.Tensor | None] | None,
+        unpad_data: tuple[torch.Tensor, torch.Tensor] | None,
+        autocast_dtype: torch.dtype | None,
+        wavenet_reflect_cache: dict | None,
+        is_ragged: bool,
+    ) -> _StepGraphEntry | None:
+        static_x = x.clone()
+        static_t = t.clone()
+        static_prompt_x = prompt_x.clone()
+        static_style = style.clone()
+        static_cond = precomputed_cond.clone()
+        static_x_lens = x_lens.clone()
+        static_pre_mask = (
+            (
+                pre_mask[0].contiguous().clone(),
+                pre_mask[1].contiguous().clone() if pre_mask[1] is not None else None,
+            )
+            if pre_mask is not None
+            else None
+        )
+        static_unpad = (unpad_data[0].contiguous().clone(), unpad_data[1].contiguous().clone()) if unpad_data else None
+        kw: dict[str, object] = {
+            "pre_mask": static_pre_mask,
+            "unpad_data": static_unpad,
+            "precomputed_cond": static_cond,
+            "_skip_inner_graph": True,
+        }
+        if is_ragged and wavenet_reflect_cache is not None:
+            kw["wavenet_reflect_cache"] = wavenet_reflect_cache
+        try:
+            # Step 0 already executed an eager warm pass on the current stream;
+            # wait for it to finish before starting stream capture.
+            torch.accelerator.synchronize(x.device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                if autocast_dtype is None:
+                    static_out = self.estimator(
+                        static_x,
+                        static_prompt_x,
+                        static_x_lens,
+                        static_t,
+                        static_style,
+                        static_cond,
+                        **kw,
+                    )
+                else:
+                    with torch.autocast(x.device.type, dtype=autocast_dtype):
+                        raw_out = self.estimator(
+                            static_x,
+                            static_prompt_x,
+                            static_x_lens,
+                            static_t,
+                            static_style,
+                            static_cond,
+                            **kw,
+                        )
+                    static_out = raw_out.float()
+        except Exception:
+            logger.warning(
+                "Disabling S2Mel DiT full-step CUDA graphs (ragged=%s) after capture failure for shape=%s",
+                is_ragged,
+                tuple(x.shape),
+                exc_info=True,
+            )
+            if is_ragged:
+                self.ragged_enabled = False
+            else:
+                self.enabled = False
+            return None
+
+        return _StepGraphEntry(
+            graph=graph,
+            static_x=static_x,
+            static_t=static_t,
+            static_prompt_x=static_prompt_x,
+            static_style=static_style,
+            static_cond=static_cond,
+            static_x_lens=static_x_lens,
+            static_pre_mask=static_pre_mask,
+            static_unpad_data=static_unpad,
+            static_out=static_out,
+            static_reflect_cache=wavenet_reflect_cache if is_ragged else None,
+        )

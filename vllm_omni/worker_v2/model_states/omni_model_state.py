@@ -601,10 +601,10 @@ class OmniModelState(DefaultModelState):
                 continue
 
             stacked = torch.stack(values, dim=0)
-            self.intermediate_buffer.update_gpu_tensor_rows(
+            self.intermediate_buffer.update_owned_gpu_tensor_rows(
                 req_indices,
                 key,
-                stacked,
+                stacked.detach(),
                 keepdim=False,
             )
 

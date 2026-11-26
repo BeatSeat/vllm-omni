@@ -222,45 +222,93 @@ class BASECFM(torch.nn.Module, ABC):
         else:
             precomputed_cond = _project_cond_once(mu)
 
-        est_extra_kw = {"precomputed_cond": precomputed_cond} if precomputed_cond is not None else {}
+        est_extra_kw: dict[str, object] = {}
+        if precomputed_cond is not None:
+            est_extra_kw["precomputed_cond"] = precomputed_cond
+        wavenet_reflect_cache: dict | None = {} if unpad_data is not None else None
+        if wavenet_reflect_cache is not None and can_precompute_cond:
+            est_extra_kw["wavenet_reflect_cache"] = wavenet_reflect_cache
 
-        for step in range(1, len(t_span)):
-            dt = t_span[step] - t_span[step - 1]
+        step_graph_session = None
+        step_graph_runner = (
+            getattr(eager_estimator, "_step_cuda_graph_runner", None) if self.estimator is eager_estimator else None
+        )
+        if step_graph_runner is not None and precomputed_cond is not None:
+            num_ode_steps = len(t_span) - 1
             if inference_cfg_rate > 0:
-                cfg_x[:batch].copy_(x)
-                cfg_x[batch:].copy_(x)
-                cfg_t.fill_(t)
-
-                stacked_dphi_dt = _run_estimator(
-                    cfg_x,
-                    cfg_prompt_x,
-                    x_lens,
-                    cfg_t,
-                    cfg_style,
-                    cfg_mu,
+                step_graph_session = step_graph_runner.begin_solve(
+                    prompt_x=cfg_prompt_x,
+                    x_lens=x_lens,
+                    style=cfg_style,
+                    precomputed_cond=precomputed_cond,
                     pre_mask=cfg_pre_mask,
                     unpad_data=unpad_data,
-                    **est_extra_kw,
+                    autocast_dtype=autocast_dtype,
+                    num_steps=num_ode_steps,
+                    cfg_enabled=True,
+                    wavenet_reflect_cache=wavenet_reflect_cache,
                 )
-
-                dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
-                dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = _run_estimator(
-                    x,
-                    prompt_x,
-                    x_lens,
-                    t.unsqueeze(0),
-                    style,
-                    mu,
+                step_graph_session = step_graph_runner.begin_solve(
+                    prompt_x=prompt_x,
+                    x_lens=x_lens,
+                    style=style,
+                    precomputed_cond=precomputed_cond,
                     pre_mask=pre_mask,
                     unpad_data=unpad_data,
-                    **est_extra_kw,
+                    autocast_dtype=autocast_dtype,
+                    num_steps=num_ode_steps,
+                    cfg_enabled=False,
+                    wavenet_reflect_cache=wavenet_reflect_cache,
                 )
 
-            x = x + dt * dphi_dt
-            t = t + dt
-            x.masked_fill_(noise_prefix_mask.unsqueeze(1), 0)
+        try:
+            for step in range(1, len(t_span)):
+                dt = t_span[step] - t_span[step - 1]
+                if inference_cfg_rate > 0:
+                    cfg_x[:batch].copy_(x)
+                    cfg_x[batch:].copy_(x)
+                    cfg_t.fill_(t)
+
+                    if step_graph_session is not None:
+                        stacked_dphi_dt = step_graph_session.run_step(cfg_x, cfg_t)
+                    else:
+                        stacked_dphi_dt = _run_estimator(
+                            cfg_x,
+                            cfg_prompt_x,
+                            x_lens,
+                            cfg_t,
+                            cfg_style,
+                            cfg_mu,
+                            pre_mask=cfg_pre_mask,
+                            unpad_data=unpad_data,
+                            **est_extra_kw,
+                        )
+
+                    dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
+                    dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
+                else:
+                    if step_graph_session is not None:
+                        dphi_dt = step_graph_session.run_step(x, t.unsqueeze(0))
+                    else:
+                        dphi_dt = _run_estimator(
+                            x,
+                            prompt_x,
+                            x_lens,
+                            t.unsqueeze(0),
+                            style,
+                            mu,
+                            pre_mask=pre_mask,
+                            unpad_data=unpad_data,
+                            **est_extra_kw,
+                        )
+
+                x = x + dt * dphi_dt
+                t = t + dt
+                x.masked_fill_(noise_prefix_mask.unsqueeze(1), 0)
+        finally:
+            if step_graph_session is not None:
+                step_graph_session.close()
 
         return x
 

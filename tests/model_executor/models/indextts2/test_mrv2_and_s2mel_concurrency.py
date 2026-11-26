@@ -1094,3 +1094,126 @@ def test_indextts2_deploy_config_includes_640_vocoder_graph_bucket():
     overrides = stage1["hf_overrides"]
     assert 640 in overrides["s2mel_vocoder_capture_sizes"]
     assert overrides["s2mel_vocoder_compile_shapes"] == [256, 384, 512]
+
+
+def test_prefill_caches_conformer_conds_and_emo_vectors_and_invalidates_on_speaker_cache_clear():
+    """Warm speaker/emotion hits skip Conformer+Perceiver recomputation with bit-identical embeds."""
+    from vllm_omni.model_executor.models.indextts2.indextts2_talker import (
+        resolve_indextts_conditioning_policy,
+    )
+    from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+    torch.manual_seed(42)
+    cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
+    cond_calls = 0
+    emo_calls = 0
+
+    class _CountingCondEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1024, HIDDEN)
+
+        def forward(self, emb, _lens):
+            nonlocal cond_calls
+            cond_calls += 1
+            return self.proj(emb), torch.ones(1, 1, emb.shape[1], device=emb.device)
+
+    class _CountingEmoEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1024, 1024)
+
+        def forward(self, emb, _lens):
+            nonlocal emo_calls
+            emo_calls += 1
+            return self.proj(emb), torch.ones(1, 1, emb.shape[1], device=emb.device)
+
+    talker = object.__new__(IndexTTS2TalkerForConditionalGeneration)
+    nn.Module.__init__(talker)
+    talker.model_path = "dummy-model"
+    talker.config = SimpleNamespace(model_type="indextts2", semantic_codec={"codebook_size": 8192})
+    talker.conditioning_policy = resolve_indextts_conditioning_policy("indextts2")
+    talker.use_gpt_latent = True
+    talker.model_dim = HIDDEN
+    talker.start_mel_token = 8192
+    talker._speaker_cache = cache
+    talker._w2v_stat = None
+    talker.text_embedding = nn.Embedding(32, HIDDEN)
+    talker.mel_embedding = nn.Embedding(8194, HIDDEN)
+    talker.text_pos_embedding = lambda ids: torch.zeros(ids.shape[0], ids.shape[1], HIDDEN)
+    talker.mel_pos_embedding = SimpleNamespace(
+        get_fixed_embedding=lambda _pos, device: torch.zeros(1, 1, HIDDEN, device=device)
+    )
+    talker.conditioning_encoder = _CountingCondEncoder()
+    talker.cond_mask_pad = lambda mask: mask
+    talker.perceiver_encoder = lambda cond, _mask: cond[:, :1, :].expand(1, 32, HIDDEN).contiguous()
+    talker.emo_conditioning_encoder = _CountingEmoEncoder()
+    talker.emo_cond_mask_pad = lambda mask: mask
+    talker.emo_perceiver_encoder = lambda cond, _mask: cond[:, :1, :].contiguous()
+    talker.emovec_layer = nn.Linear(1024, HIDDEN)
+    talker.emo_layer = nn.Linear(HIDDEN, HIDDEN)
+    talker.speed_emb = nn.Embedding(2, HIDDEN)
+    talker._ensure_w2v_stat_loaded = lambda _dev: None
+    talker._compute_mel_22k = lambda _wav, dev: torch.ones(1, 80, 12, device=dev)
+    talker._tokenize_text = lambda text, dev, **kw: (torch.tensor([[1, 2, 3]], dtype=torch.long, device=dev), None)
+
+    class _FakeCodec:
+        def quantize(self, emb):
+            return None, emb[:, :, :HIDDEN].clone()
+
+    with (
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_reference_audio",
+            lambda _p, dev, mode="speaker": (
+                torch.full((1600,), 1.0 if mode == "speaker" else 2.0, device=dev),
+                torch.zeros(2205, device=dev),
+            ),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_wav2vec2",
+            lambda _p, _d: (object(), object()),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.wav2vec_extract",
+            lambda wav, _m, _p, dev, _s: torch.full((1, 5, 1024), float(wav[0].item()), device=dev),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_semantic_codec",
+            lambda _p, _c, _d: _FakeCodec(),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.load_campplus",
+            lambda _p, _d: (lambda _fb: torch.ones(1, 192)),
+        ),
+        patch(
+            "vllm_omni.model_executor.models.indextts2.indextts2_talker.compute_fbank",
+            lambda _wav, dev: torch.ones(1, 10, 80, device=dev),
+        ),
+    ):
+        ids = torch.ones(38, dtype=torch.long)
+        base_info = {"text": ["hello"], "voice": [["spk.wav"]], "ref_audio_cache_key": ["spk-key"]}
+        _, emb1, _ = talker._preprocess_prefill(ids, None, base_info, 38)
+        _, emb2, _ = talker._preprocess_prefill(ids, None, base_info, 38)
+        assert cond_calls == 1
+        assert emo_calls == 1
+        torch.testing.assert_close(emb1, emb2, atol=0.0, rtol=0.0)
+
+        # Separate emotion audio with alpha=0.5 reuses cached base_emo_vec and caches emo_vec
+        emo_info = {
+            **base_info,
+            "emo_audio": ["emo.wav"],
+            "emo_audio_cache_key": ["emo-key"],
+            "emo_alpha": [0.5],
+        }
+        _, emo_emb1, _ = talker._preprocess_prefill(ids, None, emo_info, 38)
+        _, emo_emb2, _ = talker._preprocess_prefill(ids, None, emo_info, 38)
+        assert cond_calls == 1
+        assert emo_calls == 2
+        torch.testing.assert_close(emo_emb1, emo_emb2, atol=0.0, rtol=0.0)
+
+        # Clearing SpeakerEmbeddingCache invalidates cached conds/emo_vec too
+        cache.clear()
+        _, emb3, _ = talker._preprocess_prefill(ids, None, base_info, 38)
+        assert cond_calls == 2
+        assert emo_calls == 3
+        torch.testing.assert_close(emb1, emb3, atol=0.0, rtol=0.0)

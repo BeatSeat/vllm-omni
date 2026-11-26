@@ -844,9 +844,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 dtype=torch.long,
             )
             full_mask = all(length == group_length for length in group_x_lengths)
-            self._set_dit_full_mask_fast_path(estimator, enabled=full_mask)
-            if full_mask:
+            if self.s2mel_dit_cuda_graph:
                 self._enable_dit_cuda_graph(estimator)
+            self._set_dit_full_mask_fast_path(estimator, enabled=full_mask)
             unpad_data = None
             if not full_mask:
                 token_offset = int(bool(getattr(runtime_estimator, "style_as_token", False))) + int(
@@ -1555,13 +1555,20 @@ class IndexTTS2S2MelDecoder(nn.Module):
         if graph_runner is not None:
             graph_runner.enabled = True
             return
-        from vllm_omni.model_executor.models.indextts2.dit_cuda_graph import CUDAGraphDiTRunner
+        from vllm_omni.model_executor.models.indextts2.dit_cuda_graph import (
+            CUDAGraphDiTRunner,
+            CUDAGraphDiTStepRunner,
+        )
 
         estimator._cuda_graph_runner = CUDAGraphDiTRunner(
             estimator.transformer,
             max_graphs=self.s2mel_dit_cuda_graph_max_graphs,
         )
+        estimator._step_cuda_graph_runner = CUDAGraphDiTStepRunner(
+            estimator,
+            max_graphs=self.s2mel_dit_cuda_graph_max_graphs,
+        )
         logger.info(
-            "S2Mel DiT CUDA graph runner enabled (per-shape capture, LRU=%d)",
+            "S2Mel DiT CUDA graph runner enabled (full-step per-shape + packed-varlen ragged capture, LRU=%d)",
             self.s2mel_dit_cuda_graph_max_graphs,
         )

@@ -68,6 +68,7 @@ class WN(torch.nn.Module):
         in_layer: SConv1d,
         x: torch.Tensor,
         logical_lengths: torch.Tensor,
+        reflect_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """Run a WaveNet input convolution at each row's logical boundary.
 
@@ -94,29 +95,43 @@ class WN(torch.nn.Module):
         padded = F.pad(x, (padding_left, padding_right), mode="reflect")
 
         if padding_right:
-            offsets = torch.arange(
-                padding_right,
-                device=x.device,
-                dtype=torch.long,
-            ).unsqueeze(0)
-            lengths = logical_lengths.to(device=x.device, dtype=torch.long).reshape(-1, 1)
-            source_positions = padding_left + lengths - 2 - offsets
-            target_positions = padding_left + lengths + offsets
-            source_indices = source_positions.unsqueeze(1).expand(-1, x.shape[1], -1)
-            target_indices = target_positions.unsqueeze(1).expand(-1, x.shape[1], -1)
+            cache_key = (padding_left, padding_right)
+            cached = reflect_cache.get(cache_key) if reflect_cache is not None else None
+            if cached is None:
+                offsets = torch.arange(
+                    padding_right,
+                    device=x.device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                lengths = logical_lengths.to(device=x.device, dtype=torch.long).reshape(-1, 1)
+                source_positions = padding_left + lengths - 2 - offsets
+                target_positions = padding_left + lengths + offsets
+                source_indices = source_positions.unsqueeze(1).expand(-1, x.shape[1], -1)
+                target_indices = target_positions.unsqueeze(1).expand(-1, x.shape[1], -1)
+                if reflect_cache is not None:
+                    reflect_cache[cache_key] = (source_indices, target_indices)
+            else:
+                source_indices, target_indices = cached
             reflected = torch.gather(padded, dim=2, index=source_indices)
             padded.scatter_(dim=2, index=target_indices, src=reflected)
 
         return in_layer.conv(padded)
 
-    def forward(self, x, x_mask, g=None, **kwargs):
+    def forward(self, x, x_mask, g=None, reflect_cache=None, **kwargs):
         output = torch.zeros_like(x)
 
         logical_lengths = None
+        local_reflect_cache = None
         if getattr(self, "_assume_full_mask", None) is False:
             # Under CFG, x_mask has already been repeated from B to 2B in the
             # same [conditional rows, unconditional rows] order as x.
-            logical_lengths = x_mask[:, 0, :].sum(dim=-1)
+            local_reflect_cache = reflect_cache if reflect_cache is not None else {}
+            if "logical_lengths" in local_reflect_cache:
+                logical_lengths = local_reflect_cache["logical_lengths"]
+            else:
+                logical_lengths = x_mask[:, 0, :].sum(dim=-1)
+                if reflect_cache is not None:
+                    local_reflect_cache["logical_lengths"] = logical_lengths
 
         if g is not None:
             g = self.cond_layer(g)
@@ -129,6 +144,7 @@ class WN(torch.nn.Module):
                     self.in_layers[i],
                     x,
                     logical_lengths,
+                    reflect_cache=local_reflect_cache,
                 )
             if g is not None:
                 cond_offset = i * 2 * self.hidden_channels

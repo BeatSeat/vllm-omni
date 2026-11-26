@@ -177,6 +177,8 @@ class DiT(torch.nn.Module):
         pre_mask=None,
         unpad_data: tuple[torch.Tensor, torch.Tensor] | None = None,
         precomputed_cond: torch.Tensor | None = None,
+        wavenet_reflect_cache: dict | None = None,
+        _skip_inner_graph: bool = False,
     ):
         """
         x (torch.Tensor): random noise
@@ -241,7 +243,7 @@ class DiT(torch.nn.Module):
         input_pos = self.input_pos[: x_in.size(1)]  # (T,) range（0，1863）
         # Route through per-shape CUDA graph runner if enabled.
         graph_runner = getattr(self, "_cuda_graph_runner", None)
-        if graph_runner is not None and unpad_data is None:
+        if graph_runner is not None and unpad_data is None and not _skip_inner_graph:
             x_res = graph_runner(x_in, t1.unsqueeze(1), input_pos, x_mask_expanded)
         else:
             x_res = self.transformer(
@@ -260,7 +262,8 @@ class DiT(torch.nn.Module):
             x = self.conv1(x_res)
             x = x.transpose(1, 2)
             t2 = self.t_embedder2(t)
-            x = self.wavenet(x, x_mask, g=t2.unsqueeze(2)).transpose(1, 2) + self.res_projection(
+            wn_kw = {"reflect_cache": wavenet_reflect_cache} if wavenet_reflect_cache is not None else {}
+            x = self.wavenet(x, x_mask, g=t2.unsqueeze(2), **wn_kw).transpose(1, 2) + self.res_projection(
                 x_res
             )  # long residual connection
             x = self.final_layer(x, t1).transpose(1, 2)

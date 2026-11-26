@@ -194,3 +194,23 @@ def test_decoder_full_mask_switch_unwraps_compiled_estimator():
 
     assert all(layer.attention._assume_full_mask is False for layer in attention_layers)
     assert eager_estimator.wavenet._assume_full_mask is False
+
+
+def test_ragged_wavenet_reuses_reflect_cache_across_calls_bit_exact():
+    wavenet = _make_wavenet()
+    lengths = [6, 5, 4, 3]
+    inputs = torch.randn(len(lengths), 2, max(lengths))
+    conditioning = torch.randn(len(lengths), 2, 1)
+    mask = _sequence_mask(torch.tensor(lengths), inputs.shape[-1])
+    wavenet._assume_full_mask = False
+
+    baseline = wavenet(inputs, mask, g=conditioning)
+    reflect_cache: dict = {}
+    first = wavenet(inputs, mask, g=conditioning, reflect_cache=reflect_cache)
+    assert "logical_lengths" in reflect_cache
+    assert (2, 2) in reflect_cache
+    cached_indices = reflect_cache[(2, 2)]
+    second = wavenet(inputs, mask, g=conditioning, reflect_cache=reflect_cache)
+    assert reflect_cache[(2, 2)] is cached_indices
+    torch.testing.assert_close(first, baseline, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(second, baseline, atol=0.0, rtol=0.0)

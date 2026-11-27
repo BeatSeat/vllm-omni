@@ -203,6 +203,28 @@ class CUDAGraphDiTRunner:
         )
 
 
+_FATAL_CUDA_ERROR_MARKERS = (
+    "device-side assert",
+    "illegal memory access",
+    "misaligned address",
+    "uncorrectable ecc",
+    "hardware stack error",
+    "illegal instruction",
+)
+
+
+def _is_fatal_cuda_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _FATAL_CUDA_ERROR_MARKERS)
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    oom_types: tuple[type[BaseException], ...] = (torch.OutOfMemoryError,)
+    if hasattr(torch.cuda, "OutOfMemoryError"):
+        oom_types = (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError)
+    return isinstance(exc, oom_types) or "out of memory" in str(exc).lower()
+
+
 @dataclass
 class _StepGraphEntry:
     graph: torch.cuda.CUDAGraph
@@ -216,6 +238,8 @@ class _StepGraphEntry:
     static_unpad_data: tuple[torch.Tensor, torch.Tensor] | None
     static_out: torch.Tensor
     static_reflect_cache: dict | None = None
+    stream: object | None = None
+    in_use: bool = False
 
 
 class _SolveGraphSession:
@@ -298,6 +322,7 @@ class _SolveGraphSession:
             autocast_dtype=self._autocast_dtype,
             wavenet_reflect_cache=self._wavenet_reflect_cache,
             is_ragged=self._is_ragged,
+            cache_key=self._cache_key,
         )
         if entry is None:
             self._failed = True
@@ -305,16 +330,39 @@ class _SolveGraphSession:
             self._runner._stats["eager"] += 1
             return self._run_eager(x, t)
 
+        try:
+            entry.graph.replay()
+        except Exception as exc:
+            if _is_fatal_cuda_error(exc):
+                raise
+            logger.warning(
+                "S2Mel DiT full-step CUDA graph first replay failed (ragged=%s) for shape=%s; falling back to eager",
+                self._is_ragged,
+                tuple(x.shape) if hasattr(x, "shape") else type(x).__name__,
+                exc_info=True,
+            )
+            self._runner._handle_capture_failure(
+                is_ragged=self._is_ragged,
+                cache_key=self._cache_key,
+                oom=_is_oom_error(exc),
+            )
+            self._failed = True
+            self._runner._stats["capture_failures"] += 1
+            self._runner._stats["eager"] += 1
+            return self._run_eager(x, t)
+
         self._runner._stats["captures"] += 1
+        entry.in_use = True
         self._entry = entry
         if not self._is_ragged and self._cache_key is not None:
             self._runner._store_entry(self._cache_key, entry)
-        entry.graph.replay()
         return entry.static_out
 
     def close(self) -> None:
-        if self._is_ragged and self._entry is not None:
-            self._entry = None
+        if self._entry is not None:
+            self._entry.in_use = False
+            if self._is_ragged:
+                self._entry = None
 
 
 class CUDAGraphDiTStepRunner:
@@ -326,20 +374,25 @@ class CUDAGraphDiTStepRunner:
     ``wavenet``, ``final_layer``, and output ``float()`` cast) so there are zero
     eager kernel launches between Euler steps.
 
-    - Full-mask shapes (``unpad_data is None``): cached across requests in a
-      bounded LRU; per-request static inputs (``prompt_x``, ``style``,
-      ``precomputed_cond``) are copied once before the Euler loop.
+    - Full-mask shapes (explicit ``full_mask=True`` and ``unpad_data is None``):
+      cached across requests in a bounded LRU; per-request static inputs
+      (``prompt_x``, ``style``, ``precomputed_cond``) are copied once before
+      the Euler loop under a single-active-solve, same-stream guard.
     - Packed-varlen ragged batches (``unpad_data is not None``): step 0 runs
       eager as a real warm pass, step 1 captures an ephemeral graph using the
       shared graph pool, and steps 1..N-1 replay it with zero CPU launch gaps.
     """
+
+    _MAX_FAILED_KEYS = 64
 
     def __init__(self, estimator: torch.nn.Module, *, max_graphs: int = 8, enabled: bool = True) -> None:
         self.estimator = estimator
         self.max_graphs = int(max_graphs)
         self.enabled = bool(enabled)
         self.ragged_enabled = bool(enabled)
+        self.full_mask_enabled = False
         self._cache: OrderedDict[tuple, _StepGraphEntry] = OrderedDict()
+        self._failed_keys: OrderedDict[tuple, None] = OrderedDict()
         self._stats = {
             "calls": 0,
             "hits": 0,
@@ -396,9 +449,36 @@ class CUDAGraphDiTStepRunner:
         self._cache[key] = entry
         self._cache.move_to_end(key)
         while len(self._cache) > self.max_graphs:
-            _, evicted = self._cache.popitem(last=False)
+            # Prefer evicting an idle entry if an overlapping solve somehow holds one.
+            evict_key = next((k for k, v in self._cache.items() if not v.in_use), None)
+            if evict_key is None:
+                break
+            evicted = self._cache.pop(evict_key)
             del evicted
             self._stats["evictions"] += 1
+
+    def _handle_capture_failure(
+        self,
+        *,
+        is_ragged: bool,
+        cache_key: tuple | None,
+        oom: bool,
+    ) -> None:
+        if is_ragged:
+            if not oom:
+                self.ragged_enabled = False
+            return
+        if oom and cache_key is not None:
+            self._failed_keys[cache_key] = None
+            self._failed_keys.move_to_end(cache_key)
+            while len(self._failed_keys) > self._MAX_FAILED_KEYS:
+                self._failed_keys.popitem(last=False)
+            return
+        self.enabled = False
+        # Release cached graphs/static buffers when retiring the runner so they
+        # are not stranded in GPU memory.
+        for key in [k for k, v in self._cache.items() if not v.in_use]:
+            del self._cache[key]
 
     def begin_solve(
         self,
@@ -412,10 +492,12 @@ class CUDAGraphDiTStepRunner:
         autocast_dtype: torch.dtype | None,
         num_steps: int,
         cfg_enabled: bool = True,
+        full_mask: bool | None = None,
         wavenet_reflect_cache: dict | None = None,
     ) -> _SolveGraphSession | None:
         if (
             not self.enabled
+            or getattr(self.estimator, "training", False)
             or prompt_x.device.type != "cuda"
             or torch.cuda.is_current_stream_capturing()
             or num_steps < 2
@@ -443,6 +525,14 @@ class CUDAGraphDiTStepRunner:
                 wavenet_reflect_cache=wavenet_reflect_cache,
             )
 
+        # Dense full-mask LRU requires an explicit caller guarantee (either via
+        # `full_mask_enabled=True` set by the decoder or `full_mask=True`) that
+        # every row is full-length so the all-True mask is identical across
+        # requests sharing the same shape.
+        is_full_mask = self.full_mask_enabled if full_mask is None else bool(full_mask)
+        if not is_full_mask:
+            return None
+
         device_key = (prompt_x.device.type, prompt_x.device.index)
         cache_key = (
             device_key,
@@ -455,9 +545,16 @@ class CUDAGraphDiTStepRunner:
             autocast_dtype,
             bool(cfg_enabled),
         )
+        if cache_key in self._failed_keys:
+            return None
+
         entry = self._cache.get(cache_key)
         if entry is not None:
+            current_stream = torch.cuda.current_stream(prompt_x.device)
+            if entry.in_use or (entry.stream is not None and entry.stream != current_stream):
+                return None
             self._cache.move_to_end(cache_key)
+            entry.in_use = True
             self._load_per_solve_inputs(
                 entry,
                 prompt_x=prompt_x,
@@ -493,31 +590,41 @@ class CUDAGraphDiTStepRunner:
         autocast_dtype: torch.dtype | None,
         wavenet_reflect_cache: dict | None,
         is_ragged: bool,
+        cache_key: tuple | None = None,
     ) -> _StepGraphEntry | None:
-        static_x = x.clone()
-        static_t = t.clone()
-        static_prompt_x = prompt_x.clone()
-        static_style = style.clone()
-        static_cond = precomputed_cond.clone()
-        static_x_lens = x_lens.clone()
-        static_pre_mask = (
-            (
-                pre_mask[0].contiguous().clone(),
-                pre_mask[1].contiguous().clone() if pre_mask[1] is not None else None,
-            )
-            if pre_mask is not None
-            else None
-        )
-        static_unpad = (unpad_data[0].contiguous().clone(), unpad_data[1].contiguous().clone()) if unpad_data else None
-        kw: dict[str, object] = {
-            "pre_mask": static_pre_mask,
-            "unpad_data": static_unpad,
-            "precomputed_cond": static_cond,
-            "_skip_inner_graph": True,
-        }
-        if is_ragged and wavenet_reflect_cache is not None:
-            kw["wavenet_reflect_cache"] = wavenet_reflect_cache
+        orig_stream = torch.cuda.current_stream(x.device)
         try:
+            static_x = x.clone()
+            static_t = t.clone()
+            static_prompt_x = prompt_x.clone()
+            static_style = style.clone()
+            static_cond = precomputed_cond.clone()
+            static_x_lens = x_lens.clone()
+            # Clone only the compact [2B, 1, T] mask and build the [2B, 1, T, T]
+            # expanded tensor as a zero-copy view (avoids O(B*T^2) memory).
+            static_pre_mask: tuple[torch.Tensor, torch.Tensor | None] | None = None
+            if pre_mask is not None:
+                static_x_mask = pre_mask[0].contiguous().clone()
+                static_x_mask_exp = (
+                    static_x_mask[:, None, :].expand(-1, -1, static_x_mask.shape[-1], -1)
+                    if pre_mask[1] is not None
+                    else None
+                )
+                static_pre_mask = (static_x_mask, static_x_mask_exp)
+            static_unpad = (
+                (unpad_data[0].contiguous().clone(), unpad_data[1].contiguous().clone())
+                if unpad_data is not None
+                else None
+            )
+            kw: dict[str, object] = {
+                "pre_mask": static_pre_mask,
+                "unpad_data": static_unpad,
+                "precomputed_cond": static_cond,
+                "_skip_inner_graph": True,
+            }
+            if is_ragged and wavenet_reflect_cache is not None:
+                kw["wavenet_reflect_cache"] = wavenet_reflect_cache
+
             # Step 0 already executed an eager warm pass on the current stream;
             # wait for it to finish before starting stream capture.
             torch.accelerator.synchronize(x.device)
@@ -545,18 +652,27 @@ class CUDAGraphDiTStepRunner:
                             **kw,
                         )
                     static_out = raw_out.float()
-        except Exception:
+        except Exception as exc:
+            if _is_fatal_cuda_error(exc):
+                raise
+            oom = _is_oom_error(exc)
             logger.warning(
-                "Disabling S2Mel DiT full-step CUDA graphs (ragged=%s) after capture failure for shape=%s",
+                "S2Mel DiT full-step CUDA graph capture failed (ragged=%s, oom=%s) for shape=%s; falling back to eager",
                 is_ragged,
-                tuple(x.shape),
+                oom,
+                tuple(x.shape) if hasattr(x, "shape") else type(x).__name__,
                 exc_info=True,
             )
-            if is_ragged:
-                self.ragged_enabled = False
-            else:
-                self.enabled = False
+            self._handle_capture_failure(
+                is_ragged=is_ragged,
+                cache_key=cache_key,
+                oom=oom,
+            )
             return None
+        finally:
+            # PyTorch may raise from capture_end() before restoring the caller
+            # stream; always restore it so eager fallback preserves stream order.
+            torch.cuda.set_stream(orig_stream)
 
         return _StepGraphEntry(
             graph=graph,
@@ -570,4 +686,5 @@ class CUDAGraphDiTStepRunner:
             static_unpad_data=static_unpad,
             static_out=static_out,
             static_reflect_cache=wavenet_reflect_cache if is_ragged else None,
+            stream=orig_stream,
         )

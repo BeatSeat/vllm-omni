@@ -205,12 +205,27 @@ def test_ragged_wavenet_reuses_reflect_cache_across_calls_bit_exact():
     wavenet._assume_full_mask = False
 
     baseline = wavenet(inputs, mask, g=conditioning)
-    reflect_cache: dict = {}
-    first = wavenet(inputs, mask, g=conditioning, reflect_cache=reflect_cache)
+    reflect_cache = wavenet.build_reflect_cache(mask)
     assert "logical_lengths" in reflect_cache
     assert (2, 2) in reflect_cache
     cached_indices = reflect_cache[(2, 2)]
+    first = wavenet(inputs, mask, g=conditioning, reflect_cache=reflect_cache)
     second = wavenet(inputs, mask, g=conditioning, reflect_cache=reflect_cache)
     assert reflect_cache[(2, 2)] is cached_indices
     torch.testing.assert_close(first, baseline, atol=0.0, rtol=0.0)
     torch.testing.assert_close(second, baseline, atol=0.0, rtol=0.0)
+
+    # Pre-built reflect_cache stays read-only across repeated compiled steps -> 1 compile.
+    compile_count = 0
+
+    def _counting_backend(gm, _example_inputs):
+        nonlocal compile_count
+        compile_count += 1
+        return gm
+
+    compiled = torch.compile(wavenet, backend=_counting_backend, fullgraph=True, dynamic=True)
+    out0 = compiled(inputs, mask, g=conditioning, reflect_cache=reflect_cache)
+    out1 = compiled(inputs * 0.5, mask, g=conditioning, reflect_cache=reflect_cache)
+    assert compile_count == 1
+    torch.testing.assert_close(out0, baseline, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(out1, wavenet(inputs * 0.5, mask, g=conditioning), rtol=1e-5, atol=1e-6)

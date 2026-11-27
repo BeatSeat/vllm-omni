@@ -8,6 +8,7 @@ for Stage 1 (S2Mel + BigVGAN).
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import re
@@ -62,6 +63,7 @@ from .preprocess_utils import (
 )
 
 logger = init_logger(__name__)
+_SPEAKER_CACHE_ENTRY_COUNTER = itertools.count(1)
 
 
 @dataclass(frozen=True)
@@ -177,8 +179,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         self.omni_payload_at_request_end = True
         self.omni_request_end_token_ids = ()
         self._speaker_cache = get_speaker_cache()
-        self._cond_cache: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
+        self._cond_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._cond_cache_max_entries: int = 128
+        self._weight_generation: int = 0
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("codes", "mel"),
             ("meta", "mel_start_offset"),
@@ -537,6 +540,19 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         # --- Prefill path ---
         return self._preprocess_prefill(input_ids, input_embeds, info_dict, span_len)
 
+    def _validate_decode_step_bounds(self, decode_steps: int | list[int]) -> None:
+        emb = getattr(self.mel_pos_embedding, "emb", None)
+        num_embeddings = getattr(emb, "num_embeddings", None)
+        if not isinstance(num_embeddings, int) or num_embeddings <= 0:
+            return
+        max_step = decode_steps if isinstance(decode_steps, int) else max(decode_steps)
+        min_step = decode_steps if isinstance(decode_steps, int) else min(decode_steps)
+        if min_step < 0 or max_step >= num_embeddings:
+            raise ValueError(
+                f"IndexTTS decode step out of mel_pos_embedding bounds: "
+                f"step_range=[{min_step}, {max_step}], valid=[0, {num_embeddings - 1}]"
+            )
+
     def _preprocess_decode(
         self,
         input_ids: torch.Tensor,
@@ -550,6 +566,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         if not isinstance(prev_count, int):
             prev_count = int(prev_count)
         decode_step = prev_count + 1
+        self._validate_decode_step_bounds(decode_step)
 
         # Only keep the current token; no O(T) history accumulation.
         new_codes = input_ids.detach()
@@ -616,6 +633,7 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             else:
                 updates_by_req.append({"meta": meta_update})
 
+        self._validate_decode_step_bounds(decode_steps)
         step_tensor = index_to_device(decode_steps, ids_flat.device)
         embeds = self.mel_embedding(ids_flat) + self.mel_pos_embedding.emb(step_tensor)
         return input_ids, embeds, updates_by_req
@@ -666,21 +684,24 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         text_preprocessed = bool(_first(INDEXTTS25_TEXT_PREPROCESSED_KEY, False))
         _raw_emo_voice = _first("emo_voice_name")
         emo_voice_name = str(_raw_emo_voice).strip().lower() if _raw_emo_voice else None
-        _ref_audio_cache_key = _first("ref_audio_cache_key")
-        _emo_audio_cache_key = _first("emo_audio_cache_key")
+        # Only trust decoded waveform content digests (not URL locator keys) for
+        # worker-side speaker/emotion feature caching.
+        _ref_audio_artifact_key = _first("ref_audio_artifact_key")
+        _emo_audio_artifact_key = _first("emo_audio_artifact_key")
 
         # --- Speaker cache lookup ---
         _voice_name = _first("voice_name")
         _voice_created_at = int(_first("voice_created_at", 0))
-        _cache_model_tag = "indextts2_5" if self.conditioning_policy.uses_campplus_projection else "indextts2"
+        _version_tag = "indextts2_5" if self.conditioning_policy.uses_campplus_projection else "indextts2"
+        _cache_model_tag = f"{_version_tag}:{self.model_path}"
         _speaker_cache_key = None
         _cached = None
         if _voice_name:
             _speaker_cache_key = self._speaker_cache.make_cache_key(_voice_name, _cache_model_tag, _voice_created_at)
             _cached = self._speaker_cache.get(_speaker_cache_key)
-        elif isinstance(_ref_audio_cache_key, str) and _ref_audio_cache_key:
+        elif isinstance(_ref_audio_artifact_key, str) and _ref_audio_artifact_key:
             _speaker_cache_key = self._speaker_cache.make_cache_key(
-                f"ref:{_ref_audio_cache_key}",
+                f"artifact:{_ref_audio_artifact_key}",
                 _cache_model_tag,
                 0,
             )
@@ -696,10 +717,13 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         w2v_proc = None
 
         _speaker_cache_hit = _cached is not None
+        _speaker_entry_id: int | None = None
         if not _speaker_cache_hit and _speaker_cache_key is not None:
             self._cond_cache_pop(_speaker_cache_key)
 
         if _cached is not None:
+            _raw_entry_id = _cached.get("_entry_id")
+            _speaker_entry_id = _raw_entry_id if isinstance(_raw_entry_id, int) else None
             s_ref_cpu = _cached["S_ref"].detach().cpu().contiguous()
             style_cpu = _cached["style"].detach().cpu().contiguous()
             ref_mel_cpu = _cached["ref_mel"].detach().cpu().contiguous()
@@ -737,9 +761,11 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             ref_mel_cpu = ref_mel.detach().cpu().contiguous()
 
             if _speaker_cache_key is not None:
+                _speaker_entry_id = next(_SPEAKER_CACHE_ENTRY_COUNTER)
                 self._speaker_cache.put(
                     _speaker_cache_key,
                     {
+                        "_entry_id": _speaker_entry_id,
                         "S_ref": s_ref_cpu,
                         "style": style_cpu,
                         "ref_mel": ref_mel_cpu,
@@ -752,7 +778,15 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         else:
             model_dtype = next(self.conditioning_encoder.parameters()).dtype
 
-        _cond_entry = self._cond_cache_get(_speaker_cache_key) if (_speaker_cache_hit and _speaker_cache_key) else None
+        _cond_entry = (
+            self._cond_cache_get(
+                _speaker_cache_key,
+                raw_entry_id=_speaker_entry_id,
+                dtype=model_dtype,
+            )
+            if (_speaker_cache_hit and _speaker_cache_key)
+            else None
+        )
         if self.conditioning_policy.uses_conformer_perceiver:
             _cached_conds = _cond_entry.get("conds") if _cond_entry is not None else None
             if _cached_conds is not None:
@@ -763,17 +797,24 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 speech_cond, mask = self.conditioning_encoder(spk_cond_emb, spk_lens)
                 conds_mask = self.cond_mask_pad(mask.squeeze(1))
                 conds = self.perceiver_encoder(speech_cond, conds_mask)
-                if _speaker_cache_key is not None:
-                    self._cond_cache_put(_speaker_cache_key, "conds", conds)
+                if _speaker_cache_key is not None and _speaker_entry_id is not None:
+                    self._cond_cache_put(
+                        _speaker_cache_key,
+                        "conds",
+                        conds,
+                        raw_entry_id=_speaker_entry_id,
+                        dtype=model_dtype,
+                    )
 
         emo_vec = self._compute_emotion_vector(
             wav_16k=wav_16k,
             speaker_audio_path=voice_path,
             emo_audio_path=emo_audio_path,
             emo_voice_name=emo_voice_name,
-            emo_audio_cache_key=_emo_audio_cache_key if isinstance(_emo_audio_cache_key, str) else None,
+            emo_audio_artifact_key=_emo_audio_artifact_key if isinstance(_emo_audio_artifact_key, str) else None,
             speaker_cache_key=_speaker_cache_key,
             speaker_cache_hit=_speaker_cache_hit,
+            speaker_entry_id=_speaker_entry_id,
             target_dtype=model_dtype,
             main_text=text,
             use_emo_text=use_emo_text,
@@ -930,29 +971,49 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
     # Emotion conditioning
     # ------------------------------------------------------------------
 
-    def _get_cond_cache(self) -> OrderedDict[str, dict[str, torch.Tensor]]:
+    def _get_cond_cache(self) -> OrderedDict[str, dict[str, Any]]:
         cache = getattr(self, "_cond_cache", None)
         if cache is None:
             cache = OrderedDict()
             self._cond_cache = cache
         return cache
 
-    def _cond_cache_get(self, key: str | None) -> dict[str, torch.Tensor] | None:
-        if not key:
+    def _cond_cache_get(
+        self,
+        key: str | None,
+        *,
+        raw_entry_id: int | None,
+        dtype: torch.dtype,
+    ) -> dict[str, Any] | None:
+        if not key or raw_entry_id is None:
             return None
         cache = self._get_cond_cache()
         entry = cache.get(key)
-        if entry is not None:
-            cache.move_to_end(key)
+        if entry is None:
+            return None
+        expected_meta = (raw_entry_id, dtype, int(getattr(self, "_weight_generation", 0)))
+        if entry.get("_meta") != expected_meta:
+            cache.pop(key, None)
+            return None
+        cache.move_to_end(key)
         return entry
 
-    def _cond_cache_put(self, key: str | None, field: str, tensor: torch.Tensor) -> None:
-        if not key:
+    def _cond_cache_put(
+        self,
+        key: str | None,
+        field: str,
+        tensor: torch.Tensor,
+        *,
+        raw_entry_id: int | None,
+        dtype: torch.dtype,
+    ) -> None:
+        if not key or raw_entry_id is None:
             return
         cache = self._get_cond_cache()
+        meta = (raw_entry_id, dtype, int(getattr(self, "_weight_generation", 0)))
         entry = cache.get(key)
-        if entry is None:
-            entry = {}
+        if entry is None or entry.get("_meta") != meta:
+            entry = {"_meta": meta}
             cache[key] = entry
         else:
             cache.move_to_end(key)
@@ -986,9 +1047,10 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         w2v_model: Any,
         w2v_proc: Any,
         device: torch.device,
-        emo_audio_cache_key: str | None = None,
+        emo_audio_artifact_key: str | None = None,
         speaker_cache_key: str | None = None,
         speaker_cache_hit: bool = False,
+        speaker_entry_id: int | None = None,
         target_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Full emotion control logic aligned with official infer_v2.py. Returns [1, D]."""
@@ -1041,7 +1103,15 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             emovec_mat = self._compute_emo_from_distribution(vec, style, device, use_random=use_random)
 
         out_dtype = target_dtype if target_dtype is not None else spk_cond_emb.dtype
-        spk_cond_entry = self._cond_cache_get(speaker_cache_key) if (speaker_cache_hit and speaker_cache_key) else None
+        spk_cond_entry = (
+            self._cond_cache_get(
+                speaker_cache_key,
+                raw_entry_id=speaker_entry_id,
+                dtype=out_dtype,
+            )
+            if (speaker_cache_hit and speaker_cache_key)
+            else None
+        )
         cached_base_emo = spk_cond_entry.get("base_emo_vec") if spk_cond_entry is not None else None
 
         # --- Audio-based emotion with alpha blending ---
@@ -1053,25 +1123,48 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
             else:
                 spk_emb_dev = spk_cond_emb.to(device=device, dtype=out_dtype)
                 emovec = self._merge_emovec(spk_emb_dev, spk_emb_dev, 1.0)
-                if speaker_cache_key is not None:
-                    self._cond_cache_put(speaker_cache_key, "base_emo_vec", emovec)
+                if speaker_cache_key is not None and speaker_entry_id is not None:
+                    self._cond_cache_put(
+                        speaker_cache_key,
+                        "base_emo_vec",
+                        emovec,
+                        raw_entry_id=speaker_entry_id,
+                        dtype=out_dtype,
+                    )
         else:
             effective_alpha = emo_alpha
-            # emotion audio cache (uploaded emo_voice_name or content-hashed emo_audio_cache_key)
+            # Checkpoint-scoped emotion audio cache (uploaded emo_voice_name or
+            # decoded waveform content digest emo_audio_artifact_key).
+            _version_tag = "indextts2_5" if self.conditioning_policy.uses_campplus_projection else "indextts2"
+            _emo_model_tag = f"{_version_tag}_emo:{self.model_path}"
             _emo_cache_key = None
             _emo_cached = None
-            if emo_voice_name:
-                _emo_cache_key = self._speaker_cache.make_cache_key(emo_voice_name, "indextts2_emo", 0)
+            if emo_voice_name and emo_audio_artifact_key:
+                _emo_cache_key = self._speaker_cache.make_cache_key(
+                    f"{emo_voice_name}:{emo_audio_artifact_key}",
+                    _emo_model_tag,
+                    0,
+                )
                 _emo_cached = self._speaker_cache.get(_emo_cache_key)
-            elif emo_audio_cache_key:
-                _emo_cache_key = self._speaker_cache.make_cache_key(f"ref:{emo_audio_cache_key}", "indextts2_emo", 0)
+            elif emo_voice_name:
+                _emo_cache_key = self._speaker_cache.make_cache_key(emo_voice_name, _emo_model_tag, 0)
+                _emo_cached = self._speaker_cache.get(_emo_cache_key)
+            elif emo_audio_artifact_key:
+                _emo_cache_key = self._speaker_cache.make_cache_key(
+                    f"artifact:{emo_audio_artifact_key}",
+                    _emo_model_tag,
+                    0,
+                )
                 _emo_cached = self._speaker_cache.get(_emo_cache_key)
 
             _emo_cache_hit = _emo_cached is not None
+            _emo_entry_id: int | None = None
             if not _emo_cache_hit and _emo_cache_key is not None:
                 self._cond_cache_pop(_emo_cache_key)
 
             if _emo_cached is not None:
+                _raw_emo_id = _emo_cached.get("_entry_id")
+                _emo_entry_id = _raw_emo_id if isinstance(_raw_emo_id, int) else None
                 emo_cond_emb = _emo_cached["spk_cond_emb"]
                 logger.debug("[EMO] cache HIT for %s", emo_voice_name)
             else:
@@ -1081,15 +1174,25 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                 self._ensure_w2v_stat_loaded(device)
                 emo_cond_emb = wav2vec_extract(emo_wav_16k, w2v_model, w2v_proc, device, self._w2v_stat)
                 if _emo_cache_key is not None:
+                    _emo_entry_id = next(_SPEAKER_CACHE_ENTRY_COUNTER)
                     self._speaker_cache.put(
                         _emo_cache_key,
                         {
+                            "_entry_id": _emo_entry_id,
                             "spk_cond_emb": emo_cond_emb.detach().cpu().contiguous(),
                         },
                     )
                     logger.debug("[EMO] cache MISS, cached for %s", emo_voice_name)
 
-            emo_cond_entry = self._cond_cache_get(_emo_cache_key) if (_emo_cache_hit and _emo_cache_key) else None
+            emo_cond_entry = (
+                self._cond_cache_get(
+                    _emo_cache_key,
+                    raw_entry_id=_emo_entry_id,
+                    dtype=out_dtype,
+                )
+                if (_emo_cache_hit and _emo_cache_key)
+                else None
+            )
             cached_emo_vec = emo_cond_entry.get("emo_vec") if emo_cond_entry is not None else None
             uses_default_merge = (
                 getattr(type(self), "_merge_emovec", None) is IndexTTS2TalkerForConditionalGeneration._merge_emovec
@@ -1103,8 +1206,14 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     spk_emb_dev = spk_cond_emb.to(device=device, dtype=out_dtype)
                     emo_emb_dev = emo_cond_emb.to(device=device, dtype=out_dtype)
                     emovec = self._merge_emovec(spk_emb_dev, emo_emb_dev, 1.0)
-                    if _emo_cache_key is not None:
-                        self._cond_cache_put(_emo_cache_key, "emo_vec", emovec)
+                    if _emo_cache_key is not None and _emo_entry_id is not None:
+                        self._cond_cache_put(
+                            _emo_cache_key,
+                            "emo_vec",
+                            emovec,
+                            raw_entry_id=_emo_entry_id,
+                            dtype=out_dtype,
+                        )
             elif effective_alpha == 0.0:
                 if cached_base_emo is not None:
                     emovec = cached_base_emo.to(device=device, dtype=out_dtype)
@@ -1112,8 +1221,14 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     spk_emb_dev = spk_cond_emb.to(device=device, dtype=out_dtype)
                     emo_emb_dev = emo_cond_emb.to(device=device, dtype=out_dtype)
                     emovec = self._merge_emovec(spk_emb_dev, emo_emb_dev, 0.0)
-                    if speaker_cache_key is not None:
-                        self._cond_cache_put(speaker_cache_key, "base_emo_vec", emovec)
+                    if speaker_cache_key is not None and speaker_entry_id is not None:
+                        self._cond_cache_put(
+                            speaker_cache_key,
+                            "base_emo_vec",
+                            emovec,
+                            raw_entry_id=speaker_entry_id,
+                            dtype=out_dtype,
+                        )
             elif cached_base_emo is not None and cached_emo_vec is not None:
                 base_vec = cached_base_emo.to(device=device, dtype=out_dtype)
                 emo_vec_audio = cached_emo_vec.to(device=device, dtype=out_dtype)
@@ -1123,14 +1238,26 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
                     base_vec = cached_base_emo.to(device=device, dtype=out_dtype)
                 else:
                     base_vec = self._compute_audio_emo_vec(spk_cond_emb.to(device=device, dtype=out_dtype))
-                    if speaker_cache_key is not None:
-                        self._cond_cache_put(speaker_cache_key, "base_emo_vec", base_vec)
+                    if speaker_cache_key is not None and speaker_entry_id is not None:
+                        self._cond_cache_put(
+                            speaker_cache_key,
+                            "base_emo_vec",
+                            base_vec,
+                            raw_entry_id=speaker_entry_id,
+                            dtype=out_dtype,
+                        )
                 if cached_emo_vec is not None:
                     emo_vec_audio = cached_emo_vec.to(device=device, dtype=out_dtype)
                 else:
                     emo_vec_audio = self._compute_audio_emo_vec(emo_cond_emb.to(device=device, dtype=out_dtype))
-                    if _emo_cache_key is not None:
-                        self._cond_cache_put(_emo_cache_key, "emo_vec", emo_vec_audio)
+                    if _emo_cache_key is not None and _emo_entry_id is not None:
+                        self._cond_cache_put(
+                            _emo_cache_key,
+                            "emo_vec",
+                            emo_vec_audio,
+                            raw_entry_id=_emo_entry_id,
+                            dtype=out_dtype,
+                        )
                 emovec = base_vec + effective_alpha * (emo_vec_audio - base_vec)
             else:
                 spk_emb_dev = spk_cond_emb.to(device=device, dtype=out_dtype)
@@ -1496,6 +1623,9 @@ class IndexTTS2TalkerForConditionalGeneration(nn.Module):
         for mod in modules:
             mod.to(target_device)
 
+        self._weight_generation = int(getattr(self, "_weight_generation", 0)) + 1
+        if getattr(self, "_cond_cache", None) is not None:
+            self._cond_cache.clear()
         self._warmup_external_models(target_device)
         return loaded_params
 

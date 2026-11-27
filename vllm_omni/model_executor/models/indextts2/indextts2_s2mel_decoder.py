@@ -868,19 +868,24 @@ class IndexTTS2S2MelDecoder(nn.Module):
                 device=cond.device,
                 dtype=cond.dtype,
             )
-            with torch.no_grad():
-                group_mel = cfm.inference(
-                    packed_condition,
-                    x_lens,
-                    packed_prompt,
-                    packed_style,
-                    None,
-                    self.diffusion_steps,
-                    inference_cfg_rate=self.inference_cfg_rate,
-                    initial_noise=initial_noise,
-                    prompt_lens=prompt_lens,
-                    unpad_data=unpad_data,
-                )
+            try:
+                with torch.no_grad():
+                    group_mel = cfm.inference(
+                        packed_condition,
+                        x_lens,
+                        packed_prompt,
+                        packed_style,
+                        None,
+                        self.diffusion_steps,
+                        inference_cfg_rate=self.inference_cfg_rate,
+                        initial_noise=initial_noise,
+                        prompt_lens=prompt_lens,
+                        unpad_data=unpad_data,
+                    )
+            finally:
+                step_runner = getattr(runtime_estimator, "_step_cuda_graph_runner", None)
+                if step_runner is not None:
+                    step_runner.full_mask_enabled = False
 
             for row, (index, ref_len, target_len) in enumerate(
                 zip(group_indices, group_ref_lengths, group_target_lengths)
@@ -1541,6 +1546,9 @@ class IndexTTS2S2MelDecoder(nn.Module):
         graph_runner = getattr(runtime_estimator, "_cuda_graph_runner", None)
         if graph_runner is not None and not enabled:
             graph_runner.enabled = False
+        step_runner = getattr(runtime_estimator, "_step_cuda_graph_runner", None)
+        if step_runner is not None:
+            step_runner.full_mask_enabled = enabled
 
     def _enable_dit_cuda_graph(self, estimator: nn.Module) -> None:
         """Attach a per-shape CUDA graph runner to the DiT transformer core.

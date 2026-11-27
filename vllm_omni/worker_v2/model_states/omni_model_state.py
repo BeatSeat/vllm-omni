@@ -747,13 +747,14 @@ class OmniModelState(DefaultModelState):
             num_computed_tokens = None
             if req_states is not None:
                 prompt_len = self._get_req_state_value(getattr(req_states, "prompt_len", None), req_idx)
-                num_computed_field = getattr(req_states, "num_computed_tokens_np", None)
-                if num_computed_field is None:
-                    num_computed_field = getattr(req_states, "num_computed_tokens", None)
-                num_computed_tokens = self._get_req_state_value(
-                    num_computed_field,
-                    req_idx,
-                )
+                num_computed_np = getattr(req_states, "num_computed_tokens_np", None)
+                if isinstance(num_computed_np, np.ndarray):
+                    num_computed_tokens = self._get_req_state_value(num_computed_np, req_idx)
+                if num_computed_tokens is None:
+                    num_computed_tokens = self._get_req_state_value(
+                        getattr(req_states, "num_computed_tokens", None),
+                        req_idx,
+                    )
             if num_computed_tokens is None:
                 num_computed_tokens = self._get_input_batch_num_computed(input_batch, req_idx, i)
             if prompt_len is not None:

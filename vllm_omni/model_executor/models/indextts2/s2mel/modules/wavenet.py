@@ -63,12 +63,48 @@ class WN(torch.nn.Module):
             for layer in self.in_layers
         )
 
+    def build_reflect_cache(self, x_mask: torch.Tensor) -> dict[object, object]:
+        """Precompute ragged logical lengths and right-reflection gather/scatter indices.
+
+        Building this cache once outside the Euler ODE loop ensures every ODE
+        step receives an identical, read-only cache structure so ``torch.compile``
+        traces a single graph without recompiling between step 0 and step 1.
+        """
+        logical_lengths = x_mask[:, 0, :].sum(dim=-1)
+        lengths = logical_lengths.to(device=x_mask.device, dtype=torch.long).reshape(-1, 1)
+        cache: dict[object, object] = {"logical_lengths": logical_lengths}
+        for in_layer in self.in_layers:
+            conv = in_layer.conv.conv
+            stride = conv.stride[0]
+            dilation = conv.dilation[0]
+            effective_kernel = (conv.kernel_size[0] - 1) * dilation + 1
+            if in_layer.causal or in_layer.pad_mode != "reflect" or stride != 1:
+                raise RuntimeError(
+                    "Ragged WaveNet batching requires non-causal reflect-padded stride-one input convolutions"
+                )
+            padding_total = effective_kernel - stride
+            padding_right = padding_total // 2
+            padding_left = padding_total - padding_right
+            cache_key = (padding_left, padding_right)
+            if padding_right and cache_key not in cache:
+                offsets = torch.arange(
+                    padding_right,
+                    device=x_mask.device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                source_positions = padding_left + lengths - 2 - offsets
+                target_positions = padding_left + lengths + offsets
+                source_indices = source_positions.unsqueeze(1).expand(-1, self.hidden_channels, -1)
+                target_indices = target_positions.unsqueeze(1).expand(-1, self.hidden_channels, -1)
+                cache[cache_key] = (source_indices, target_indices)
+        return cache
+
     @staticmethod
     def _logical_reflect_in_layer(
         in_layer: SConv1d,
         x: torch.Tensor,
         logical_lengths: torch.Tensor,
-        reflect_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] | None = None,
+        reflect_cache: dict[object, object] | None = None,
     ) -> torch.Tensor:
         """Run a WaveNet input convolution at each row's logical boundary.
 
@@ -97,7 +133,9 @@ class WN(torch.nn.Module):
         if padding_right:
             cache_key = (padding_left, padding_right)
             cached = reflect_cache.get(cache_key) if reflect_cache is not None else None
-            if cached is None:
+            if cached is not None:
+                source_indices, target_indices = cached  # type: ignore[misc]
+            else:
                 offsets = torch.arange(
                     padding_right,
                     device=x.device,
@@ -110,8 +148,6 @@ class WN(torch.nn.Module):
                 target_indices = target_positions.unsqueeze(1).expand(-1, x.shape[1], -1)
                 if reflect_cache is not None:
                     reflect_cache[cache_key] = (source_indices, target_indices)
-            else:
-                source_indices, target_indices = cached
             reflected = torch.gather(padded, dim=2, index=source_indices)
             padded.scatter_(dim=2, index=target_indices, src=reflected)
 

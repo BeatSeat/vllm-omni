@@ -239,6 +239,20 @@ class IndexTTS2Adapter(ARTTSAdapter):
     ) -> list:
         return apply_max_new_tokens(sampling_params_list, request)
 
+    @staticmethod
+    def _resolve_artifact_key(server: Any, cache_key: str, wav_list: Any, sr: int) -> str | None:
+        get_artifact_key = getattr(server, "_get_resolved_ref_audio_artifact_key", None)
+        if callable(get_artifact_key):
+            artifact_key = get_artifact_key(cache_key)
+            if isinstance(artifact_key, str) and artifact_key:
+                return artifact_key
+        make_artifact_key = getattr(server, "_make_ref_audio_artifact_cache_key", None)
+        if callable(make_artifact_key):
+            artifact_key = make_artifact_key(np.asarray(wav_list, dtype=np.float32), int(sr))
+            if isinstance(artifact_key, str) and artifact_key:
+                return artifact_key
+        return None
+
     async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server
         params: dict[str, Any] = {"text": [request.input]}
@@ -252,6 +266,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio_source)
             params["voice"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = [cache_key]
+            artifact_key = self._resolve_artifact_key(server, cache_key, wav_list, sr)
+            if artifact_key:
+                params["ref_audio_artifact_key"] = [artifact_key]
         if using_uploaded_voice and voice_lower:
             params["voice_name"] = [voice_lower]
             params["voice_created_at"] = [server._voice_created_at(voice_lower)]
@@ -264,6 +281,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
                 wav_list, sr, emo_key = await server._resolve_ref_audio(extras[key])
                 params[key] = [[wav_list, sr]]
                 params["emo_audio_cache_key"] = [emo_key]
+                emo_artifact_key = self._resolve_artifact_key(server, emo_key, wav_list, sr)
+                if emo_artifact_key:
+                    params["emo_audio_artifact_key"] = [emo_artifact_key]
             else:
                 params[key] = [extras[key]]
         return params

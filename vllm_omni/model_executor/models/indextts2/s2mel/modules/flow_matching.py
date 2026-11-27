@@ -225,8 +225,15 @@ class BASECFM(torch.nn.Module, ABC):
         est_extra_kw: dict[str, object] = {}
         if precomputed_cond is not None:
             est_extra_kw["precomputed_cond"] = precomputed_cond
-        wavenet_reflect_cache: dict | None = {} if unpad_data is not None else None
-        if wavenet_reflect_cache is not None and can_precompute_cond:
+        wavenet_reflect_cache: dict | None = None
+        if unpad_data is not None and can_precompute_cond:
+            wavenet = getattr(eager_estimator, "wavenet", None)
+            active_mask = cfg_pre_mask[0] if inference_cfg_rate > 0 else pre_mask[0]
+            build_reflect_cache = getattr(wavenet, "build_reflect_cache", None)
+            if callable(build_reflect_cache):
+                wavenet_reflect_cache = build_reflect_cache(active_mask)
+            else:
+                wavenet_reflect_cache = {}
             est_extra_kw["wavenet_reflect_cache"] = wavenet_reflect_cache
 
         step_graph_session = None

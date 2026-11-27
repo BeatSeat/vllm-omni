@@ -863,13 +863,27 @@ def test_ref_audio_and_emo_audio_cache_keys_reuse_speaker_cache_and_isolate_vers
         ),
     ):
         t2 = _build_minimal_talker("indextts2")
+        # Raw URL locator key without content digest must NOT hit worker cache.
+        info_url_only = {
+            "text": ["hello"],
+            "voice": [["dummy.wav"]],
+            "ref_audio_cache_key": ["url-locator-only"],
+        }
+        ids_v2 = torch.ones(38, dtype=torch.long)
+        t2._preprocess_prefill(ids_v2, None, info_url_only, 38)
+        t2._preprocess_prefill(ids_v2, None, info_url_only, 38)
+        assert len(load_calls) == 2
+
+        load_calls.clear()
+        w2v_calls.clear()
+        quant_calls.clear()
+
         info_v2 = {
             "text": ["hello"],
             "voice": [["dummy.wav"]],
-            "ref_audio_cache_key": ["sha256-same-ref"],
+            "ref_audio_artifact_key": ["sha1-same-ref"],
         }
         # IndexTTS-2: 34 prefix + 3 text + 1 start_mel = 38 tokens
-        ids_v2 = torch.ones(38, dtype=torch.long)
         _, _, upd1 = t2._preprocess_prefill(ids_v2, None, info_v2, 38)
         _, _, upd2 = t2._preprocess_prefill(ids_v2, None, info_v2, 38)
         assert len(load_calls) == 1
@@ -878,14 +892,15 @@ def test_ref_audio_and_emo_audio_cache_keys_reuse_speaker_cache_and_isolate_vers
         torch.testing.assert_close(upd1["meta"]["S_ref"], upd2["meta"]["S_ref"])
         assert float(upd2["meta"]["S_ref"][0, 0, 0]) == pytest.approx(1.25)
 
-        # IndexTTS-2.5 with the exact same ref_audio_cache_key must NOT hit 2.0's quantized S_ref
+        # IndexTTS-2.5 with the exact same ref_audio_artifact_key must NOT hit 2.0's quantized S_ref
+        # and separate emotion cache must also isolate 2.0 vs 2.5 checkpoints.
         t25 = _build_minimal_talker("indextts2_5")
         info_v25 = {
             "text": ["hello"],
             "voice": [["dummy.wav"]],
-            "ref_audio_cache_key": ["sha256-same-ref"],
+            "ref_audio_artifact_key": ["sha1-same-ref"],
             "emo_audio": ["emo.wav"],
-            "emo_audio_cache_key": ["sha256-same-emo"],
+            "emo_audio_artifact_key": ["sha1-same-emo"],
         }
         # IndexTTS-2.5: 3 prefix + 3 text + 1 start_mel = 7 tokens
         ids_v25 = torch.ones(7, dtype=torch.long)
@@ -896,6 +911,15 @@ def test_ref_audio_and_emo_audio_cache_keys_reuse_speaker_cache_and_isolate_vers
         assert len(w2v_calls) == 3
         assert float(upd25_1["meta"]["S_ref"][0, 0, 0]) == pytest.approx(2.5)
         torch.testing.assert_close(upd25_1["meta"]["S_ref"], upd25_2["meta"]["S_ref"])
+
+        # IndexTTS-2 with the same emo_audio_artifact_key must NOT hit 2.5's emotion cache entry.
+        info_v2_emo = {
+            **info_v2,
+            "emo_audio": ["emo.wav"],
+            "emo_audio_artifact_key": ["sha1-same-emo"],
+        }
+        t2._preprocess_prefill(ids_v2, None, info_v2_emo, 38)
+        assert load_calls == ["speaker", "speaker", "emotion", "emotion"]
 
 
 @pytest.mark.parametrize("use_gpt_latent", [True, False])
@@ -1024,6 +1048,26 @@ def test_mrv2_batched_decode_preprocess_and_postprocess_match_serial(use_gpt_lat
             torch.testing.assert_close(stored, decode_hidden[i : i + 1], atol=0.0, rtol=0.0)
         else:
             assert "latent_acc" not in state.intermediate_buffer.buffers[i]["meta"]
+
+    # Verify unspecced MagicMock req_states does NOT shadow legacy num_computed_tokens
+    from unittest.mock import MagicMock
+
+    mock_req_states = MagicMock()
+    mock_req_states.prompt_len = np.array([10, 11, 12, 0], dtype=np.int32)
+    mock_req_states.num_computed_tokens = np.array([12, 14, 16, 0], dtype=np.int32)
+    state.run_preprocess(input_batch, {"input_ids": input_ids}, req_states=mock_req_states)
+    assert state.intermediate_buffer.buffers[0]["meta"]["mel_code_count"] == 4
+
+    # Verify decode step bounds guard rejects out-of-range mel_pos_embedding indices cleanly
+    oob_meta = {"mel_start_offset": 10, "mel_code_count": 63}
+    with pytest.raises(ValueError, match="mel_pos_embedding bounds"):
+        talker._preprocess_decode(torch.tensor([7]), {}, oob_meta)
+    with pytest.raises(ValueError, match="mel_pos_embedding bounds"):
+        talker.preprocess_decode_batch_mrv2(
+            input_ids=torch.tensor([7]),
+            input_embeds=torch.zeros(1, HIDDEN),
+            req_infos=[{"req_id": "req-oob", "meta": oob_meta}],
+        )
 
 
 def test_cfm_solve_euler_hoists_cond_projection_once_with_identical_output():
@@ -1191,7 +1235,7 @@ def test_prefill_caches_conformer_conds_and_emo_vectors_and_invalidates_on_speak
         ),
     ):
         ids = torch.ones(38, dtype=torch.long)
-        base_info = {"text": ["hello"], "voice": [["spk.wav"]], "ref_audio_cache_key": ["spk-key"]}
+        base_info = {"text": ["hello"], "voice": [["spk.wav"]], "ref_audio_artifact_key": ["spk-key"]}
         _, emb1, _ = talker._preprocess_prefill(ids, None, base_info, 38)
         _, emb2, _ = talker._preprocess_prefill(ids, None, base_info, 38)
         assert cond_calls == 1
@@ -1202,7 +1246,7 @@ def test_prefill_caches_conformer_conds_and_emo_vectors_and_invalidates_on_speak
         emo_info = {
             **base_info,
             "emo_audio": ["emo.wav"],
-            "emo_audio_cache_key": ["emo-key"],
+            "emo_audio_artifact_key": ["emo-key"],
             "emo_alpha": [0.5],
         }
         _, emo_emb1, _ = talker._preprocess_prefill(ids, None, emo_info, 38)
@@ -1217,3 +1261,55 @@ def test_prefill_caches_conformer_conds_and_emo_vectors_and_invalidates_on_speak
         assert cond_calls == 2
         assert emo_calls == 3
         torch.testing.assert_close(emb1, emb3, atol=0.0, rtol=0.0)
+
+        # Repopulating the same key externally with a new _entry_id (simulating clear + repopulate
+        # by another instance with different audio) must invalidate Talker A's stale _cond_cache.
+        key = cache.make_cache_key("artifact:spk-key", "indextts2:dummy-model", 0)
+        existing = cache.get(key)
+        assert existing is not None
+        cache.put(
+            key,
+            {
+                **existing,
+                "_entry_id": 999999,
+                "spk_cond_emb": torch.full((1, 5, 1024), 7.0),
+            },
+        )
+        _, emb4, _ = talker._preprocess_prefill(ids, None, base_info, 38)
+        assert cond_calls == 3
+        assert emo_calls == 4
+        assert not torch.allclose(emb1, emb4)
+
+
+def test_indextts2_adapter_passes_waveform_artifact_digests():
+    """Adapter emits decoded waveform digests for ref_audio and emo_audio even on resolve-cache miss."""
+    import asyncio
+
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+    from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import IndexTTS2Adapter
+
+    calls = {"ref": 0}
+
+    async def _fake_resolve(src: str):
+        calls["ref"] += 1
+        # Simulate an HTTP URL whose content changes between calls while locator key stays identical.
+        wav = [0.1, 0.2] if calls["ref"] == 1 else [0.9, -0.8]
+        return wav, 16000, f"url:{src}"
+
+    server = SimpleNamespace(
+        uploaded_speakers={},
+        _resolve_ref_audio=_fake_resolve,
+        _get_resolved_ref_audio_artifact_key=lambda _k: None,
+        _make_ref_audio_artifact_cache_key=OmniOpenAIServingSpeech._make_ref_audio_artifact_cache_key,
+    )
+    adapter = IndexTTS2Adapter(SimpleNamespace(server=server))
+    req = SimpleNamespace(
+        input="hello",
+        voice=None,
+        ref_audio="https://example.com/spk.wav",
+        extra_params={"emo_audio": "https://example.com/emo.wav"},
+    )
+    params1 = asyncio.run(adapter._build_params(req))
+    assert params1["ref_audio_cache_key"] == ["url:https://example.com/spk.wav"]
+    assert params1["ref_audio_artifact_key"][0] != params1["emo_audio_artifact_key"][0]
+    assert len(params1["ref_audio_artifact_key"][0]) == 40
